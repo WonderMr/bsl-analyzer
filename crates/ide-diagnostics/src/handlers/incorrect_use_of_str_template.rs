@@ -357,7 +357,7 @@ pub fn from_hir(range: LocalRange, ctx: &AnalysisContext) -> Option<Diagnostic<L
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{check_hir_diagnostic, format_diags};
+    use crate::test_utils::{check_diagnostics_snapshot_for, check_hir_diagnostic, format_diags};
     use crate::DiagnosticCode;
     use expect_test::expect;
 
@@ -547,11 +547,35 @@ mod tests {
               severity: Blocker
             IncorrectUseOfStrTemplate @ 30:9..30:39
               message: Некорректное использование СтрШаблон
-              severity: Blocker
-            IncorrectUseOfStrTemplate @ 46:9..46:60
-              message: Некорректное использование СтрШаблон
               severity: Blocker"#]]
         .assert_eq(&format_diags(code, &filtered));
+    }
+
+    #[test]
+    fn template_added_up_from_literals_is_checked_as_one_string() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_literal_concatenation.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 31:13..31:56
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 32:13..32:73
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 33:13..33:69
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 34:13..34:67
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 35:13..36:24
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 37:13..37:57
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
     }
 
     #[test]
