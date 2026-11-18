@@ -608,10 +608,11 @@ fn claude_server_exists(
 }
 
 /// Claude Code has worded a missing server two ways: older releases print
-/// `No MCP server found with name: <name>`, current ones print
-/// `No MCP server named "<name>". Configured servers: ...`. Recognising only one of them
-/// turns "not installed yet" into an inspection error and aborts the install, dry runs
-/// included, so both count as absent; any other failure stays an error.
+/// `No MCP server found with name: <name>`, current ones print `No MCP server named "<name>".`
+/// followed by `Configured servers: ...` or, when none is configured, by a hint to run
+/// `claude mcp add`. Only the leading words are matched, because the tail varies with the
+/// configuration. Recognising only one wording turns "not installed yet" into an inspection
+/// error and aborts the install, dry runs included; any other failure stays an error.
 fn claude_reports_absent_server(stderr: &str) -> bool {
     stderr.contains("No MCP server found with name") || stderr.contains("No MCP server named")
 }
@@ -1233,6 +1234,7 @@ args = ["mcp", "--source-dir", "."]
         let absent_messages = [
             "No MCP server found with name: bsl-analyzer",
             "No MCP server named \"bsl-analyzer\". Configured servers: other-server",
+            "No MCP server named \"bsl-analyzer\". Run `claude mcp add` to add one.",
         ];
         for absent in absent_messages {
             let runner = FakeRunner::new(vec![
