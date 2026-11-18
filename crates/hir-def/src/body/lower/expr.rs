@@ -613,19 +613,17 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
     }
 
     if is_str_template_call {
-        if let Some(ref arg_list) = arg_list_node {
-            if let Some(first_arg) = active_children(arg_list).next() {
-                if let Some(template_string) = find_string_in_node(&first_arg) {
-                    let param_count = arg_list
-                        .children_with_tokens()
-                        .filter(|el| el.as_token().is_some_and(|t| t.kind() == SyntaxKind::COMMA))
-                        .count();
+        if let (Some(arg_list), Some(&template_arg)) = (&arg_list_node, args.first()) {
+            if let Some(template_string) = constant_template_text(ctx, template_arg) {
+                let param_count = arg_list
+                    .children_with_tokens()
+                    .filter(|el| el.as_token().is_some_and(|t| t.kind() == SyntaxKind::COMMA))
+                    .count();
 
-                    if is_wrong_str_template(&template_string, param_count) {
-                        ctx.emit(BodyDiagnostic::IncorrectUseOfStrTemplate {
-                            range: node.text_range(),
-                        });
-                    }
+                if is_wrong_str_template(&template_string, param_count) {
+                    ctx.emit(BodyDiagnostic::IncorrectUseOfStrTemplate {
+                        range: node.text_range(),
+                    });
                 }
             }
         }
@@ -1828,18 +1826,29 @@ fn compare_template_and_params(template_string: &str, used_params_count: usize) 
     false
 }
 
-fn find_string_in_node(node: &SyntaxNode) -> Option<String> {
-    for token in node.descendants_with_tokens() {
-        if let syntax::NodeOrToken::Token(t) = token {
-            if t.kind() == SyntaxKind::STRING {
-                let text = t.text().to_string();
-                if text.len() > 2 {
-                    return Some(text[1..text.len() - 1].to_string());
-                }
-            }
+/// The text of a `СтрШаблон` template built from string literals alone: a literal, `НСтр`
+/// of one, or a `+` of such parts. Any other part (a variable, `Символы.ПС`, a call) may
+/// carry markers of its own, so such a template has no text to check.
+fn constant_template_text(ctx: &LoweringCtx, expr: ExprIdx) -> Option<String> {
+    match ctx.body.expr_idx(expr) {
+        Expr::Literal(Literal::String(text)) => Some(text.clone()),
+        Expr::BinaryOp { lhs, rhs, op: BinaryOp::Add } => {
+            let mut text = constant_template_text(ctx, *lhs)?;
+            text.push_str(&constant_template_text(ctx, *rhs)?);
+            Some(text)
         }
+        Expr::Call { callee, args } if is_nstr_callee(ctx, *callee) => {
+            constant_template_text(ctx, *args.first()?)
+        }
+        _ => None,
     }
-    None
+}
+
+fn is_nstr_callee(ctx: &LoweringCtx, callee: ExprIdx) -> bool {
+    let Expr::Path(name) = ctx.body.expr_idx(callee) else {
+        return false;
+    };
+    matches!(name.as_str().fold_lower().as_str(), "нстр" | "nstr")
 }
 
 fn check_find_element_first_arg(args: &[ExprIdx], ctx: &LoweringCtx) -> bool {

@@ -357,7 +357,7 @@ pub fn from_hir(range: LocalRange, ctx: &AnalysisContext) -> Option<Diagnostic<L
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{check_hir_diagnostic, format_diags};
+    use crate::test_utils::{check_diagnostics_snapshot_for, check_hir_diagnostic, format_diags};
     use crate::DiagnosticCode;
     use expect_test::expect;
 
@@ -547,11 +547,29 @@ mod tests {
               severity: Blocker
             IncorrectUseOfStrTemplate @ 30:9..30:39
               message: Некорректное использование СтрШаблон
-              severity: Blocker
-            IncorrectUseOfStrTemplate @ 46:9..46:60
-              message: Некорректное использование СтрШаблон
               severity: Blocker"#]]
         .assert_eq(&format_diags(code, &filtered));
+    }
+
+    #[test]
+    fn template_added_up_from_literals_is_checked_as_one_string() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_literal_concatenation.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 28:13..28:56
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 29:13..29:73
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 30:13..30:69
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 31:13..31:67
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
     }
 
     #[test]
