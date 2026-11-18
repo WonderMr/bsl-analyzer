@@ -914,13 +914,18 @@ mod tests {
                 "validator allowlist accepts edge_kind '{kind}' the schema does not advertise"
             );
         }
+        // The `neighbors_params.edge_kinds` prose carries its own list: it must name every
+        // accepted kind and no kind the validator would reject.
         let neighbors_edge_kinds = schema["neighbors_params"]["edge_kinds"].as_str().unwrap();
-        for kind in EDGE_KINDS {
-            assert!(
-                neighbors_edge_kinds.contains(kind),
-                "neighbors_params.edge_kinds does not name accepted edge_kind '{kind}'"
-            );
-        }
+        let mut documented: Vec<&str> = neighbors_edge_kinds
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(kinds, _)| kinds.split('|').collect())
+            .expect("neighbors_params.edge_kinds lists the kinds in parentheses");
+        let mut accepted = EDGE_KINDS.to_vec();
+        documented.sort_unstable();
+        accepted.sort_unstable();
+        assert_eq!(documented, accepted, "neighbors_params.edge_kinds: {neighbors_edge_kinds}");
         assert!(
             schema["neighbors_result"]["total"].is_string(),
             "neighbours result must document the `total` field"
