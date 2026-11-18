@@ -632,6 +632,8 @@ fn gemini_stub() -> String {
     common_stub_prelude("exit 0\n")
 }
 
+/// Reports a missing server the way current Claude Code does; the adapter's unit tests
+/// also cover the older `No MCP server found with name` wording.
 fn claude_stub() -> String {
     common_stub_prelude(
         r#"
@@ -646,7 +648,7 @@ if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then
       exit 0
       ;;
   esac
-  echo "No MCP server found with name: $3" >&2
+  echo "No MCP server named \"$3\". Configured servers: other-server" >&2
   exit 1
 fi
 exit 0
