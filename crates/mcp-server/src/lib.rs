@@ -1379,7 +1379,8 @@ impl McpServer {
     /// with `connection`; the server does not convert between the forms. Reads the
     /// resident analysis host; while it builds it returns a retry envelope, not an error —
     /// `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-    /// shortly instead of reading the answer as "no such object".
+    /// shortly instead of reading the answer as "no such object". The resident is a build of
+    /// its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
     #[tool(name = "metadata", annotations(read_only_hint = true))]
     async fn metadata(
         &self,
@@ -5824,7 +5825,8 @@ mod tool_descriptions {
             with `connection`; the server does not convert between the forms. Reads the
             resident analysis host; while it builds it returns a retry envelope, not an error —
             `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-            shortly instead of reading the answer as "no such object".
+            shortly instead of reading the answer as "no such object". The resident is a build of
+            its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
               - action: info | tree | object | form | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
               - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
@@ -6965,6 +6967,44 @@ mod resident_failed_answers {
         );
         assert_eq!(body["error"], REASON, "and the retry still names the cause it answers: {body}",);
         assert!(body.get("retry_after_ms").is_none(), "a build in flight owes no wait: {body}");
+
+        gate.release();
+        server.shutdown();
+    }
+
+    /// The graph and the resident `metadata` reads are two builds, and a published graph says
+    /// nothing about the other one. With the graph ready and the resident still building,
+    /// `info` answers the structured retry envelope rather than a summary or an error, and the
+    /// envelope points at the readiness probe that does cover the resident.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ready_graph_leaves_metadata_answering_its_own_loading_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
+        // Parked before it publishes, the resident stays in its build however fast it is: the
+        // read below meets it building instead of racing it.
+        let gate = state.diagnostics().arm_build_gate_for_test();
+        let graph = state.graph().clone();
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        let server = McpServer::new(McpProfile::Workspace, state);
+
+        let answer =
+            server.metadata(metadata_params("info"), token(), tasks::TaskCapable(false)).await;
+        let result = match answer {
+            Ok(CallToolResponse::Complete(result)) => result,
+            Ok(_) => panic!("a synchronous call does not create a task"),
+            Err(error) => panic!("a resident in its build was answered with an error: {error:?}"),
+        };
+        let body = result.structured_content.expect("the not-ready envelope is structured");
+        assert_eq!(body["status"], "loading", "{body}");
+        assert_eq!(body["state"], "loading", "{body}");
+        assert!(
+            body["detail"].as_str().is_some_and(|detail| detail.contains("`metadata` status")),
+            "the envelope names the probe that covers the resident: {body}",
+        );
 
         gate.release();
         server.shutdown();

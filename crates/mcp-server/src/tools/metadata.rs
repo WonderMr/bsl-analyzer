@@ -1403,7 +1403,7 @@ pub fn loading(report: &crate::diagnostics_state::StatusReport) -> CallToolResul
         msg,
         crate::tools::resident::loading_body(
             report,
-            "resident analysis database is building; retry shortly",
+            "resident analysis database is building, apart from the graph; poll `metadata` status",
         ),
     )
 }

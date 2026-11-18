@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
   модули индексировались второй раз, а ссылки, определения и счётчики делились между копиями. Сам корень
   правила не исключают, отдельные файлы по шаблонам (`*.bin`) остаются. Отключается
   `[source].respect_gitignore = false`.
+- mcp: описание `metadata` и конверт `loading` (`detail`) говорят, что резидентная база - отдельная
+  от графа сборка: `graph status` со `state: ready` не означает готовности `metadata`, ждать её надо
+  по `metadata action=status`. Сам конверт `loading` со `structuredContent.status` не менялся.
 
 ## [0.4.6] - 2026-11-11
 

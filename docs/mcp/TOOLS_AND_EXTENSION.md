@@ -592,6 +592,10 @@ retry_after_ms, failed_age_ms}`: причина там называется `rea
 (`state`/`generation`/`reload`, плюс `files`/`elapsed_ms`/`error`/`watch` и, при отказе,
 `retry_after_ms`/`attempts`/`failed_age_ms`),
 `graph action=status` — свой (`state`, и при `ready` — `files`/`revision`/`stale`/`reload`).
+Это две отдельные сборки: `graph status` со `state: ready` ничего не говорит о резиденте, и
+`metadata`, `symbol_info`, `diagnostics` в это время могут отвечать конвертом `loading`, например
+пока резидент крупной конфигурации ещё строится или после простоя, когда он выгружен и
+собирается заново. Ждать готовности этих инструментов надо по `metadata action=status`.
 
 ## Карточка символа: структурная выдача `symbol_info`
 
