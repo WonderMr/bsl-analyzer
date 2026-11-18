@@ -71,7 +71,6 @@ fn global_functions_take_any_metadata_object() {
     assert_eq!(global_param("ПравоДоступа", 1), with_configuration);
     assert_eq!(global_param("AccessRight", 1), with_configuration);
     assert_eq!(global_param("ВыполнитьПроверкуПравДоступа", 1), with_configuration);
-    assert_eq!(global_param("ЗаписьЖурналаРегистрации", 2), family());
     assert_eq!(global_param("ОткрытьСправку", 0), family());
 }
 
@@ -87,6 +86,18 @@ fn types_outside_the_family_keep_their_place() {
         format!("Неопределено, {}", family())
     );
     assert_eq!(global_param("ОбновитьНумерациюОбъектов", 0), format!("Массив, {}", family()));
+    assert_eq!(global_param("ЗаписьЖурналаРегистрации", 2), format!("{}, Неопределено", family()));
+}
+
+/// The help names no `Неопределено` for the event's metadata object, yet the platform
+/// takes it as an event without one: the Standard Subsystems logger passes its own
+/// `ОбъектМетаданных = Неопределено` default through unchanged.
+#[test]
+fn write_log_event_takes_undefined_for_the_metadata_object() {
+    let raw = global_param("ЗаписьЖурналаРегистрации", 2);
+    let alternatives = bsl_platform::split_type_alternatives(&raw);
+    assert!(alternatives.contains(&"Неопределено"), "{raw}");
+    assert!(alternatives.iter().any(|alt| alt.starts_with("ОбъектМетаданных: ")), "{raw}");
 }
 
 #[test]

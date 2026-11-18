@@ -663,4 +663,21 @@ mod tests {
                   severity: Error"#]],
         );
     }
+
+    // The count in the message is the slot's size in the built-in facts: the metadata-object
+    // family plus `Неопределено`, less the three members printed.
+    #[test]
+    fn undefined_metadata_object_of_a_log_event_is_silent_and_a_number_is_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/write_log_event_undefined_metadata_object.bsl"),
+            DiagnosticCode::TypeMismatch,
+            expect![[r#"
+                TypeMismatch @ 27:79..27:80
+                  message: Несоответствие типов: ожидалось 'ОбъектМетаданных: HTTPСервис | ОбъектМетаданных: WSСсылка | ОбъектМетаданных: WebSocketКлиент | … и ещё 67', получено 'Число'
+                  severity: Major"#]],
+        );
+    }
 }
