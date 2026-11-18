@@ -3,15 +3,17 @@
 //! Three entry points can be asked about a document the project excludes: the frozen snapshot
 //! (asynchronous requests), `GlobalStateSnapshot` (synchronous requests such as formatting) and
 //! `GlobalState`. The text lives here so that one excluded document is explained the same way
-//! under hover and under formatting, and it names BOTH configuration keys, because either one
-//! can be the reason and the reader cannot tell which from the message alone.
+//! under hover and under formatting, and it names EVERY configuration key that can be the
+//! reason, because the reader cannot tell which one it was from the message alone.
 
 use lsp_types::Url;
 
-/// The error returned for a document excluded by `[source].exclude` or `[source].exclude_globs`.
+/// The error returned for a document excluded by `[source].exclude` or `[source].exclude_globs`,
+/// or lying in a directory git leaves out below a source root (`[source].respect_gitignore`).
 pub fn excluded_from_project(url: &Url) -> anyhow::Error {
     anyhow::anyhow!(
         "File is excluded from the project by [source].exclude or [source].exclude_globs, \
+         or lies in a directory git ignores (see [source].respect_gitignore), \
          so it is not analysed: {}",
         url
     )
@@ -22,10 +24,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_text_names_both_configuration_keys_and_the_document() {
+    fn the_text_names_every_configuration_key_and_the_document() {
         let url = Url::parse("file:///c:/p/CommonModules/M/Ext/Module.bsl").expect("a url");
         let message = excluded_from_project(&url).to_string();
         assert!(message.contains("[source].exclude or [source].exclude_globs"), "{message}");
+        assert!(message.contains("[source].respect_gitignore"), "{message}");
         assert!(message.contains("so it is not analysed"), "{message}");
         assert!(message.contains(url.as_str()), "{message}");
     }
