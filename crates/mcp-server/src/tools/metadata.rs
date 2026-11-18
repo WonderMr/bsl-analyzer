@@ -281,15 +281,22 @@ where
     items.into_iter().inspect(|_| salsa::Database::unwind_if_revision_cancelled(db))
 }
 
+/// The `tree` action: the category summary, one category's objects (`category`), or the
+/// objects whose name contains `filter` — across the configuration and its extensions, or
+/// within `category` when both are given.
 pub fn get_metadata_tree(
     db: &ide::RootDatabaseImpl,
     config: &Configuration,
     extensions: &[(String, Configuration)],
+    category: Option<String>,
     filter: Option<String>,
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
-    if let Some(ref category) = filter {
-        format_filtered_tree(db, config, category, max_output_tokens)
+    let filter = filter.filter(|text| !text.trim().is_empty());
+    if let Some(ref category) = category {
+        format_filtered_tree(db, config, category, filter.as_deref(), max_output_tokens)
+    } else if let Some(ref filter) = filter {
+        Ok(format_name_matches(db, config, extensions, filter, max_output_tokens))
     } else {
         let mut result = format_summary_tree(db, config)?;
         if !extensions.is_empty() {
@@ -371,7 +378,11 @@ fn format_summary_tree(
     for (category, count) in &categories {
         let _ = writeln!(out, "| {category} | {count} |");
     }
-    let _ = writeln!(out, "\nИспользуйте `filter` для получения списка объектов категории.");
+    let _ = writeln!(
+        out,
+        "\nИспользуйте `meta_type` для списка объектов категории и `filter` для поиска объектов \
+         по части имени."
+    );
 
     Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
 }
@@ -409,14 +420,25 @@ fn normalize_filter_category(raw: &str) -> String {
     }
 }
 
+/// The note a cut listing ends with.
+const LISTING_BUDGET_NOTE: &str = "\n-- список усечён под max_output_tokens; повысьте бюджет или \
+                                   запросите объект действием `object` --\n";
+
+/// One category's objects, narrowed to the names containing `filter` when it is given.
+///
+/// A category that has objects answers with its heading even when none of them matches: the
+/// count says so. Only a category the configuration does not have is refused.
 fn format_filtered_tree(
     db: &ide::RootDatabaseImpl,
     config: &Configuration,
     raw_category: &str,
+    filter: Option<&str>,
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
     let category = normalize_filter_category(raw_category);
     let category = category.as_str();
+    let needle = filter.map(stdx::case::fold_lower_per_char);
+    let needle = needle.as_deref();
     let mut out = String::new();
     let mut found = false;
 
@@ -430,6 +452,10 @@ fn format_filtered_tree(
 
         if !objects.is_empty() {
             found = true;
+            let objects: Vec<_> = objects
+                .into_iter()
+                .filter(|o| name_matches(needle, &o.name, o.name_en.as_deref()))
+                .collect();
             let _ = writeln!(out, "# {} ({})\n", mdo_type.russian_name(), objects.len());
             for obj in checkpointed(db, &objects) {
                 if let Some(ref name_en) = obj.name_en {
@@ -445,6 +471,8 @@ fn format_filtered_tree(
 
         if !registers.is_empty() {
             found = true;
+            let registers: Vec<_> =
+                registers.into_iter().filter(|r| name_matches(needle, r.name(), None)).collect();
             let _ = writeln!(out, "# {} ({})\n", mdo_type.russian_name(), registers.len());
             for reg in checkpointed(db, &registers) {
                 let _ = writeln!(out, "- {}", reg.name());
@@ -454,7 +482,7 @@ fn format_filtered_tree(
 
     if !found {
         if let Some(kind) = parse_service_kind(category) {
-            found = format_service_listing(db, config, kind, &mut out);
+            found = format_service_listing(db, config, kind, needle, &mut out);
         }
     }
 
@@ -465,6 +493,8 @@ fn format_filtered_tree(
                 let modules = config.common_modules();
                 if !modules.is_empty() {
                     found = true;
+                    let modules: Vec<_> =
+                        modules.iter().filter(|m| name_matches(needle, m.name(), None)).collect();
                     let _ = writeln!(out, "# ОбщиеМодули ({})\n", modules.len());
                     for m in checkpointed(db, modules) {
                         let flags = format_common_module_flags(m);
@@ -476,6 +506,8 @@ fn format_filtered_tree(
                 let subs = config.event_subscriptions();
                 if !subs.is_empty() {
                     found = true;
+                    let subs: Vec<_> =
+                        subs.iter().filter(|s| name_matches(needle, s.name(), None)).collect();
                     let _ = writeln!(out, "# ПодпискиНаСобытия ({})\n", subs.len());
                     for s in checkpointed(db, subs) {
                         let _ = writeln!(out, "- {}", s.name());
@@ -486,6 +518,8 @@ fn format_filtered_tree(
                 let types = config.defined_types();
                 if !types.is_empty() {
                     found = true;
+                    let types: Vec<_> =
+                        types.iter().filter(|t| name_matches(needle, t.name(), None)).collect();
                     let _ = writeln!(out, "# ОпределяемыеТипы ({})\n", types.len());
                     for t in checkpointed(db, types) {
                         let _ = writeln!(out, "- {}", t.name());
@@ -496,6 +530,8 @@ fn format_filtered_tree(
                 let roles = config.roles();
                 if !roles.is_empty() {
                     found = true;
+                    let roles: Vec<_> =
+                        roles.iter().filter(|r| name_matches(needle, r.name(), None)).collect();
                     let _ = writeln!(out, "# Роли ({})\n", roles.len());
                     for r in checkpointed(db, roles) {
                         let _ = writeln!(out, "- {}", r.name());
@@ -508,7 +544,10 @@ fn format_filtered_tree(
 
     if !found {
         return Err(McpError::invalid_params(
-            format!("Категория '{raw_category}' не найдена. Вызовите get_metadata_tree без фильтра для списка категорий."),
+            format!(
+                "Категория '{raw_category}' не найдена. Список категорий: `metadata` с \
+                 `action: \"tree\"` без `meta_type` и `filter`."
+            ),
             None,
         ));
     }
@@ -518,10 +557,111 @@ fn format_filtered_tree(
     crate::tools::response::truncate_text_to_budget(
         &mut out,
         max_output_tokens,
-        "\n-- список усечён под max_output_tokens; повысьте бюджет или запросите объект действием `object` --\n",
+        LISTING_BUDGET_NOTE,
     );
 
     Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+}
+
+/// Every object of the configuration and of its extensions whose name contains `filter`,
+/// grouped by the layer that holds it, one `Категория.Имя` line each: the pair the `object`
+/// action takes.
+fn format_name_matches(
+    db: &ide::RootDatabaseImpl,
+    config: &Configuration,
+    extensions: &[(String, Configuration)],
+    filter: &str,
+    max_output_tokens: usize,
+) -> CallToolResult {
+    let needle = stdx::case::fold_lower_per_char(filter);
+    let layers = std::iter::once(("Конфигурация".to_owned(), config))
+        .chain(extensions.iter().map(|(name, layer)| (format!("Расширение: {name}"), layer)));
+    let mut total = 0;
+    let mut sections = String::new();
+    for (title, layer) in layers {
+        let names = names_containing(db, layer, &needle);
+        if names.is_empty() {
+            continue;
+        }
+        total += names.len();
+        let _ = writeln!(sections, "\n## {title} ({})\n", names.len());
+        for name in names {
+            let _ = writeln!(sections, "- {name}");
+        }
+    }
+
+    let mut out = format!("# Объекты, в имени которых есть «{filter}» ({total})\n");
+    if total == 0 {
+        let _ = writeln!(
+            out,
+            "\nКатегорию задаёт `meta_type`; список категорий — `tree` без `meta_type` и `filter`."
+        );
+    }
+    out.push_str(&sections);
+    crate::tools::response::truncate_text_to_budget(
+        &mut out,
+        max_output_tokens,
+        LISTING_BUDGET_NOTE,
+    );
+    CallToolResult::success(vec![ContentBlock::text(out)])
+}
+
+/// `Категория.Имя` of every object in `config` whose name, or English name, contains
+/// `needle` (per-char lowercase), in the order the summary counts the categories.
+fn names_containing(
+    db: &ide::RootDatabaseImpl,
+    config: &Configuration,
+    needle: &str,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for object in checkpointed(db, config.metadata_objects()) {
+        if name_matches(Some(needle), &object.name, object.name_en.as_deref()) {
+            names.push(format!("{}.{}", object.mdo_type.russian_name(), object.name));
+        }
+    }
+    for register in checkpointed(db, config.registers()) {
+        push_matching(&mut names, register.mdo_type().russian_name(), register.name(), needle);
+    }
+    for module in checkpointed(db, config.common_modules()) {
+        push_matching(&mut names, "ОбщийМодуль", module.name(), needle);
+    }
+    for subscription in checkpointed(db, config.event_subscriptions()) {
+        push_matching(&mut names, "ПодпискаНаСобытие", subscription.name(), needle);
+    }
+    for defined_type in checkpointed(db, config.defined_types()) {
+        push_matching(&mut names, "ОпределяемыйТип", defined_type.name(), needle);
+    }
+    for job in checkpointed(db, config.scheduled_jobs()) {
+        push_matching(&mut names, "РегламентноеЗадание", job.name(), needle);
+    }
+    for role in checkpointed(db, config.roles()) {
+        push_matching(&mut names, "Роль", role.name(), needle);
+    }
+    for service in checkpointed(db, config.http_services()) {
+        push_matching(&mut names, "HTTPСервис", service.name(), needle);
+    }
+    for service in checkpointed(db, config.web_services()) {
+        push_matching(&mut names, "WebСервис", service.name(), needle);
+    }
+    for service in checkpointed(db, config.integration_services()) {
+        push_matching(&mut names, "СервисИнтеграции", service.name(), needle);
+    }
+    names
+}
+
+fn push_matching(names: &mut Vec<String>, category: &str, name: &str, needle: &str) {
+    if stdx::case::contains_ignore_case(name, needle) {
+        names.push(format!("{category}.{name}"));
+    }
+}
+
+/// Whether `name` or its English twin contains `needle` (per-char lowercase); no needle keeps
+/// every name.
+fn name_matches(needle: Option<&str>, name: &str, english: Option<&str>) -> bool {
+    needle.is_none_or(|needle| {
+        stdx::case::contains_ignore_case(name, needle)
+            || english.is_some_and(|english| stdx::case::contains_ignore_case(english, needle))
+    })
 }
 
 fn format_common_module_flags(m: &bsl_metadata::CommonModule) -> String {
@@ -548,47 +688,36 @@ fn format_common_module_flags(m: &bsl_metadata::CommonModule) -> String {
     }
 }
 
+/// One service kind's listing, narrowed to the names containing `needle`; `false` when the
+/// configuration has no service of that kind.
 fn format_service_listing(
     db: &ide::RootDatabaseImpl,
     config: &Configuration,
     kind: ServiceKind,
+    needle: Option<&str>,
     out: &mut String,
 ) -> bool {
-    match kind {
-        ServiceKind::Http => {
-            let services = config.http_services();
-            if services.is_empty() {
-                return false;
-            }
-            let _ = writeln!(out, "# HTTPСервисы ({})\n", services.len());
-            for service in checkpointed(db, services) {
-                let _ = writeln!(out, "- {}", service.name());
-            }
-            true
-        }
-        ServiceKind::Web => {
-            let services = config.web_services();
-            if services.is_empty() {
-                return false;
-            }
-            let _ = writeln!(out, "# WebСервисы ({})\n", services.len());
-            for service in checkpointed(db, services) {
-                let _ = writeln!(out, "- {}", service.name());
-            }
-            true
-        }
+    let names: Vec<&str> = match kind {
+        ServiceKind::Http => checkpointed(db, config.http_services()).map(|s| s.name()).collect(),
+        ServiceKind::Web => checkpointed(db, config.web_services()).map(|s| s.name()).collect(),
         ServiceKind::Integration => {
-            let services = config.integration_services();
-            if services.is_empty() {
-                return false;
-            }
-            let _ = writeln!(out, "# СервисыИнтеграции ({})\n", services.len());
-            for service in checkpointed(db, services) {
-                let _ = writeln!(out, "- {}", service.name());
-            }
-            true
+            checkpointed(db, config.integration_services()).map(|s| s.name()).collect()
         }
+    };
+    if names.is_empty() {
+        return false;
     }
+    let title = match kind {
+        ServiceKind::Http => "HTTPСервисы",
+        ServiceKind::Web => "WebСервисы",
+        ServiceKind::Integration => "СервисыИнтеграции",
+    };
+    let names: Vec<_> = names.into_iter().filter(|name| name_matches(needle, name, None)).collect();
+    let _ = writeln!(out, "# {title} ({})\n", names.len());
+    for name in names {
+        let _ = writeln!(out, "- {name}");
+    }
+    true
 }
 
 /// The whole-`Configuration` object formatter. Production resolves objects from the
@@ -1646,7 +1775,7 @@ mod tests {
 
         // Each entry names the collection the branch walks; a branch whose collection is
         // empty in the fixture would answer "category not found" and the assertion says so.
-        for filter in [
+        for category in [
             None,
             Some("Справочник"),
             Some("РегистрСведений"),
@@ -1657,15 +1786,24 @@ mod tests {
             Some("WebСервис"),
             Some("СервисИнтеграции"),
         ] {
-            let filter = filter.map(str::to_string);
+            let category = category.map(str::to_string);
             let got = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-                get_metadata_tree(&db, &config, &[], filter.clone(), usize::MAX)
+                get_metadata_tree(&db, &config, &[], category.clone(), None, usize::MAX)
             }));
             assert!(
                 matches!(got, Err(salsa::Cancelled::Local)),
-                "filter {filter:?} rendered its whole listing after the request was cancelled"
+                "category {category:?} rendered its whole listing after the request was cancelled"
             );
         }
+
+        // A name search walks every collection of every layer.
+        let got = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+            get_metadata_tree(&db, &config, &[], None, Some("а".to_string()), usize::MAX)
+        }));
+        assert!(
+            matches!(got, Err(salsa::Cancelled::Local)),
+            "the name search walked every object after the request was cancelled"
+        );
 
         let got = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
             format_extension_summary(&db, "Расширение", &config)
@@ -1681,7 +1819,14 @@ mod tests {
         // register selection unwinds first and hides whether this one exists at all.
         let objects_only = objects_only_config();
         let got = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-            get_metadata_tree(&db, &objects_only, &[], Some("ПланОбмена".to_string()), usize::MAX)
+            get_metadata_tree(
+                &db,
+                &objects_only,
+                &[],
+                Some("ПланОбмена".to_string()),
+                None,
+                usize::MAX,
+            )
         }));
         assert!(
             matches!(got, Err(salsa::Cancelled::Local)),
@@ -2051,9 +2196,8 @@ mod tests {
     #[test]
     fn test_metadata_tree_summary() {
         let config = fixture_config();
-        let result =
-            get_metadata_tree(&ide::RootDatabaseImpl::new(), &config, &[], None, usize::MAX)
-                .unwrap();
+        let db = ide::RootDatabaseImpl::new();
+        let result = get_metadata_tree(&db, &config, &[], None, None, usize::MAX).unwrap();
         let text = extract_text(&result);
 
         assert!(text.contains("дерево метаданных"), "should have header");
@@ -2070,6 +2214,7 @@ mod tests {
             &config,
             &[],
             Some("Справочник".into()),
+            None,
             usize::MAX,
         )
         .unwrap();
@@ -2105,6 +2250,7 @@ mod tests {
                 &config,
                 &[],
                 Some(input.into()),
+                None,
                 usize::MAX,
             )
             .unwrap();
@@ -2124,6 +2270,7 @@ mod tests {
             &config,
             &[],
             Some("ОбщиеМодули".into()),
+            None,
             usize::MAX,
         )
         .unwrap();
@@ -2140,10 +2287,77 @@ mod tests {
             &config,
             &[],
             Some("НесуществующаяКатегория".into()),
+            None,
             usize::MAX,
         );
 
-        assert!(result.is_err(), "should return error for unknown category");
+        let error = result.expect_err("an unknown category is refused");
+        assert!(error.message.contains("`meta_type`"), "{}", error.message);
+        assert!(!error.message.contains("get_metadata_tree"), "{}", error.message);
+    }
+
+    /// `filter` is what its schema says it is: a case-insensitive substring of object names.
+    /// It was read as a category, so a name fragment such as `Заказ` came back as an
+    /// unknown category, with an error that named a tool the server does not have. The search
+    /// covers every collection of the configuration and of each extension, one
+    /// `Категория.Имя` line per object, which is the pair `object` takes.
+    #[test]
+    fn tree_filter_finds_objects_by_a_name_substring_in_every_layer() {
+        let config = fixture_config();
+        let extensions = vec![("Расширение1".to_owned(), fixture_config())];
+        let db = ide::RootDatabaseImpl::new();
+
+        let filter = Some("СПРАВОЧНИК".to_owned());
+        let found = get_metadata_tree(&db, &config, &extensions, None, filter, usize::MAX);
+        let found = found.expect("a name substring is not a category");
+        let text = extract_text(&found);
+        assert!(text.contains("- Справочник.Справочник1\n"), "{text}");
+        assert!(text.contains("- Справочник.СправочникСМенеджером\n"), "{text}");
+        assert!(text.contains("- ПодпискаНаСобытие.ПриЗаписиСправочника\n"), "{text}");
+        assert!(!text.contains("рдт_Рецептура"), "{text}");
+        assert!(text.contains("## Конфигурация (3)"), "{text}");
+        assert!(text.contains("## Расширение: Расширение1 (3)"), "{text}");
+        assert!(text.starts_with("# Объекты, в имени которых есть «СПРАВОЧНИК» (6)"), "{text}");
+
+        let filter = Some("рдт_".to_owned());
+        let found = get_metadata_tree(&db, &config, &[], None, filter, usize::MAX).unwrap();
+        assert!(extract_text(&found).contains("- Справочник.рдт_Рецептура\n"));
+
+        // Collections outside the object table are searched too.
+        let filter = Some("ЗаданиеНесуществующийМетод".to_owned());
+        let found = get_metadata_tree(&db, &config, &[], None, filter, usize::MAX).unwrap();
+        let text = extract_text(&found);
+        assert!(
+            text.contains("- РегламентноеЗадание.РегламентноеЗаданиеНесуществующийМетод\n"),
+            "{text}"
+        );
+
+        let filter = Some("НетТакогоИмени".to_owned());
+        let nothing = get_metadata_tree(&db, &config, &[], None, filter, usize::MAX);
+        let nothing = nothing.expect("no match is an empty answer, not an error");
+        assert!(extract_text(&nothing).contains("(0)"), "{}", extract_text(&nothing));
+        assert!(extract_text(&nothing).contains("`meta_type`"), "{}", extract_text(&nothing));
+    }
+
+    /// The category has its own parameter, and `filter` narrows it. A category whose objects
+    /// all miss the filter is listed empty rather than refused as unknown.
+    #[test]
+    fn tree_filter_narrows_the_meta_type_category() {
+        let config = fixture_config();
+        let db = ide::RootDatabaseImpl::new();
+
+        let category = Some("Справочники".to_owned());
+        let filter = Some("менеджер".to_owned());
+        let narrowed = get_metadata_tree(&db, &config, &[], category, filter, usize::MAX).unwrap();
+        let text = extract_text(&narrowed);
+        assert!(text.starts_with("# Справочник (1)\n"), "{text}");
+        assert!(text.contains("- СправочникСМенеджером"), "{text}");
+        assert!(!text.contains("- Справочник1"), "{text}");
+
+        let category = Some("Справочник".to_owned());
+        let filter = Some("НетТакогоИмени".to_owned());
+        let empty = get_metadata_tree(&db, &config, &[], category, filter, usize::MAX).unwrap();
+        assert!(extract_text(&empty).starts_with("# Справочник (0)\n"), "{}", extract_text(&empty));
     }
 
     #[test]
@@ -2279,6 +2493,7 @@ mod tests {
             &config,
             &[],
             Some("HTTPСервис".into()),
+            None,
             usize::MAX,
         )
         .unwrap();
@@ -2299,6 +2514,7 @@ mod tests {
             &config,
             &[],
             Some("WebСервис".into()),
+            None,
             usize::MAX,
         )
         .unwrap();
@@ -2318,6 +2534,7 @@ mod tests {
             &config,
             &[],
             Some("СервисИнтеграции".into()),
+            None,
             usize::MAX,
         )
         .unwrap();
