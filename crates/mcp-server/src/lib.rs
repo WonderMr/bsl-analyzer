@@ -546,8 +546,9 @@ struct SyntaxHelpByNameParams {
     type_name: Option<String>,
     /// Output budget in tokens (~4 chars each) covering the compatibility Markdown and the
     /// structured card together: the Markdown is truncated at a line boundary with a note
-    /// pointing at the single-member lookup, and the card's listings take what is left
-    /// (`budget_exhausted` says when they were cut). Default 6000.
+    /// pointing at the single-member lookup, and the card's listings take what is left. A card
+    /// whose documentation does not fit beside the Markdown goes out without it
+    /// (`budget_exhausted` says when the card was cut). Default 6000.
     max_output_tokens: Option<usize>,
 }
 
