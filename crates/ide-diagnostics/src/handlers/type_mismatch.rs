@@ -663,4 +663,20 @@ mod tests {
                   severity: Error"#]],
         );
     }
+
+    // The family size in the message is the one of the built-in facts.
+    #[test]
+    fn undefined_metadata_object_of_a_log_event_is_silent_and_a_number_is_reported() {
+        if !built_in_facts_are_served() {
+            return;
+        }
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/write_log_event_undefined_metadata_object.bsl"),
+            DiagnosticCode::TypeMismatch,
+            expect![[r#"
+                TypeMismatch @ 28:85..28:86
+                  message: Несоответствие типов: ожидалось 'ОбъектМетаданных: HTTPСервис | ОбъектМетаданных: WSСсылка | ОбъектМетаданных: WebSocketКлиент | … и ещё 67', получено 'Число'
+                  severity: Major"#]],
+        );
+    }
 }
