@@ -219,12 +219,18 @@ pub(crate) fn add_register_period_attr(
     }
 }
 
+/// `Активность`, `НомерСтроки` and `Регистратор` belong to the records a recorder writes, so an
+/// information register has them only in the recorder-subordinate write mode; an independent
+/// register's record is its dimensions, resources, attributes and, when periodic, `Период`.
 pub(crate) fn add_information_register_standard_attrs(
     attributes: &mut Vec<RegisterAttribute>,
     object_name: &str,
     periodicity: Option<&str>,
+    recorder_subordinate: bool,
 ) {
-    add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    if recorder_subordinate {
+        add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    }
     add_register_period_attr(attributes, object_name, MdoType::InformationRegister, periodicity);
 }
 

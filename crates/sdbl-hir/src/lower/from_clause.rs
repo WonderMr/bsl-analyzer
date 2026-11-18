@@ -660,7 +660,7 @@ impl LoweringContext<'_> {
                 .push(FieldDef::new(&common.name, self.resolve_attribute_type(&common.attr_type)));
         }
 
-        let mut attributes = Vec::new();
+        let mut attributes = self.recorder_fields_not_listed(mdo_type, &register, object_name);
         for attr in register.attributes() {
             let ty = attr
                 .attr_type()
@@ -676,10 +676,10 @@ impl LoweringContext<'_> {
                 ty,
                 is_synthesized,
             );
-            // The metadata reader injects the recorder-mode fields into every register's
-            // attribute list, so the mark has to be applied HERE and not only to the standard
-            // set: `attributes` is what the virtual-table transform rebuilds its field list
-            // from, and a mark placed only on the standard set does not survive that rebuild.
+            // The recorder-mode fields sit in this attribute list, so the mark has to be
+            // applied HERE and not only to the standard set: `attributes` is what the
+            // virtual-table transform rebuilds its field list from, and a mark placed only on
+            // the standard set does not survive that rebuild.
             field.provisional = Self::is_conditional_standard_field(mdo_type, attr.name());
             attributes.push(field);
         }
@@ -749,6 +749,36 @@ impl LoweringContext<'_> {
         const RECORDER_MODE_ONLY: &[&str] =
             &["Регистратор", "Активность", "НомерСтроки", "МоментВремени"];
         RECORDER_MODE_ONLY.iter().any(|known| stdx::case::eq_ignore_case(known, name))
+    }
+
+    /// The recorder-mode fields of an information register that the metadata reader did not
+    /// list for it, provisional, in the order the reader lists them.
+    ///
+    /// The reader lists `Активность`, `НомерСтроки` and `Регистратор` only for a register
+    /// subordinate to a recorder, the one mode the platform has them in. The query layer keeps
+    /// offering them on an independent register, as it offers `Период` on a non-periodic one:
+    /// the unknown-field rule stays silent on them and the ambiguity rule does not count them.
+    fn recorder_fields_not_listed(
+        &self,
+        mdo_type: MdoType,
+        register: &bsl_metadata::Register,
+        object_name: &str,
+    ) -> Vec<FieldDef> {
+        use bsl_metadata::metadata_object::StandardAttributeKind as Kind;
+
+        if mdo_type != MdoType::InformationRegister {
+            return Vec::new();
+        }
+        let mut fields = Vec::new();
+        for kind in [Kind::Active, Kind::LineNumber, Kind::Recorder] {
+            let name = kind.russian_name();
+            if register.attributes().iter().any(|attr| eq_ignore_case(attr.name(), name)) {
+                continue;
+            }
+            let ty = self.resolve_attribute_type(&kind.attribute_type(mdo_type, object_name));
+            fields.push(FieldDef::provisional_standard(name, kind.english_name(), ty));
+        }
+        fields
     }
 
     /// Fields the register MAIN table has on top of the object-model set — query-only virtual
