@@ -1687,47 +1687,101 @@ pub fn project_workspace_subscription_edges<DB: ConfigsDatabase>(
     index: &GraphIndex,
     state: &mut GraphBuildState,
 ) -> Vec<WorkspaceCallEdge> {
+    let handlers: Vec<_> = db
+        .enumerate_event_subscriptions(representative)
+        .into_iter()
+        .filter_map(|sub| {
+            let handler = sub.parse_handler()?;
+            Some((sub.name().to_string(), handler.module_name, handler.method_name))
+        })
+        .collect();
+    project_metadata_handler_edges(
+        db,
+        representative,
+        index,
+        state,
+        (MdoType::EventSubscription, EdgeKind::EventSubscriptionRef),
+        handlers,
+    )
+}
+
+/// Project scheduled-job handler edges: each `РегламентноеЗадание` links its job node
+/// (`Mdo{ScheduledJob, name}`) to the exported common-module method named in its
+/// `MethodName`. Such a method has no caller in code, so without this edge the graph
+/// shows it as unused. Every job of every configured root is projected, an extension's
+/// own jobs included. The same resolution and the same full-build-only lifecycle as
+/// [`project_workspace_subscription_edges`].
+pub fn project_workspace_scheduled_job_edges<DB: ConfigsDatabase>(
+    db: &DB,
+    representative: FileId,
+    index: &GraphIndex,
+    state: &mut GraphBuildState,
+) -> Vec<WorkspaceCallEdge> {
+    let handlers: Vec<_> = db
+        .enumerate_scheduled_jobs(representative)
+        .into_iter()
+        .filter_map(|job| {
+            let handler = job.parse_handler()?;
+            Some((job.name().to_string(), handler.module_name, handler.method_name))
+        })
+        .collect();
+    project_metadata_handler_edges(
+        db,
+        representative,
+        index,
+        state,
+        (MdoType::ScheduledJob, EdgeKind::ScheduledJobRef),
+        handlers,
+    )
+}
+
+/// Link each metadata object to the exported common-module method its configuration
+/// names as the handler: `handlers` holds `(object, module, method)` as written in the
+/// metadata, and `(mdo_type, kind)` say which node the edge leaves and how it is labelled.
+fn project_metadata_handler_edges<DB: ConfigsDatabase>(
+    db: &DB,
+    representative: FileId,
+    index: &GraphIndex,
+    state: &mut GraphBuildState,
+    (mdo_type, kind): (MdoType, EdgeKind),
+    handlers: Vec<(String, String, String)>,
+) -> Vec<WorkspaceCallEdge> {
     // Resolve the handler's common module by name through the source-root module index,
-    // not the visibility-gated resolver: a subscription's handler is named by
-    // configuration metadata and is referenced regardless of code-visibility scoping,
-    // matching the `MissingEventSubscriptionHandler` diagnostic's "anywhere" lookup.
+    // not the visibility-gated resolver: a handler is named by configuration metadata and
+    // is referenced regardless of code-visibility scoping, matching the "anywhere" lookup
+    // of the `MissingEventSubscriptionHandler` and `ScheduledJobHandler` diagnostics.
     let source_root_id = db.file_source_root_input(representative).source_root_id(db);
     let module_index = db.module_index(source_root_id);
 
-    // Collect (subscription, handler module, handler method) deterministically so the
-    // shared canonicalization sees a load-order-independent first-seen spelling.
-    let mut subs: Vec<(String, crate::name::Name, crate::name::Name)> = Vec::new();
-    for sub in db.enumerate_event_subscriptions(representative) {
-        let Some(handler) = sub.parse_handler() else { continue };
-        if handler.method_name.is_empty() {
-            continue;
-        }
-        subs.push((
-            sub.name().to_string(),
-            crate::name::Name::new(&handler.module_name),
-            crate::name::Name::new(&handler.method_name),
-        ));
-    }
-    subs.sort();
-    subs.dedup();
+    // Collect (object, handler module, handler method) deterministically so the shared
+    // canonicalization sees a load-order-independent first-seen spelling.
+    let mut handlers: Vec<(String, crate::name::Name, crate::name::Name)> = handlers
+        .into_iter()
+        .filter(|(_, _, method_name)| !method_name.is_empty())
+        .map(|(object, module_name, method_name)| {
+            (object, crate::name::Name::new(&module_name), crate::name::Name::new(&method_name))
+        })
+        .collect();
+    handlers.sort();
+    handlers.dedup();
 
     let mut edges = Vec::new();
     let mut seen: FxHashSet<(GraphNode, GraphNode)> = FxHashSet::default();
-    for (sub_name, module_name, method_name) in &subs {
+    for (object, module_name, method_name) in &handlers {
         let Some(handler_file) = module_index.resolve_common_module(module_name) else { continue };
         let module_id = ModuleId::new(handler_file);
         let Some(m) = index.find_method(module_id, method_name) else { continue };
         if !m.is_export {
             continue;
         }
-        let object_name = state.mdo_canonical.canonical(MdoType::EventSubscription, sub_name);
-        let from = GraphNode::Mdo { mdo_type: MdoType::EventSubscription, object_name };
+        let object_name = state.mdo_canonical.canonical(mdo_type, object);
+        let from = GraphNode::Mdo { mdo_type, object_name };
         let to = GraphNode::Method(MethodId { module: module_id, local_id: m.local_id });
         if seen.insert((from.clone(), to.clone())) {
             edges.push(WorkspaceCallEdge {
                 from,
                 to,
-                kind: EdgeKind::EventSubscriptionRef,
+                kind,
                 provenance: EdgeProvenance::StringResolved,
                 call_site: CallSite::Structural,
                 crosses_client_to_server: false,
@@ -2233,6 +2287,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::NotifyRef => "notify_ref",
         EdgeKind::IdleHandler => "idle_handler",
         EdgeKind::EventSubscriptionRef => "event_subscription",
+        EdgeKind::ScheduledJobRef => "scheduled_job",
         EdgeKind::RegisterMovement => "register_movement",
         EdgeKind::SubsystemMembership => "subsystem_membership",
         EdgeKind::RoleReference => "role_reference",

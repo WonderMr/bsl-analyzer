@@ -8901,6 +8901,104 @@ mod tests {
         );
     }
 
+    fn scheduled_job_xml(name: &str, method_name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <ScheduledJob uuid="00000000-0000-0000-0000-000000000073">
+        <Properties>
+            <Name>{name}</Name>
+            <MethodName>{method_name}</MethodName>
+            <Use>true</Use>
+            <Predefined>false</Predefined>
+        </Properties>
+    </ScheduledJob>
+</MetaDataObject>"#
+        )
+    }
+
+    /// A method only the platform scheduler calls has no caller in code: its scheduled
+    /// job is the incoming edge, both for a job of the base and for a job an extension
+    /// declares itself.
+    #[test]
+    fn a_scheduled_job_is_the_incoming_edge_of_its_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(
+            root,
+            "Обмен",
+            true,
+            "&НаСервере\nПроцедура Выгрузить() Экспорт\nКонецПроцедуры",
+        );
+        write(
+            root,
+            "ScheduledJobs/ВыгрузкаДанных.xml",
+            &scheduled_job_xml("ВыгрузкаДанных", "CommonModule.Обмен.Выгрузить"),
+        );
+        let ext = root.join("ext/a");
+        write(&ext, "Configuration.xml", "<Configuration/>");
+        write_common_module(
+            &ext,
+            "ОтправкаВнешняя",
+            true,
+            "&НаСервере\nПроцедура Отправить() Экспорт\nКонецПроцедуры",
+        );
+        write(
+            &ext,
+            "ScheduledJobs/ОтправкаДанных.xml",
+            &scheduled_job_xml("ОтправкаДанных", "CommonModule.ОтправкаВнешняя.Отправить"),
+        );
+        declare_scoped_extension(root, "a", "ext/a");
+
+        let out = graph_db_path(root);
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        build_whole_graph(
+            root,
+            &out,
+            1,
+            &crate::graph_db::GraphMeta {
+                revision: 1,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                files: 2,
+                built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
+            },
+        )
+        .expect("graph database builds");
+        let gdb = GraphDb::open(&out).expect("graph database opens");
+
+        for (handler, job) in [
+            ("method/common/Обмен/Выгрузить", "mdo/ScheduledJob/ВыгрузкаДанных"),
+            ("method/common/ОтправкаВнешняя/Отправить", "mdo/ScheduledJob/ОтправкаДанных"),
+        ] {
+            let params = ide::NeighborsParams {
+                id: handler,
+                dir: ide::Direction::In,
+                depth: 1,
+                max_nodes: 50,
+                detail: ide::GraphDetail::Names,
+                provenance_filter: Vec::new(),
+                edge_kind_filter: Vec::new(),
+                call_sites: false,
+                max_call_sites: 0,
+            };
+            let unfiltered = gdb.neighbors(&params, None).unwrap().expect("the handler is a node");
+            let callers: Vec<&str> = unfiltered.nodes.iter().map(|node| node.id.as_str()).collect();
+            assert_eq!(callers, [job], "{handler}: the job is the only caller");
+            assert_eq!(unfiltered.in_total, Some(1), "{handler}");
+
+            let filter = vec!["scheduled_job".to_string()];
+            let params = ide::NeighborsParams { edge_kind_filter: filter, ..params };
+            let filtered = gdb.neighbors(&params, None).unwrap().expect("the handler is a node");
+            assert_eq!(filtered.edges.len(), 1, "{handler}: {:?}", filtered.edges);
+            let edge = &filtered.edges[0];
+            assert_eq!(edge.kind, "scheduled_job");
+            assert_eq!(edge.provenance, "string_resolved");
+            assert_eq!(edge.from.as_deref(), Some(job), "{handler}");
+        }
+    }
+
     /// The SQLite reader must keep the in-memory resolver's id semantics: a
     /// malformed id is `BadId` (not `NotFound`), and a metadata id resolves
     /// case-insensitively on its type and object name.
@@ -11810,6 +11908,48 @@ mod form_twin_tests {
             v.into_iter().map(|(n, q)| (n, q.to_ascii_lowercase())).collect()
         };
         assert_eq!(fold(lower_form), fold(upper_form), "квалификация форменного обработчика");
+    }
+
+    /// A scheduled job's edge leads into a method, which the metadata-only patch cannot
+    /// project: an edit of the job's XML is never taken as a local owner delta, while an
+    /// edit of a catalog in the same tree still is.
+    #[test]
+    fn a_scheduled_job_xml_edit_is_not_a_local_owner_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Configuration.xml", "<Configuration/>");
+        sample_workspace(root);
+        write_catalog_attribute(root, "Товары", "ИНН");
+        write(
+            root,
+            "ScheduledJobs/Пересчет.xml",
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><ScheduledJob uuid="00000000-0000-0000-0000-000000000073"><Properties><Name>Пересчет</Name><MethodName>CommonModule.Сервер.Считать</MethodName><Use>true</Use><Predefined>false</Predefined></Properties></ScheduledJob></MetaDataObject>"#,
+        );
+
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_for_build_to_settle(&graph);
+
+        let db_path = crate::cache::graph_db_path(root);
+        let (_, edges) = full_projection(&db_path);
+        let job_edges: Vec<_> =
+            edges.iter().filter(|row| row.contains("mdo/ScheduledJob/Пересчет")).collect();
+        assert!(job_edges.iter().any(|row| row.contains("scheduled_job")), "{job_edges:?}");
+
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
+        let universe = crate::graph::universe::ScannedUniverse::scan_project(&project);
+        let canonical = root.canonicalize().unwrap();
+        let delta = |rel: &str| {
+            let path: std::path::PathBuf = canonical.join(rel).components().collect();
+            crate::graph_db::local_metadata_delta(&project, &universe, &db_path, &[path]).unwrap()
+        };
+        assert!(delta("Catalogs/Товары.xml").is_some(), "a catalog edit stays a local owner delta");
+        assert!(delta("ScheduledJobs/Пересчет.xml").is_none(), "a job edit takes the full build");
     }
 
     #[test]

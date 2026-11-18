@@ -366,6 +366,7 @@ fn edge_kind(kind: &str) -> &'static str {
         "notify_ref" => "notify_ref",
         "idle_handler" => "idle_handler",
         "event_subscription" => "event_subscription",
+        "scheduled_job" => "scheduled_job",
         "register_movement" => "register_movement",
         "subsystem_membership" => "subsystem_membership",
         "role_reference" => "role_reference",
@@ -2212,6 +2213,7 @@ mod tests {
         assert_eq!(edge_kind("notify_ref"), "notify_ref");
         assert_eq!(edge_kind("idle_handler"), "idle_handler");
         assert_eq!(edge_kind("event_subscription"), "event_subscription");
+        assert_eq!(edge_kind("scheduled_job"), "scheduled_job");
         assert_eq!(provenance("string_resolved"), "string_resolved");
         // The catch-all still normalizes a genuinely unknown string.
         assert_eq!(edge_kind("call"), "call");

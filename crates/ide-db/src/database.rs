@@ -1837,6 +1837,58 @@ impl RootDatabaseImpl {
         )
     }
 
+    /// Every scheduled job of every configured root, base and extensions alike. The
+    /// scheduled-job counterpart of [`enumerate_event_subscriptions_for_file`]: the graph
+    /// needs a job an extension declares itself, which the main-listing lookups above do
+    /// not see.
+    pub fn enumerate_scheduled_jobs_for_file(
+        &self,
+        file_id: FileId,
+    ) -> Vec<Arc<bsl_metadata::ScheduledJob>> {
+        let paths = RootDatabaseImpl::all_config_paths(self);
+        if !paths.is_empty() {
+            let mut listings = Vec::with_capacity(paths.len());
+            for (_, path) in &paths {
+                let Some(listing) = self.metadata_listing(&path.to_string_lossy()) else {
+                    listings.clear();
+                    break;
+                };
+                listings.push(listing);
+            }
+            if !listings.is_empty() {
+                let mut out = Vec::new();
+                for listing in listings {
+                    let names: Vec<String> = listing
+                        .scheduled_jobs(self)
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect();
+                    for name in names {
+                        if let Some(job) = metadata::resolve_scheduled_job(self, listing, name) {
+                            out.push(job);
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+
+        // With no configured roots (single-file mode) the inventory is empty; fall back
+        // to the file's own discovered configuration like the per-file resolvers do.
+        let inventory = RootDatabase::all_configurations_inventory(self);
+        let configs: Vec<Arc<bsl_metadata::Configuration>> = if inventory.is_empty() {
+            self.get_configuration(file_id).into_iter().collect()
+        } else {
+            inventory.into_iter().map(|(_, config)| config).collect()
+        };
+        configs
+            .into_iter()
+            .flat_map(|config| {
+                config.scheduled_jobs().iter().cloned().map(Arc::new).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn resolve_role_for_file(
         &self,
         file_id: FileId,
@@ -3499,6 +3551,10 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
 
     fn scheduled_job_names(&self, file_id: FileId) -> Vec<String> {
         RootDatabaseImpl::scheduled_job_names_for_file(self, file_id)
+    }
+
+    fn enumerate_scheduled_jobs(&self, file_id: FileId) -> Vec<Arc<bsl_metadata::ScheduledJob>> {
+        RootDatabaseImpl::enumerate_scheduled_jobs_for_file(self, file_id)
     }
 
     fn resolve_http_service(

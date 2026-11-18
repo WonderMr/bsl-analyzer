@@ -394,6 +394,12 @@ pub trait ConfigsDatabase: DefDatabase {
     /// enumeration. File-scoped like [`resolve_scheduled_job`].
     fn scheduled_job_names(&self, file_id: FileId) -> Vec<String>;
 
+    /// Explicit project/config enumeration for graph-style consumers that need every
+    /// scheduled job's handler, from the base and from every extension: unlike the
+    /// main-listing single-name lookup above, a job an extension declares itself must be
+    /// seen too. The scheduled-job counterpart of [`enumerate_event_subscriptions`].
+    fn enumerate_scheduled_jobs(&self, file_id: FileId) -> Vec<Arc<ScheduledJob>>;
+
     /// Resolve the HTTP service `name` visible to `file_id` at per-service Salsa
     /// granularity. Wave 2d keeps main-listing parity with the current whole-config
     /// service surface.

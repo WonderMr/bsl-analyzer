@@ -1267,7 +1267,8 @@ impl ManagerType {
             | MdoType::CommonModule
             | MdoType::EventSubscription
             | MdoType::Subsystem
-            | MdoType::Role => None,
+            | MdoType::Role
+            | MdoType::ScheduledJob => None,
         }
     }
 

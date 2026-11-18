@@ -24,9 +24,9 @@ use hir::graph_index::{
     display_scope, encode_scope, form_qualified_prefix, form_scope, project_batch_call_edges,
     project_batch_form_edges, project_batch_query_edges, project_form_binding_edges,
     project_workspace_catalog_edges, project_workspace_register_records_edges,
-    project_workspace_role_edges, project_workspace_subscription_edges,
-    project_workspace_subsystem_edges, EdgeRow, GraphBuildState, GraphIndex, GraphRowEncoder,
-    NodeRow,
+    project_workspace_role_edges, project_workspace_scheduled_job_edges,
+    project_workspace_subscription_edges, project_workspace_subsystem_edges, EdgeRow,
+    GraphBuildState, GraphIndex, GraphRowEncoder, NodeRow,
 };
 use hir::{
     module_key_for_path, ConfigsDatabase, DefDatabase, GraphNode, MethodId, ModuleId, ModuleIndex,
@@ -1351,6 +1351,17 @@ pub fn build_workspace_graph_rows(
         mark("subscription_edges");
         let db = open_batch(first);
         let edges = project_workspace_subscription_edges(&db, first[0].file_id, &index, &mut state);
+        emit(&edges, &mut summary, &mut seen_aux, sink)?;
+    }
+
+    // Phase F2 — `scheduled_job` edges: each `РегламентноеЗадание` → its exported handler
+    // method, the scheduler's dispatch that no code call shows. Same lifecycle as Phase F:
+    // config-level, sharing `state`, full-build only.
+    if let Some(&first) = batches.first() {
+        mark("scheduled_job_edges");
+        let db = open_batch(first);
+        let edges =
+            project_workspace_scheduled_job_edges(&db, first[0].file_id, &index, &mut state);
         emit(&edges, &mut summary, &mut seen_aux, sink)?;
     }
 
@@ -3289,6 +3300,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::NotifyRef => "notify_ref",
         EdgeKind::IdleHandler => "idle_handler",
         EdgeKind::EventSubscriptionRef => "event_subscription",
+        EdgeKind::ScheduledJobRef => "scheduled_job",
         EdgeKind::RegisterMovement => "register_movement",
         EdgeKind::SubsystemMembership => "subsystem_membership",
         EdgeKind::RoleReference => "role_reference",

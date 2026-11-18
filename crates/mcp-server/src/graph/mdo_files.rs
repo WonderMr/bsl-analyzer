@@ -19,8 +19,7 @@ use ide::graph_index::{mdo_files_key, MdoFiles};
 /// the only key on which a base `товары` and an extension `Товары` meet at all.
 ///
 /// Collected here is what `bsl_metadata` can discover AND the graph can key: a
-/// defined type or a scheduled job is discovered but has no [`MdoType`], so no
-/// `Mdo` node ever names it.
+/// defined type is discovered but has no [`MdoType`], so no `Mdo` node ever names it.
 ///
 /// The reverse gap is real and is not covered: `MdoType::ExternalDataSource`
 /// exists and the graph does emit nodes for it, but nothing discovers that
@@ -101,6 +100,9 @@ fn collect_root(
     }
     for subscription in bsl_metadata::discover_event_subscription_structure(root, tree) {
         put(MdoType::EventSubscription, &subscription.name, &subscription.main);
+    }
+    for job in bsl_metadata::discover_scheduled_job_structure(root, tree) {
+        put(MdoType::ScheduledJob, &job.name, &job.main);
     }
 }
 
@@ -204,11 +206,16 @@ mod tests {
             "/ws/cf/Roles/ПолныеПрава.xml",
             "/ws/cf/Subsystems/Продажи.xml",
             "/ws/cf/EventSubscriptions/ПриЗаписи.xml",
+            "/ws/cf/ScheduledJobs/Выгрузка.xml",
         ]);
         let map = mdo_files(&configs(&[(None, "/ws/cf")]), &tree);
 
         assert!(file_of(&map, MdoType::Role, "полныеправа").is_some());
         assert!(file_of(&map, MdoType::Subsystem, "продажи").is_some());
         assert!(file_of(&map, MdoType::EventSubscription, "призаписи").is_some());
+        assert_eq!(
+            file_of(&map, MdoType::ScheduledJob, "выгрузка").as_deref(),
+            Some("/ws/cf/ScheduledJobs/Выгрузка.xml"),
+        );
     }
 }

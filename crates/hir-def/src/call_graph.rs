@@ -281,6 +281,11 @@ pub enum EdgeKind {
     /// subscription's [`GraphNode::Mdo`] to the handler [`GraphNode::Method`]. Derived
     /// from configuration metadata, not from code.
     EventSubscriptionRef,
+    /// A `РегламентноеЗадание` metadata object links to the handler method named in its
+    /// `MethodName`. From the job's [`GraphNode::Mdo`] (type [`MdoType::ScheduledJob`]) to the
+    /// handler [`GraphNode::Method`]. Derived from configuration metadata, not from code: the
+    /// platform scheduler is the only caller such a method may have.
+    ScheduledJobRef,
     /// A document touches register records through a `Движения.<Регистр>.<метод>()` call
     /// (`Добавить`/`Записать`/`Очистить`/`Загрузить`/`Выгрузить`). From the writing
     /// `Method`/`ModuleCode` node to the touched register's [`GraphNode::Mdo`]. The

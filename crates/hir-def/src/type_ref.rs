@@ -170,7 +170,8 @@ fn mdo_ref_prefix(mdo: MdoType) -> Option<&'static str> {
         | MdoType::CommonModule
         | MdoType::EventSubscription
         | MdoType::Subsystem
-        | MdoType::Role => None,
+        | MdoType::Role
+        | MdoType::ScheduledJob => None,
     }
 }
 

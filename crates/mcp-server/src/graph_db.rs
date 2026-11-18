@@ -88,7 +88,10 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
-pub(crate) const SCHEMA_VERSION: u32 = 25;
+// 26: `scheduled_job` edges link each scheduled job to its handler method. A version-25
+// artefact has none, and nothing about the workspace changed, so no fingerprint moves: it
+// would keep answering that a handler only the scheduler calls has no caller.
+pub(crate) const SCHEMA_VERSION: u32 = 26;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -1636,6 +1639,18 @@ pub(crate) fn local_metadata_delta(
                 return Ok(None);
             }
         }
+        // A scheduled job's edge leads into its handler method, and the metadata-only
+        // projection has no method index to derive it again: replacing the job as an
+        // owner would delete the edge and never write it back. Its XML edits stay on the
+        // full-build path.
+        let job_prefix = format!("mdo/{}/", bsl_metadata::MdoType::ScheduledJob.english_name());
+        if current_owner
+            .into_iter()
+            .chain(&previous_mdo_owners)
+            .any(|owner| owner.starts_with(&job_prefix))
+        {
+            return Ok(None);
+        }
         // An MDO's forms can bind directly to its attributes. Reproject every form
         // module owned by that object together with the catalog rows so data_binding
         // edges are rebuilt from the same metadata generation.
@@ -2868,18 +2883,19 @@ fn plan_caller_delta(
     let changed_files: std::collections::BTreeSet<&str> =
         sig_changed.iter().map(|(f, _)| *f).collect();
 
-    // A signature change in an event-subscription handler module can invalidate its
-    // config-level `mdo -> method` subscription edge — but that edge's source is an
-    // `mdo` node, which the resolved-caller fan-out below never selects (it asks for
-    // BSL source by kind), and the body-only reproject never re-derives Phase F.
+    // A signature change in an event-subscription or scheduled-job handler module can
+    // invalidate its config-level `mdo -> method` handler edge — but that edge's source is
+    // an `mdo` node, which the resolved-caller fan-out below never selects (it asks for
+    // BSL source by kind), and the body-only reproject never re-derives Phases F and F2.
     // Bail to a full rebuild so a removed/unexported/renamed handler cannot leave a
-    // dangling subscription edge.
+    // dangling handler edge.
     {
         let mut stmt = conn.prepare(
             "SELECT 1 FROM edges e JOIN nodes n1 ON e.to_id = n1.id \
              JOIN changed_file_keys changed ON changed.root_id = n1.file_root_id \
                  AND changed.path = n1.file_path \
-             WHERE n1.kind = 'method' AND e.kind = 'event_subscription' LIMIT 1",
+             WHERE n1.kind = 'method' AND e.kind IN ('event_subscription', 'scheduled_job') \
+             LIMIT 1",
         )?;
         if stmt.exists([])? {
             return Ok(None);
