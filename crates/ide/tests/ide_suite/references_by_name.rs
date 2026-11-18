@@ -1942,6 +1942,50 @@ fn the_object_of_a_module_is_found_in_both_path_layouts() {
     );
 }
 
+// --- a configuration the project does not load -------------------------------------------
+
+const CALLS_THE_BASE: &str = "\
+Процедура Свой() Экспорт
+    БазовыйМодуль.Экспортируемая();
+КонецПроцедуры
+";
+
+/// An extension-only project calls into the configuration it extends without loading it, so
+/// a name of that configuration finds nothing. The answer carries the owner no loaded root
+/// declares — without it `not_found` reads as "nobody declares it, so nobody calls it" —
+/// while a name of the extension's own module, which IS loaded, keeps its conclusive answer.
+/// Loading the main configuration takes the mark away.
+#[test]
+fn a_name_of_a_configuration_the_project_does_not_load_says_so() {
+    let module = FileId(0);
+    let path = cfe_root("independent").join("CommonModules/МодульНезависимый/Ext/Module.bsl");
+    let mut file_set = FileSet::default();
+    file_set.insert(module, VfsPath::new(path.to_string_lossy().to_string()));
+    let mut db = RootDatabaseImpl::new();
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(module, SourceRootId(0));
+    db.set_file_text(module, CALLS_THE_BASE);
+    let scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+    let extension = (Some("independent".to_string()), cfe_root("independent"));
+    db.set_all_config_paths(vec![extension.clone()], scope);
+
+    let vendor = by_name(&db, "БазовыйМодуль.Экспортируемая");
+    assert_eq!(vendor.outcome, ReferencesOutcome::NotFound);
+    assert_eq!(vendor.unloaded_owner.as_deref(), Some("БазовыйМодуль"));
+
+    let own_missing = by_name(&db, "МодульНезависимый.НетТакого");
+    assert_eq!(own_missing.outcome, ReferencesOutcome::NotFound);
+    assert_eq!(own_missing.unloaded_owner, None, "the extension's own module is loaded");
+
+    let own = by_name(&db, "МодульНезависимый.Свой");
+    assert_eq!(own.outcome, ReferencesOutcome::Resolved);
+    assert_eq!(own.unloaded_owner, None);
+
+    db.set_all_config_paths(vec![(None, cfe_root("base")), extension], scope);
+    let with_base = by_name(&db, "БазовыйМодуль.Экспортируемая");
+    assert_eq!(with_base.unloaded_owner, None, "{:?}", with_base.outcome);
+}
+
 // --- the self-certifying anchor -----------------------------------------------------------
 
 fn by_text(

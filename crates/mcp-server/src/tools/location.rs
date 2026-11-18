@@ -282,9 +282,11 @@ reason_code! {
     OutOfAnalysisScope => "out_of_analysis_scope";
     /// A modality or subsystem the answer would normally use was unavailable.
     ModalityDegraded => "modality_degraded";
-    /// The file belongs to an external data processor or report analyzed without
-    /// the configuration it was written for: its calls into that configuration
-    /// are reported as unresolved.
+    /// The configuration the subject belongs to is not part of the project: a file of an
+    /// external data processor or report analyzed without the configuration it was written
+    /// for, whose calls into that configuration are reported as unresolved; or a name whose
+    /// module or object no loaded root declares while the project loads no main
+    /// configuration, so finding nothing about it proves nothing.
     OwningConfigurationMissing => "owning_configuration_missing";
 }
 
@@ -341,6 +343,24 @@ impl Completeness {
             self.reasons.push(Reason { code, detail: detail.into() });
         }
         self
+    }
+
+    /// Record that the name answered about belongs to `owner`, a module or object no loaded
+    /// configuration declares (see `ide::owner_outside_loaded_configurations`). One wording
+    /// for every tool that resolves names, so a consumer reads the same fact the same way.
+    pub fn when_owner_unloaded(self, owner: Option<&str>) -> Self {
+        match owner {
+            Some(owner) => self.when(
+                true,
+                ReasonCode::OwningConfigurationMissing,
+                format!(
+                    "`{owner}` is declared by no loaded configuration and the project loads no \
+                     main configuration; the name may be declared there, so finding nothing \
+                     here is no proof that it does not exist"
+                ),
+            ),
+            None => self,
+        }
     }
 
     pub fn is_complete(&self) -> bool {

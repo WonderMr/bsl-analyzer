@@ -10,8 +10,8 @@ use syntax::{SyntaxKind, TextRange, TextSize};
 use vfs::FileId;
 
 use crate::declarations::{
-    classify_unreferenceable, resolve_declarations, Declaration, DeclarationKind,
-    UnsupportedCategory,
+    classify_unreferenceable, owner_outside_loaded_configurations, resolve_declarations,
+    Declaration, DeclarationKind, UnsupportedCategory,
 };
 use crate::name_lookup::{lookup_names, NameLookupResult, NameMatchTier, NameQuery};
 use crate::reference_kind::{classify_reference_token, ReferenceKind};
@@ -318,6 +318,11 @@ pub struct ReferencesResult {
     /// The places a text anchor could not choose between. Empty for every
     /// outcome other than an ambiguity the quoted line produced.
     pub anchor_sites: Vec<AnchorSite>,
+    /// The owner a `NotFound` name addresses — a common module, a metadata object — when no
+    /// loaded root declares it and the project loads no main configuration that could. The
+    /// name may then be declared in the configuration that is not loaded, so the answer is
+    /// no proof that it does not exist. `None` for every other outcome.
+    pub unloaded_owner: Option<String>,
 }
 
 impl ReferencesResult {
@@ -334,6 +339,7 @@ impl ReferencesResult {
             anchor_candidates_capped: false,
             anchor_line: None,
             anchor_sites: Vec::new(),
+            unloaded_owner: None,
         }
     }
 }
@@ -429,6 +435,18 @@ impl Anchored {
             Self::Walk(walk) => Self::Walk(ReferenceWalk { anchor_candidates_capped, ..walk }),
         }
     }
+
+    /// A `NotFound` about a name whose owner no loaded configuration declares says only that
+    /// the loaded roots do not hold it; which configuration is missing travels with it.
+    fn with_unloaded_owner(self, db: &RootDatabaseImpl, name: &str) -> Self {
+        match self {
+            Self::Answered(result) if result.outcome == ReferencesOutcome::NotFound => {
+                let unloaded_owner = owner_outside_loaded_configurations(db, name);
+                Self::Answered(ReferencesResult { unloaded_owner, ..result })
+            }
+            other => other,
+        }
+    }
 }
 
 /// Resolve the anchor and decide which files to walk — the first of the three steps
@@ -496,7 +514,7 @@ fn resolve_by_name(
                     ReferencesOutcome::UnsupportedSymbol { category },
                     BodySource::Resident,
                 )),
-                None => dictionary.result,
+                None => dictionary.result.with_unloaded_owner(db, name),
             }
         }
         _ => Anchored::Answered(ReferencesResult {
@@ -1015,6 +1033,7 @@ pub fn finish_references(
         anchor_candidates_capped,
         anchor_line,
         anchor_sites: Vec::new(),
+        unloaded_owner: None,
     }
 }
 

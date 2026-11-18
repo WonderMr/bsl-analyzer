@@ -177,6 +177,75 @@ pub fn resolve_declarations(db: &RootDatabaseImpl, name: &str) -> Vec<Declaratio
     rank_and_order(db, &found)
 }
 
+/// The owner a qualified name addresses — the common module of `Модуль.Член`, the object of
+/// `Тип.Объект` and of `Тип.Объект.Член` — when no loaded root declares it and the project
+/// loads no main configuration that could.
+///
+/// An extension, or an external data processor, calls into the configuration it was written
+/// for. When that configuration is not part of the project, a name of it resolves to nothing,
+/// and "no declaration found" is then no evidence that the name has none: the reader would
+/// take it for "nobody declares it, so nobody calls it". `None` whenever the absence is
+/// conclusive — the main configuration is loaded, or some loaded root declares the owner — and
+/// for a name of any other shape. A project that declares no root at all says nothing about
+/// which configuration it was written for, and is left alone too.
+///
+/// The owner is looked for both as a module body and in the metadata listings, so a module
+/// declared without a readable body still counts as declared.
+pub fn owner_outside_loaded_configurations(db: &RootDatabaseImpl, name: &str) -> Option<String> {
+    let roots = db.workspace_configs_snapshot();
+    if roots.paths.is_empty() || roots.has_base() {
+        return None;
+    }
+    let segments: Vec<&str> = name.split('.').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let (owner, spelled) = match segments.as_slice() {
+        // `Тип.Объект` names the object itself, `Модуль.Член` a member of the module.
+        [first, second] => match typed_owner(first, second) {
+            Some(owner) => (owner, format!("{first}.{second}")),
+            None => (Owner::Common { name: first.fold_lower() }, (*first).to_string()),
+        },
+        [mdo, object, _] => (typed_owner(mdo, object)?, format!("{mdo}.{object}")),
+        _ => return None,
+    };
+
+    let source_root = db.source_root_input(ROOT).root(db);
+    let file_set = source_root.file_set();
+    for file_id in source_root.iter() {
+        db.unwind_if_revision_cancelled();
+        let Some(path) = file_set.path_for_file(&file_id) else { continue };
+        let path = path.as_path().to_string_lossy().replace('\\', "/");
+        if module_key_for_path(&path).is_some_and(|key| owner.rank_of(&key).is_some()) {
+            return None;
+        }
+    }
+
+    for (_, root) in &roots.paths {
+        let Some(listing) = db.metadata_listing(&root.to_string_lossy()) else { continue };
+        let declared = match &owner {
+            Owner::Common { name } => {
+                listing.common_modules(db).iter().any(|entry| entry.name.fold_lower() == *name)
+            }
+            Owner::Object { mdo_type, name } => {
+                let entries = listing.entries(db);
+                let mut of_kind = entries.iter().filter(|entry| entry.kind == *mdo_type);
+                of_kind.any(|entry| entry.name.fold_lower() == *name)
+            }
+        };
+        if declared {
+            return None;
+        }
+    }
+    Some(spelled)
+}
+
+/// The owner a `Тип.Объект` pair names: the module for `ОбщийМодуль`, the metadata object for
+/// every other type. `None` when the first segment names no metadata type.
+fn typed_owner(mdo: &str, object: &str) -> Option<Owner> {
+    Some(match parse_mdo_type(mdo)? {
+        bsl_metadata::MdoType::CommonModule => Owner::Common { name: object.fold_lower() },
+        mdo_type => Owner::Object { mdo_type, name: object.fold_lower() },
+    })
+}
+
 /// Keep the best-ranked declaration per object and put them in file order — the
 /// reduction that follows the module walk.
 ///

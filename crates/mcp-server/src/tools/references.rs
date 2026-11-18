@@ -776,7 +776,10 @@ fn render(
                 // the thing it holds is text, and text is what narrows it.
                 anchor_cap_detail(anchor),
             )
-            .when(unread_files > 0, loc::ReasonCode::UnreadableFiles, UNREADABLE),
+            .when(unread_files > 0, loc::ReasonCode::UnreadableFiles, UNREADABLE)
+            // An extension-only project answers `not_found` for every name of the
+            // configuration it extends; without the reason that reads as "nobody calls it".
+            .when_owner_unloaded(result.unloaded_owner.as_deref()),
     }
 }
 
@@ -1772,6 +1775,7 @@ mod tests {
             anchor_candidates_capped: false,
             anchor_line: None,
             anchor_sites: Vec::new(),
+            unloaded_owner: None,
         }
     }
 
@@ -1971,6 +1975,62 @@ mod tests {
             assert_eq!(ReferenceKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(ReferenceKind::parse("handler"), None, "an undeclared kind is refused");
+    }
+
+    /// A `not_found` about a name whose module no loaded configuration declares is partial,
+    /// and the reason names that module: in an extension-only project the extended
+    /// configuration's names all miss, and a whole `not_found` would read as "nobody calls
+    /// it". The control is the same `not_found` without the mark, which stays whole.
+    #[test]
+    fn a_name_of_an_unloaded_configuration_makes_not_found_partial() {
+        let db = ide::RootDatabaseImpl::new();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(
+            std::path::Path::new("/ws"),
+            std::path::Path::new("/ws/src/cfe/Расширение"),
+            &[],
+        );
+        let params = Params {
+            symbol: Some("ОбщегоНазначения.ЗначениеРеквизитаОбъекта"),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            line_content: None,
+            kinds: &[],
+            include_declaration: None,
+            limit: None,
+            max_files: None,
+            include_preview: None,
+        };
+        let anchor =
+            ide::ReferenceAnchor::Name("ОбщегоНазначения.ЗначениеРеквизитаОбъекта".to_owned());
+
+        let found = no_answer();
+        let whole =
+            render(&db, &roots, &found, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 0);
+        assert!(
+            whole.completeness.is_complete(),
+            "control: a miss about a loaded module is conclusive: {:?}",
+            whole.completeness.to_value(),
+        );
+
+        let miss =
+            ReferencesResult { unloaded_owner: Some("ОбщегоНазначения".to_owned()), ..no_answer() };
+        let partial =
+            render(&db, &roots, &miss, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 0);
+        assert_eq!(partial.body["outcome"], "not_found");
+        let completeness = partial.completeness.to_value();
+        assert_eq!(completeness["status"], "partial", "{completeness}");
+        let reason = completeness["reasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .find(|reason| reason["code"] == "owning_configuration_missing")
+            .expect("the unloaded configuration is a reason");
+        assert!(reason["detail"].as_str().unwrap().contains("`ОбщегоНазначения`"), "{reason}");
     }
 
     /// A workspace the resident could not read whole is not a workspace-wide enumeration,
