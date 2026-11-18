@@ -17,7 +17,12 @@
 //! is excluded when it, or any directory above it below the base, matches: that is
 //! how files no single directory can describe — a generated listing next to every
 //! template — are taken out under the same hard rule.
+//!
+//! The set may also carry what git leaves out below the source roots ([`GitIgnored`]):
+//! the directories the ignore rules of each root's work tree name, and the repository's
+//! linked worktrees. Those apply below a root only, never to the root itself.
 
+use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +38,44 @@ pub struct ExcludedPaths {
     /// Boxed so a set without patterns stays as small as it was: the set is embedded by
     /// value in many structures, enums among them.
     patterns: Option<Box<Patterns>>,
+    /// Shared by every copy of the set; `None` when no root has rules.
+    git: Option<Arc<GitIgnored>>,
+}
+
+/// What git leaves out below the project's source roots: the directories the ignore
+/// rules of each root's work tree name, and the repository's linked worktrees.
+///
+/// Only directories strictly below a root are matched, against the rules of the
+/// innermost root that holds them. A root that git ignores, or one inside a directory
+/// the rules of an enclosing root leave out, therefore keeps everything below it: being
+/// declared or found as a root is the stronger statement. Files are never matched one
+/// by one: a 1C dump keeps parts of its objects (`*.bin`, text templates) out of git
+/// while they stay on disk and in the configuration, so only whole directories go.
+#[derive(Debug, Clone, Default)]
+pub struct GitIgnored {
+    roots: Vec<GitRoot>,
+}
+
+#[derive(Debug, Clone)]
+struct GitRoot {
+    declared: PathBuf,
+    /// [`comparison_key`] of the declared spelling and of the resolved one when that
+    /// differs, each with the number of components it stands for.
+    spellings: Vec<(String, usize)>,
+    /// The rules of the work tree holding the root, with the root's path relative to the
+    /// top of that work tree, `/`-separated; `None` when no rules apply below the root.
+    tree: Option<(Arc<WorkTreeRules>, String)>,
+}
+
+/// The ignore rules of one git work tree, matched against the directories below it.
+#[derive(Debug)]
+pub struct WorkTreeRules {
+    /// Every line read, kept for equality: the compiled matcher cannot be compared.
+    lines: Vec<String>,
+    matcher: ignore::gitignore::Gitignore,
+    /// Directories relative to the top of the work tree, `/`-separated, each left out
+    /// whole.
+    directories: Vec<String>,
 }
 
 /// Glob patterns and the base they are relative to.
@@ -99,7 +142,14 @@ impl ExcludedPaths {
             }
             entries.push(Excluded { declared, spellings });
         }
-        Self { entries, patterns: None }
+        Self { entries, patterns: None, git: None }
+    }
+
+    /// Adds what git leaves out below the source roots. Roots without rules add nothing,
+    /// so the set stays equal to one built without them.
+    pub fn with_git_ignored(mut self, ignored: GitIgnored) -> Self {
+        self.git = if ignored.has_rules() { Some(Arc::new(ignored)) } else { None };
+        self
     }
 
     /// Sets the glob patterns, matched against paths relative to the absolute `base`; a
@@ -179,9 +229,9 @@ impl ExcludedPaths {
         Ok(self)
     }
 
-    /// Whether nothing is excluded: no directory and no pattern.
+    /// Whether nothing is excluded: no directory, no pattern and nothing git leaves out.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.patterns.is_none()
+        self.entries.is_empty() && self.patterns.is_none() && self.git.is_none()
     }
 
     /// The patterns as they were declared.
@@ -257,10 +307,14 @@ impl ExcludedPaths {
             .collect();
         let patterns =
             self.patterns.as_ref().map(|patterns| Box::new(patterns.respelled_under(&roots)));
-        Self { entries, patterns }
+        Self { entries, patterns, git: self.git.clone() }
     }
 
     /// Whether `path` is an excluded directory or lies anywhere beneath one.
+    ///
+    /// A directory git leaves out answers only for what lies beneath it, since the
+    /// question does not say whether `path` is a directory; a walk that reaches one is
+    /// pruned there by [`Self::prunes_walked_dir`].
     pub fn is_excluded(&self, path: &Path) -> bool {
         if self.is_empty() {
             return false;
@@ -269,6 +323,9 @@ impl ExcludedPaths {
             return true;
         }
         if self.patterns.as_ref().is_some_and(|patterns| patterns.matches_any_spelling(path)) {
+            return true;
+        }
+        if self.git.as_ref().is_some_and(|git| git.leaves_out(path, false)) {
             return true;
         }
         has_dot_components(path) && {
@@ -307,7 +364,7 @@ impl ExcludedPaths {
         if self.is_empty() {
             return false;
         }
-        if self.is_excluded(path) {
+        if self.is_excluded(path) || (!is_symlink && self.git_leaves_out_dir(path)) {
             return true;
         }
         let from_parent = || {
@@ -318,9 +375,15 @@ impl ExcludedPaths {
             (false, Some(canonical)) => canonical,
             _ => path.canonicalize().map(simplify_verbatim).unwrap_or_else(|_| path.to_path_buf()),
         };
-        let excluded = self.is_excluded(&canonical);
+        let excluded =
+            self.is_excluded(&canonical) || (!is_symlink && self.git_leaves_out_dir(&canonical));
         resolved.0.insert(path.to_path_buf(), canonical);
         excluded
+    }
+
+    /// Whether git leaves out the directory at `path` itself, not only what lies below it.
+    fn git_leaves_out_dir(&self, path: &Path) -> bool {
+        self.git.as_ref().is_some_and(|git| git.leaves_out(path, true))
     }
 
     /// [`Self::is_excluded_resolved`] for many paths in a row: the resolved spelling of
@@ -355,8 +418,8 @@ impl ExcludedPaths {
     ///
     /// The question a watcher asks before arming `dir` recursively: a recursive watch on
     /// such a directory would cover the exclusion too, including one that does not
-    /// exist yet and is only created later. Patterns do not count: any directory may
-    /// hold a match, so they are applied to each path a watch reports instead.
+    /// exist yet and is only created later. Patterns and git's rules do not count: any
+    /// directory may hold a match, so they are applied to each path a watch reports instead.
     pub fn has_exclusion_below(&self, dir: &Path) -> bool {
         if self.entries.is_empty() {
             return false;
@@ -488,6 +551,194 @@ fn strip_within(path: &Path, prefix: &Path) -> Option<PathBuf> {
     Some(path.components().skip(prefix.components().count()).collect())
 }
 
+impl GitIgnored {
+    /// Adds a source root. `tree` is the rules of the git work tree that holds the root,
+    /// with the root's path relative to the top of that work tree; `None` for a root
+    /// outside every work tree, which still decides for the paths inside it.
+    pub fn add_root(&mut self, root: &Path, tree: Option<(Arc<WorkTreeRules>, &Path)>) {
+        let declared = normalize_lexically(root);
+        let mut spellings = vec![(comparison_key(&declared), declared.components().count())];
+        if let Ok(resolved) = resolve(&declared) {
+            let spelling = (comparison_key(&resolved), resolved.components().count());
+            if !spellings.contains(&spelling) {
+                spellings.push(spelling);
+            }
+        }
+        let tree = tree.and_then(|(rules, relative)| {
+            let mut prefix = String::new();
+            for component in relative.components() {
+                let Component::Normal(name) = component else { continue };
+                push_name(&mut prefix, name);
+                // A root the rules leave out is still a root: nothing below it goes.
+                if rules.leaves_out(&prefix) {
+                    return None;
+                }
+            }
+            Some((rules, prefix))
+        });
+        self.roots.push(GitRoot { declared, spellings, tree });
+    }
+
+    fn has_rules(&self) -> bool {
+        self.roots.iter().filter_map(|root| root.tree.as_ref()).any(|(rules, _)| !rules.is_inert())
+    }
+
+    /// Whether `path` lies in a directory below its innermost root that the root's rules
+    /// leave out; with `itself`, also whether `path` is such a directory.
+    fn leaves_out(&self, path: &Path, itself: bool) -> bool {
+        if has_dot_components(path) {
+            return self.leaves_out_normalized(&normalize_lexically(path), itself);
+        }
+        self.leaves_out_normalized(path, itself)
+    }
+
+    fn leaves_out_normalized(&self, path: &Path, itself: bool) -> bool {
+        let key = comparison_key(path);
+        let mut innermost: Option<(&GitRoot, usize)> = None;
+        for root in &self.roots {
+            for (spelling, depth) in &root.spellings {
+                let within = key
+                    .strip_prefix(spelling.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+                if within && innermost.is_none_or(|(_, deepest)| *depth > deepest) {
+                    innermost = Some((root, *depth));
+                }
+            }
+        }
+        let Some((root, depth)) = innermost else { return false };
+        let Some((rules, prefix)) = &root.tree else { return false };
+        let names: Vec<&OsStr> = path
+            .components()
+            .skip(depth)
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let checked = if itself { names.len() } else { names.len().saturating_sub(1) };
+        let mut relative = prefix.clone();
+        for name in &names[..checked] {
+            push_name(&mut relative, name);
+            if rules.leaves_out(&relative) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl GitRoot {
+    /// What equality and hashing look at: the declared spelling, the root's place in its
+    /// work tree and that tree's rules as read, not what the file system resolved.
+    fn identity(&self) -> (&Path, Option<&str>, &[String], &[String]) {
+        let Some((rules, prefix)) = &self.tree else {
+            return (self.declared.as_path(), None, &[], &[]);
+        };
+        (self.declared.as_path(), Some(prefix.as_str()), &rules.lines, &rules.directories)
+    }
+}
+
+impl PartialEq for GitIgnored {
+    fn eq(&self, other: &Self) -> bool {
+        self.roots.iter().map(GitRoot::identity).eq(other.roots.iter().map(GitRoot::identity))
+    }
+}
+
+impl Eq for GitIgnored {}
+
+impl Hash for GitIgnored {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for root in &self.roots {
+            root.identity().hash(state);
+        }
+    }
+}
+
+impl WorkTreeRules {
+    /// Rules of the work tree whose top is `top`: the patterns in `ignore_files`, read in
+    /// gitignore format relative to `top`, and `directories`, relative to `top`, each left
+    /// out whole. A file that cannot be read adds nothing and a line that is not a valid
+    /// pattern is skipped: git reads its ignore files the same way.
+    pub fn new(top: &Path, ignore_files: &[PathBuf], directories: &[PathBuf]) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(top);
+        // Git ignores case in its patterns where the file system does (`core.ignorecase`),
+        // and so does the rest of this set.
+        let _ = builder.case_insensitive(cfg!(windows));
+        let mut lines = Vec::new();
+        for file in ignore_files {
+            let Ok(text) = std::fs::read_to_string(file) else { continue };
+            // Git skips a byte order mark at the start of an ignore file.
+            for line in text.trim_start_matches('\u{feff}').lines() {
+                if builder.add_line(Some(file.clone()), line).is_ok() {
+                    lines.push(line.to_owned());
+                }
+            }
+        }
+        let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+        let directories = directories
+            .iter()
+            .map(PathBuf::as_path)
+            .map(slash_separated)
+            .filter(|directory| !directory.is_empty())
+            .collect();
+        Self { lines, matcher, directories }
+    }
+
+    /// Whether the directory at `relative` (to the top, `/`-separated) is left out.
+    fn leaves_out(&self, relative: &str) -> bool {
+        self.matcher.matched(Path::new(relative), true).is_ignore()
+            || self.directories.iter().any(|directory| same_relative(directory, relative))
+    }
+
+    fn is_inert(&self) -> bool {
+        self.matcher.is_empty() && self.directories.is_empty()
+    }
+}
+
+/// `path` as compared with the roots of [`GitIgnored`]: its components joined by `/`,
+/// lower-cased on Windows, where the file system ignores case. Built once per path, so
+/// matching it against every root allocates nothing per root.
+fn comparison_key(path: &Path) -> String {
+    let mut key = String::new();
+    for component in path.components() {
+        key.push('/');
+        key.push_str(&component.as_os_str().to_string_lossy());
+    }
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// `path`'s plain names joined by `/`.
+fn slash_separated(path: &Path) -> String {
+    let mut out = String::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            push_name(&mut out, name);
+        }
+    }
+    out
+}
+
+fn push_name(path: &mut String, name: &OsStr) {
+    if !path.is_empty() {
+        path.push('/');
+    }
+    path.push_str(&name.to_string_lossy());
+}
+
+/// Whether two `/`-separated relative paths name the same directory, ignoring case on
+/// Windows as [`is_within`] does.
+fn same_relative(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.to_lowercase() == right.to_lowercase()
+    } else {
+        left == right
+    }
+}
+
 impl PartialEq for ExcludedPaths {
     fn eq(&self, other: &Self) -> bool {
         self.entries.len() == other.entries.len()
@@ -499,6 +750,7 @@ impl PartialEq for ExcludedPaths {
                 }
                 _ => false,
             }
+            && self.git == other.git
     }
 }
 
@@ -513,6 +765,9 @@ impl Hash for ExcludedPaths {
         if let Some(patterns) = &self.patterns {
             patterns.declared_base.hash(state);
             patterns.globs.sources.hash(state);
+        }
+        if let Some(git) = &self.git {
+            git.hash(state);
         }
     }
 }
@@ -889,5 +1144,112 @@ mod tests {
         assert!(!excluded.is_excluded(&base.join("kept/Module.bsl")));
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    const MODULE: &str = "CommonModules/M/Ext/Module.bsl";
+
+    /// A work tree at `name` whose `.gitignore` holds `gitignore`, and a set over `roots`
+    /// (relative to its top) with its rules and the listed `directories`.
+    fn git_ignored(
+        name: &str,
+        gitignore: &str,
+        roots: &[&str],
+        directories: &[&str],
+    ) -> (PathBuf, ExcludedPaths) {
+        let top = absolute(name);
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::write(top.join(".gitignore"), gitignore).unwrap();
+        let directories: Vec<PathBuf> = directories.iter().map(PathBuf::from).collect();
+        let rules = Arc::new(WorkTreeRules::new(&top, &[top.join(".gitignore")], &directories));
+        let mut ignored = GitIgnored::default();
+        for root in roots {
+            ignored.add_root(&top.join(root), Some((rules.clone(), Path::new(root))));
+        }
+        (top, ExcludedPaths::default().with_git_ignored(ignored))
+    }
+
+    #[test]
+    fn git_ignored_directories_below_a_root_are_left_out_but_files_are_not() {
+        // A byte order mark must not hide the first pattern: git skips it.
+        let gitignore = "\u{feff}.claude/\n*.bin\n/build\n";
+        let (top, excluded) = git_ignored("git-ignored", gitignore, &[""], &[]);
+
+        assert!(excluded.is_excluded(&top.join(".claude/worktrees/copy").join(MODULE)));
+        assert!(excluded.is_excluded(&top.join("build").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("src/build").join(MODULE)), "`/build` is anchored");
+        assert!(!excluded.is_excluded(&top.join(MODULE)));
+        assert!(
+            !excluded.is_excluded(&top.join("CommonModules/M/Ext/Module.bin")),
+            "a file is never matched on its own"
+        );
+        let mut resolved = ResolvedDirs::default();
+        assert!(excluded.prunes_walked_dir(&top.join(".claude"), false, &mut resolved));
+        assert!(!excluded.prunes_walked_dir(&top.join("CommonModules"), false, &mut resolved));
+        assert!(!excluded.prunes_walked_dir(&top, false, &mut resolved), "the root itself stays");
+
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_root_inside_an_ignored_directory_keeps_everything_below_it() {
+        let roots = ["", "build/cf", "work/cf"];
+        let (top, excluded) = git_ignored("git-ignored-root", "build/\nwork/**\n", &roots, &[]);
+
+        assert!(excluded.is_excluded(&top.join("build/other").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("build/cf").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("work/cf").join(MODULE)));
+        let mut resolved = ResolvedDirs::default();
+        assert!(!excluded.prunes_walked_dir(&top.join("build/cf"), false, &mut resolved));
+
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_listed_directory_is_left_out_whole() {
+        let (top, excluded) = git_ignored("git-listed", "", &[""], &["nested/copy"]);
+
+        assert!(excluded.is_excluded(&top.join("nested/copy").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("nested/other").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("nested/copy")), "only what lies below it");
+
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn rules_that_leave_nothing_out_change_nothing() {
+        let (top, excluded) = git_ignored("git-inert", "# a comment only\n", &[""], &[]);
+
+        assert!(excluded.is_empty());
+        assert_eq!(excluded, ExcludedPaths::default());
+        let mut outside = GitIgnored::default();
+        outside.add_root(&top, None);
+        assert_eq!(ExcludedPaths::default().with_git_ignored(outside), ExcludedPaths::default());
+
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn equality_follows_the_rules_as_read() {
+        let (top, first) = git_ignored("git-equality", ".claude/\n", &[""], &[]);
+        let (_, same) = git_ignored("git-equality", ".claude/\n", &[""], &[]);
+        let (_, other) = git_ignored("git-equality", "build/\n", &[""], &[]);
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_ne!(first, ExcludedPaths::default());
+
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_ignored_directories_ignore_case_on_windows() {
+        let (top, excluded) = git_ignored("git-case", ".Claude/\n", &[""], &["Nested/Copy"]);
+
+        assert!(excluded.is_excluded(&top.join(".claude/worktrees").join(MODULE)));
+        assert!(excluded.is_excluded(&top.join("nested/copy").join(MODULE)));
+
+        std::fs::remove_dir_all(&top).unwrap();
     }
 }
