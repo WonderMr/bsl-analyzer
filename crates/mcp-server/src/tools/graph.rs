@@ -43,7 +43,7 @@ pub fn direction_from(s: Option<&str>) -> Result<Direction, String> {
 }
 
 /// The agent-facing edge-kind labels accepted by the `edge_kinds` neighbour filter.
-const EDGE_KINDS: [&str; 14] = [
+pub(crate) const EDGE_KINDS: [&str; 14] = [
     "call",
     "manager_creates",
     "manager_access",
@@ -72,6 +72,19 @@ pub fn validate_edge_kinds(kinds: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The `edge_kinds` parameter description published in `tools/list`, built from
+/// `EDGE_KINDS`: an agent may pick its filter from this text without calling `schema`, so a
+/// kind the text leaves out is a kind its filters silently drop.
+pub(crate) fn edge_kinds_param_description() -> String {
+    format!(
+        "Keep only edges of these kinds ({}); empty keeps all. Lets metadata-impact queries \
+         isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a \
+         register manager is `register_record_set`, not `manager_creates`; the `schema` action \
+         explains each kind.",
+        EDGE_KINDS.join("|")
+    )
 }
 
 /// Default and ceiling for `max_call_sites`. The default is a working number of places for
@@ -899,6 +912,13 @@ mod tests {
             assert!(
                 advertised.contains(&kind),
                 "validator allowlist accepts edge_kind '{kind}' the schema does not advertise"
+            );
+        }
+        let neighbors_edge_kinds = schema["neighbors_params"]["edge_kinds"].as_str().unwrap();
+        for kind in EDGE_KINDS {
+            assert!(
+                neighbors_edge_kinds.contains(kind),
+                "neighbors_params.edge_kinds does not name accepted edge_kind '{kind}'"
             );
         }
         assert!(
