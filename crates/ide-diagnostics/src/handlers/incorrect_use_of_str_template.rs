@@ -557,16 +557,22 @@ mod tests {
             include_str!("fixtures/str_template_literal_concatenation.bsl"),
             DiagnosticCode::IncorrectUseOfStrTemplate,
             expect![[r#"
-                IncorrectUseOfStrTemplate @ 28:13..28:56
+                IncorrectUseOfStrTemplate @ 31:13..31:56
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 29:13..29:73
+                IncorrectUseOfStrTemplate @ 32:13..32:73
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 30:13..30:69
+                IncorrectUseOfStrTemplate @ 33:13..33:69
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 31:13..31:67
+                IncorrectUseOfStrTemplate @ 34:13..34:67
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 35:13..36:24
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 37:13..37:57
                   message: Некорректное использование СтрШаблон
                   severity: Blocker"#]],
         );

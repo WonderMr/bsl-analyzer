@@ -13,8 +13,10 @@ The current implementation checks several common problems:
   literal;
 - misplaced parentheses around `NStr(...)` make the template expression wrong.
 
-A template added up from string literals (`"Document No. %1" + " of %2"`, including
-an `NStr(...)` among the parts) is checked as one string. When a part is anything
+A multi-line template literal (continuation lines starting with `|`) is checked as a
+whole. A template added up from string literals (`"Document No. %1" + " of %2"`,
+including one in parentheses or with an `NStr(...)` among the parts) is checked as
+one string. When a part is anything
 but a literal, such as `Chars.LF`, a variable or a function call, the diagnostic
 stays silent: the value of that part is unknown and placeholders may come from it.
 
