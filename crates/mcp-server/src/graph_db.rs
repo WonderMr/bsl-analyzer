@@ -1203,10 +1203,14 @@ pub(crate) fn build_graph_database_inner(
     // chunking): kept alive until after `finalize`, so a wedge anywhere in the
     // pipeline gets reported rather than freezing silently.
     let ticker = ticker.unwrap_or_else(|| Arc::new(GraphBuildTicker::default()));
+    // One interval per note after the first: four per batch (index, call, query and form
+    // edges), then the seven whole-config passes, `done`, `validation` and `published`.
+    // A pass added without counting it here ends the estimate one note early, and a
+    // build still running reports no remaining time.
     ticker.set_eta_total_intervals(if batches.is_empty() {
         0
     } else {
-        batches.len().saturating_mul(4).saturating_add(8)
+        batches.len().saturating_mul(4).saturating_add(9)
     });
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));
