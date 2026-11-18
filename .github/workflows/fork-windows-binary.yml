@@ -1,0 +1,46 @@
+name: Fork Windows binary
+
+# Fork-only: builds bsl-analyzer-app.exe for Windows on every pull request to develop,
+# every push to develop and on demand, so a change can be tried on real 1C repositories
+# (MCP, LSP, analyze) before it is merged. Upstream CI does not publish this binary for
+# pull requests. Thin build: LTO off and 16 codegen units through the environment, so the
+# workspace Cargo.toml stays identical to upstream; the binary is for validation, not release.
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-windows-binary-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: bsl-analyzer-app (windows-amd64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-windows-binary
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+      - name: Build
+        run: cargo build --locked --release --bin bsl-analyzer-app
+      - name: Smoke
+        run: target/release/bsl-analyzer-app.exe --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bsl-analyzer-app-windows-amd64
+          path: target/release/bsl-analyzer-app.exe
+          retention-days: 14
