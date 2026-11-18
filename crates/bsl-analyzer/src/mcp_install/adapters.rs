@@ -597,7 +597,7 @@ fn claude_server_exists(
     if output.status == 0 {
         return Ok(true);
     }
-    if output.stderr.contains("No MCP server found with name") {
+    if claude_reports_absent_server(&output.stderr) {
         return Ok(false);
     }
     Err(InstallError::InspectionFailed {
@@ -605,6 +605,16 @@ fn claude_server_exists(
         name: name.to_owned(),
         message: output.stderr.trim().to_owned(),
     })
+}
+
+/// Claude Code has worded a missing server two ways: older releases print
+/// `No MCP server found with name: <name>`, current ones print `No MCP server named "<name>".`
+/// followed by `Configured servers: ...` or, when none is configured, by a hint to run
+/// `claude mcp add`. Only the leading words are matched, because the tail varies with the
+/// configuration. Recognising only one wording turns "not installed yet" into an inspection
+/// error and aborts the install, dry runs included; any other failure stays an error.
+fn claude_reports_absent_server(stderr: &str) -> bool {
+    stderr.contains("No MCP server found with name") || stderr.contains("No MCP server named")
 }
 
 fn claude_existing_server_name(
@@ -1217,5 +1227,63 @@ args = ["mcp", "--source-dir", "."]
         assert_eq!(invocations.len(), 3);
         assert_eq!(invocations[1].1[1], "remove");
         assert_eq!(invocations[2].1[1], "add");
+    }
+
+    #[test]
+    fn claude_install_treats_either_absent_server_wording_as_absent() {
+        let absent_messages = [
+            "No MCP server found with name: bsl-analyzer",
+            "No MCP server named \"bsl-analyzer\". Configured servers: other-server",
+            "No MCP server named \"bsl-analyzer\". Run `claude mcp add` to add one.",
+        ];
+        for absent in absent_messages {
+            let runner = FakeRunner::new(vec![
+                CommandOutput { status: 1, stdout: String::new(), stderr: absent.to_owned() },
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            ]);
+            let files = MemoryFiles::default();
+            let install_action = action(InstallTarget::Claude, InstallScope::Project);
+
+            let result = apply_action(&install_action, &runner, &files).expect(absent);
+
+            assert_eq!(result.status, InstallStatus::Installed, "{absent}");
+            let invocations = runner.invocations.borrow();
+            assert_eq!(invocations.len(), 2, "{absent}");
+            assert_eq!(invocations[0].1[1], "get", "{absent}");
+            assert_eq!(invocations[1].1[1], "add", "{absent}");
+        }
+    }
+
+    #[test]
+    fn claude_dry_run_accepts_the_current_absent_server_wording() {
+        let runner = FakeRunner::new(vec![CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "No MCP server named \"bsl-analyzer\". Configured servers: a, b".to_owned(),
+        }]);
+        let files = MemoryFiles::default();
+        let mut install_action = action(InstallTarget::Claude, InstallScope::Project);
+        install_action.dry_run = true;
+
+        let result = apply_action(&install_action, &runner, &files).expect("dry-run succeeds");
+
+        assert_eq!(result.status, InstallStatus::DryRun);
+        assert_eq!(runner.invocations.borrow().len(), 1);
+    }
+
+    #[test]
+    fn claude_get_failure_with_an_unknown_message_is_an_inspection_error() {
+        let runner = FakeRunner::new(vec![CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "Error: the configuration file is unreadable".to_owned(),
+        }]);
+        let files = MemoryFiles::default();
+        let install_action = action(InstallTarget::Claude, InstallScope::Project);
+
+        let error = apply_action(&install_action, &runner, &files).expect_err("fails");
+
+        assert!(matches!(error, InstallError::InspectionFailed { .. }), "{error}");
+        assert_eq!(runner.invocations.borrow().len(), 1);
     }
 }
