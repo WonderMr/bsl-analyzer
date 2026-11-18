@@ -2017,8 +2017,10 @@ mod tests {
             whole.completeness.to_value(),
         );
 
-        let miss =
-            ReferencesResult { unloaded_owner: Some("ОбщегоНазначения".to_owned()), ..no_answer() };
+        let miss = ReferencesResult {
+            unloaded_owner: Some("ОбщегоНазначения".to_owned()),
+            ..no_answer()
+        };
         let partial =
             render(&db, &roots, &miss, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 0);
         assert_eq!(partial.body["outcome"], "not_found");
