@@ -707,6 +707,7 @@ struct EventLogParams {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = graph_edge_kinds_description)]
 struct GraphParams {
     /// overview | schema | status | node | source | neighbors | callers | callees | resolve
     action: String,
@@ -733,8 +734,7 @@ struct GraphParams {
     /// Keep only edges with these provenances (resolved/inferred/visibility_blocked/unresolved).
     #[serde(default)]
     provenance: Vec<String>,
-    /// Keep only edges of these kinds (call/manager_creates/manager_access/query_ref/
-    /// contains/data_binding) — lets metadata-impact queries isolate e.g. only `query_ref`.
+    // Described by `graph_edge_kinds_description` from the filter's allowlist.
     #[serde(default)]
     edge_kinds: Vec<String>,
     /// How many top-centrality methods to include in `overview` (default: 20).
@@ -746,6 +746,24 @@ struct GraphParams {
     /// Cap on places per edge when `call_sites` is on (default: 20, max: 200). What the cap
     /// cuts is declared: `call_sites_total` counts the places before any are shown.
     max_call_sites: Option<usize>,
+}
+
+/// Publish the `edge_kinds` description built from the filter's own allowlist, so the kinds
+/// listed in `tools/list` are exactly the kinds the filter accepts; a hand-written list falls
+/// behind as soon as a kind is added, and agents filtering by it lose those edges unnoticed.
+fn graph_edge_kinds_description(schema: &mut schemars::Schema) {
+    let edge_kinds = schema
+        .ensure_object()
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("edge_kinds"))
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(edge_kinds) = edge_kinds {
+        edge_kinds.insert(
+            "description".to_owned(),
+            serde_json::Value::String(tools::graph::edge_kinds_param_description()),
+        );
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3941,6 +3959,29 @@ mod surface_guards {
         assert!(schema["properties"].get("member_name").is_some());
     }
 
+    /// `tools/list` is what an agent reads before it filters `graph neighbors`: a kind the
+    /// filter accepts but the description omits is one that agent never asks for, so the
+    /// published list must be the allowlist itself, in full and in its order.
+    #[test]
+    fn graph_edge_kinds_description_lists_exactly_the_accepted_kinds() {
+        let schema = tool_input_schema(McpProfile::Workspace, "graph");
+        let description = schema["properties"]["edge_kinds"]["description"]
+            .as_str()
+            .expect("edge_kinds is described in tools/list");
+        let listed: Vec<&str> = description
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(kinds, _)| kinds.split('|').collect())
+            .expect("the description lists the kinds in parentheses");
+        assert_eq!(listed, crate::tools::graph::EDGE_KINDS, "{description}");
+        for kind in listed {
+            assert!(
+                crate::tools::graph::validate_edge_kinds(&[kind.to_owned()]).is_ok(),
+                "{kind}: {description}"
+            );
+        }
+    }
+
     /// The routing prose must not send a client to a tool this process may not be serving.
     ///
     /// Forward guard: the build declares no opt-in tool yet, so the loop body does not run
@@ -5756,8 +5797,7 @@ mod tool_descriptions {
               - depth: Traversal depth for neighbors (default: 1).
               - detail: names | signatures | bodies (default: signatures).
               - dir: in | out | both — only for `neighbors` (default: in).
-              - edge_kinds: Keep only edges of these kinds (call/manager_creates/manager_access/query_ref/
-            contains/data_binding) — lets metadata-impact queries isolate e.g. only `query_ref`.
+              - edge_kinds: Keep only edges of these kinds (call|manager_creates|manager_access|query_ref|contains|data_binding|notify_ref|idle_handler|event_subscription|register_movement|subsystem_membership|role_reference|register_records|register_record_set); empty keeps all. Lets metadata-impact queries isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a register manager is `register_record_set`, not `manager_creates`; the `schema` action explains each kind.
               - id: Durable node id (required for node/neighbors/callers/callees).
               - ids: Durable node ids (required for `source`).
               - max_call_sites: Cap on places per edge when `call_sites` is on (default: 20, max: 200). What the cap
