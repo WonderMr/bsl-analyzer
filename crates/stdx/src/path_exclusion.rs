@@ -51,6 +51,11 @@ pub struct ExcludedPaths {
 /// declared or found as a root is the stronger statement. Files are never matched one
 /// by one: a 1C dump keeps parts of its objects (`*.bin`, text templates) out of git
 /// while they stay on disk and in the configuration, so only whole directories go.
+///
+/// Equality looks only at what can change the files of a root: the patterns in effect
+/// and the worktrees a root loses. A comment in an ignore file, or a worktree outside
+/// every root or ignored already, leaves two sets equal, so consumers that compare sets
+/// do not re-scope for it.
 #[derive(Debug, Clone, Default)]
 pub struct GitIgnored {
     roots: Vec<GitRoot>,
@@ -59,23 +64,34 @@ pub struct GitIgnored {
 #[derive(Debug, Clone)]
 struct GitRoot {
     declared: PathBuf,
-    /// [`comparison_key`] of the declared spelling and of the resolved one when that
-    /// differs, each with the number of components it stands for.
-    spellings: Vec<(String, usize)>,
-    /// The rules of the work tree holding the root, with the root's path relative to the
-    /// top of that work tree, `/`-separated; `None` when no rules apply below the root.
-    tree: Option<(Arc<WorkTreeRules>, String)>,
+    /// The components of the declared spelling, and of the resolved one when that
+    /// differs.
+    spellings: Vec<Vec<String>>,
+    /// `None` when nothing below the root is left out.
+    rules: Option<RootRules>,
+}
+
+/// What the work tree of one root leaves out below it.
+#[derive(Debug, Clone)]
+struct RootRules {
+    tree: Arc<WorkTreeRules>,
+    /// The root's path relative to the top of the work tree, `/`-separated.
+    prefix: String,
+    /// The linked worktrees strictly below the root that the patterns do not leave out
+    /// already, relative to the top, `/`-separated.
+    worktrees: Vec<String>,
 }
 
 /// The ignore rules of one git work tree, matched against the directories below it.
 #[derive(Debug)]
 pub struct WorkTreeRules {
-    /// Every line read, kept for equality: the compiled matcher cannot be compared.
-    lines: Vec<String>,
+    /// The patterns in effect, in order: what equality compares, since the compiled
+    /// matcher cannot be compared.
+    patterns: Vec<String>,
     matcher: ignore::gitignore::Gitignore,
-    /// Directories relative to the top of the work tree, `/`-separated, each left out
-    /// whole.
-    directories: Vec<String>,
+    /// Every linked worktree of the repository below the top, relative to it,
+    /// `/`-separated.
+    worktrees: Vec<String>,
 }
 
 /// Glob patterns and the base they are relative to.
@@ -342,9 +358,17 @@ impl ExcludedPaths {
     /// ancestor, so a symlink alias still leads into the exclusion.
     pub fn is_excluded_resolved(&self, path: &Path) -> bool {
         self.is_excluded(path)
-            || (!self.is_empty()
+            || (self.resolves_aliases()
                 && resolve_as_far_as_it_goes(path)
                     .is_some_and(|resolved| self.is_excluded(&resolved)))
+    }
+
+    /// Whether a decision must also ask under the spelling the file system resolves a
+    /// path to. Literal directories and patterns are hard exclusions that a symlink alias
+    /// must not lead around. Git's rules are asked under the spelling a path arrives in,
+    /// so a set that holds nothing else costs no resolution.
+    pub fn resolves_aliases(&self) -> bool {
+        !self.entries.is_empty() || self.patterns.is_some()
     }
 
     /// Whether a walk must not enter the directory at `path` it has just reached, or
@@ -396,6 +420,9 @@ impl ExcludedPaths {
         }
         if self.is_excluded(path) {
             return true;
+        }
+        if !self.resolves_aliases() {
+            return false;
         }
         let canonical = if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
         {
@@ -557,30 +584,19 @@ impl GitIgnored {
     /// outside every work tree, which still decides for the paths inside it.
     pub fn add_root(&mut self, root: &Path, tree: Option<(Arc<WorkTreeRules>, &Path)>) {
         let declared = normalize_lexically(root);
-        let mut spellings = vec![(comparison_key(&declared), declared.components().count())];
+        let mut spellings = vec![component_names(&declared)];
         if let Ok(resolved) = resolve(&declared) {
-            let spelling = (comparison_key(&resolved), resolved.components().count());
+            let spelling = component_names(&resolved);
             if !spellings.contains(&spelling) {
                 spellings.push(spelling);
             }
         }
-        let tree = tree.and_then(|(rules, relative)| {
-            let mut prefix = String::new();
-            for component in relative.components() {
-                let Component::Normal(name) = component else { continue };
-                push_name(&mut prefix, name);
-                // A root the rules leave out is still a root: nothing below it goes.
-                if rules.leaves_out(&prefix) {
-                    return None;
-                }
-            }
-            Some((rules, prefix))
-        });
-        self.roots.push(GitRoot { declared, spellings, tree });
+        let rules = tree.and_then(|(tree, relative)| RootRules::new(tree, relative));
+        self.roots.push(GitRoot { declared, spellings, rules });
     }
 
     fn has_rules(&self) -> bool {
-        self.roots.iter().filter_map(|root| root.tree.as_ref()).any(|(rules, _)| !rules.is_inert())
+        self.roots.iter().any(|root| root.rules.is_some())
     }
 
     /// Whether `path` lies in a directory below its innermost root that the root's rules
@@ -593,32 +609,23 @@ impl GitIgnored {
     }
 
     fn leaves_out_normalized(&self, path: &Path, itself: bool) -> bool {
-        let key = comparison_key(path);
         let mut innermost: Option<(&GitRoot, usize)> = None;
         for root in &self.roots {
-            for (spelling, depth) in &root.spellings {
-                let within = key
-                    .strip_prefix(spelling.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
-                if within && innermost.is_none_or(|(_, deepest)| *depth > deepest) {
-                    innermost = Some((root, *depth));
+            for spelling in &root.spellings {
+                let Some(depth) = depth_within(path, spelling) else { continue };
+                if innermost.is_none_or(|(_, deepest)| depth > deepest) {
+                    innermost = Some((root, depth));
                 }
             }
         }
         let Some((root, depth)) = innermost else { return false };
-        let Some((rules, prefix)) = &root.tree else { return false };
-        let names: Vec<&OsStr> = path
-            .components()
-            .skip(depth)
-            .filter_map(|component| match component {
-                Component::Normal(name) => Some(name),
-                _ => None,
-            })
-            .collect();
-        let checked = if itself { names.len() } else { names.len().saturating_sub(1) };
-        let mut relative = prefix.clone();
-        for name in &names[..checked] {
-            push_name(&mut relative, name);
+        let Some(rules) = &root.rules else { return false };
+        let below = path.components().skip(depth);
+        let count = below.clone().count();
+        let checked = if itself { count } else { count.saturating_sub(1) };
+        let mut relative = rules.prefix.clone();
+        for component in below.take(checked) {
+            push_name(&mut relative, component.as_os_str());
             if rules.leaves_out(&relative) {
                 return true;
             }
@@ -629,12 +636,17 @@ impl GitIgnored {
 
 impl GitRoot {
     /// What equality and hashing look at: the declared spelling, the root's place in its
-    /// work tree and that tree's rules as read, not what the file system resolved.
+    /// work tree, the patterns in effect and the worktrees the root loses.
     fn identity(&self) -> (&Path, Option<&str>, &[String], &[String]) {
-        let Some((rules, prefix)) = &self.tree else {
+        let Some(rules) = &self.rules else {
             return (self.declared.as_path(), None, &[], &[]);
         };
-        (self.declared.as_path(), Some(prefix.as_str()), &rules.lines, &rules.directories)
+        (
+            self.declared.as_path(),
+            Some(rules.prefix.as_str()),
+            &rules.tree.patterns,
+            &rules.worktrees,
+        )
     }
 }
 
@@ -654,61 +666,118 @@ impl Hash for GitIgnored {
     }
 }
 
-impl WorkTreeRules {
-    /// Rules of the work tree whose top is `top`: the patterns in `ignore_files`, read in
-    /// gitignore format relative to `top`, and `directories`, relative to `top`, each left
-    /// out whole. A file that cannot be read adds nothing and a line that is not a valid
-    /// pattern is skipped: git reads its ignore files the same way.
-    pub fn new(top: &Path, ignore_files: &[PathBuf], directories: &[PathBuf]) -> Self {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(top);
-        // Git ignores case in its patterns where the file system does (`core.ignorecase`),
-        // and so does the rest of this set.
-        let _ = builder.case_insensitive(cfg!(windows));
-        let mut lines = Vec::new();
-        for file in ignore_files {
-            let Ok(text) = std::fs::read_to_string(file) else { continue };
-            // Git skips a byte order mark at the start of an ignore file.
-            for line in text.trim_start_matches('\u{feff}').lines() {
-                if builder.add_line(Some(file.clone()), line).is_ok() {
-                    lines.push(line.to_owned());
-                }
+impl RootRules {
+    /// `None` when the patterns leave out the root itself, since a root is still a root,
+    /// and when nothing below the root can be left out.
+    fn new(tree: Arc<WorkTreeRules>, relative: &Path) -> Option<Self> {
+        let mut prefix = String::new();
+        for component in relative.components() {
+            let Component::Normal(name) = component else { continue };
+            push_name(&mut prefix, name);
+            if tree.ignores(&prefix) {
+                return None;
             }
         }
-        let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
-        let directories = directories
+        let worktrees: Vec<String> = tree
+            .worktrees
             .iter()
-            .map(PathBuf::as_path)
-            .map(slash_separated)
-            .filter(|directory| !directory.is_empty())
+            .filter(|worktree| tree.adds_below(&prefix, worktree))
+            .cloned()
             .collect();
-        Self { lines, matcher, directories }
+        if tree.matcher.is_empty() && worktrees.is_empty() {
+            return None;
+        }
+        Some(Self { tree, prefix, worktrees })
     }
 
     /// Whether the directory at `relative` (to the top, `/`-separated) is left out.
     fn leaves_out(&self, relative: &str) -> bool {
-        self.matcher.matched(Path::new(relative), true).is_ignore()
-            || self.directories.iter().any(|directory| same_relative(directory, relative))
-    }
-
-    fn is_inert(&self) -> bool {
-        self.matcher.is_empty() && self.directories.is_empty()
+        self.tree.ignores(relative)
+            || self.worktrees.iter().any(|worktree| same_name(worktree, relative))
     }
 }
 
-/// `path` as compared with the roots of [`GitIgnored`]: its components joined by `/`,
-/// lower-cased on Windows, where the file system ignores case. Built once per path, so
-/// matching it against every root allocates nothing per root.
-fn comparison_key(path: &Path) -> String {
-    let mut key = String::new();
-    for component in path.components() {
-        key.push('/');
-        key.push_str(&component.as_os_str().to_string_lossy());
+impl WorkTreeRules {
+    /// Rules of the work tree whose top is `top`: `lines` in gitignore format, relative
+    /// to `top` and in the order git weighs them (a later line wins over an earlier
+    /// one), and `worktrees`, directories relative to `top`, each left out whole. A line
+    /// that is not a valid pattern is skipped, as git skips it.
+    pub fn new<'a>(
+        top: &Path,
+        lines: impl IntoIterator<Item = &'a str>,
+        worktrees: &[PathBuf],
+    ) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(top);
+        // Git ignores case in its patterns where the file system does (`core.ignorecase`),
+        // and so does the rest of this set.
+        let _ = builder.case_insensitive(cfg!(windows));
+        let mut patterns = Vec::new();
+        for line in lines {
+            // As git reads a line: trailing spaces go unless escaped, and a blank line or a
+            // comment is no pattern, so editing one changes nothing.
+            let line = if line.ends_with("\\ ") { line } else { line.trim_end() };
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if builder.add_line(None, line).is_ok() {
+                patterns.push(line.to_owned());
+            }
+        }
+        let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+        let worktrees = worktrees
+            .iter()
+            .map(PathBuf::as_path)
+            .map(slash_separated)
+            .filter(|worktree| !worktree.is_empty())
+            .collect();
+        Self { patterns, matcher, worktrees }
     }
-    if cfg!(windows) {
-        key.to_lowercase()
-    } else {
-        key
+
+    /// Whether the patterns leave out the directory at `relative` (to the top,
+    /// `/`-separated).
+    fn ignores(&self, relative: &str) -> bool {
+        self.matcher.matched(Path::new(relative), true).is_ignore()
     }
+
+    /// Whether `worktree` lies strictly below `prefix` (both relative to the top,
+    /// `/`-separated) and no directory from just below `prefix` down to the worktree is
+    /// ignored already.
+    fn adds_below(&self, prefix: &str, worktree: &str) -> bool {
+        let mut names = worktree.split('/');
+        for expected in prefix.split('/').filter(|expected| !expected.is_empty()) {
+            if !names.next().is_some_and(|name| same_name(name, expected)) {
+                return false;
+            }
+        }
+        let mut candidate = prefix.to_owned();
+        let mut below = false;
+        for name in names {
+            push_name(&mut candidate, OsStr::new(name));
+            if self.ignores(&candidate) {
+                return false;
+            }
+            below = true;
+        }
+        below
+    }
+}
+
+/// The components of `path` as text, for [`depth_within`].
+fn component_names(path: &Path) -> Vec<String> {
+    let name = |component: Component<'_>| component.as_os_str().to_string_lossy().into_owned();
+    path.components().map(name).collect()
+}
+
+/// The number of components `spelling` stands for, when `path` lies at or below it.
+fn depth_within(path: &Path, spelling: &[String]) -> Option<usize> {
+    let mut components = path.components();
+    for expected in spelling {
+        let actual = components.next()?;
+        if !same_name(&actual.as_os_str().to_string_lossy(), expected) {
+            return None;
+        }
+    }
+    Some(spelling.len())
 }
 
 /// `path`'s plain names joined by `/`.
@@ -729,11 +798,12 @@ fn push_name(path: &mut String, name: &OsStr) {
     path.push_str(&name.to_string_lossy());
 }
 
-/// Whether two `/`-separated relative paths name the same directory, ignoring case on
-/// Windows as [`is_within`] does.
-fn same_relative(left: &str, right: &str) -> bool {
+/// Whether two names, or two `/`-separated relative paths, are the same, ignoring case
+/// on Windows as [`is_within`] does. Compared character by character, so nothing is
+/// allocated on a path every walk and loader asks about.
+fn same_name(left: &str, right: &str) -> bool {
     if cfg!(windows) {
-        left.to_lowercase() == right.to_lowercase()
+        left.chars().flat_map(char::to_lowercase).eq(right.chars().flat_map(char::to_lowercase))
     } else {
         left == right
     }
@@ -1148,20 +1218,17 @@ mod tests {
 
     const MODULE: &str = "CommonModules/M/Ext/Module.bsl";
 
-    /// A work tree at `name` whose `.gitignore` holds `gitignore`, and a set over `roots`
-    /// (relative to its top) with its rules and the listed `directories`.
+    /// A set over `roots`, relative to the work tree top `name`, with the rules
+    /// `gitignore` and the linked `worktrees`.
     fn git_ignored(
         name: &str,
         gitignore: &str,
         roots: &[&str],
-        directories: &[&str],
+        worktrees: &[&str],
     ) -> (PathBuf, ExcludedPaths) {
         let top = absolute(name);
-        let _ = std::fs::remove_dir_all(&top);
-        std::fs::create_dir_all(&top).unwrap();
-        std::fs::write(top.join(".gitignore"), gitignore).unwrap();
-        let directories: Vec<PathBuf> = directories.iter().map(PathBuf::from).collect();
-        let rules = Arc::new(WorkTreeRules::new(&top, &[top.join(".gitignore")], &directories));
+        let worktrees: Vec<PathBuf> = worktrees.iter().map(PathBuf::from).collect();
+        let rules = Arc::new(WorkTreeRules::new(&top, gitignore.lines(), &worktrees));
         let mut ignored = GitIgnored::default();
         for root in roots {
             ignored.add_root(&top.join(root), Some((rules.clone(), Path::new(root))));
@@ -1169,11 +1236,15 @@ mod tests {
         (top, ExcludedPaths::default().with_git_ignored(ignored))
     }
 
+    fn hash_of(set: &ExcludedPaths) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        set.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[test]
     fn git_ignored_directories_below_a_root_are_left_out_but_files_are_not() {
-        // A byte order mark must not hide the first pattern: git skips it.
-        let gitignore = "\u{feff}.claude/\n*.bin\n/build\n";
-        let (top, excluded) = git_ignored("git-ignored", gitignore, &[""], &[]);
+        let (top, excluded) = git_ignored("git-ignored", ".claude/\n*.bin\n/build\n", &[""], &[]);
 
         assert!(excluded.is_excluded(&top.join(".claude/worktrees/copy").join(MODULE)));
         assert!(excluded.is_excluded(&top.join("build").join(MODULE)));
@@ -1187,8 +1258,17 @@ mod tests {
         assert!(excluded.prunes_walked_dir(&top.join(".claude"), false, &mut resolved));
         assert!(!excluded.prunes_walked_dir(&top.join("CommonModules"), false, &mut resolved));
         assert!(!excluded.prunes_walked_dir(&top, false, &mut resolved), "the root itself stays");
+        assert!(!excluded.resolves_aliases(), "git's rules alone cost no resolution");
+        assert!(ExcludedPaths::new([top.join(".tmp")]).resolves_aliases());
+    }
 
-        std::fs::remove_dir_all(&top).unwrap();
+    #[test]
+    fn a_later_line_wins_over_an_earlier_one() {
+        let (top, kept) = git_ignored("git-order", "/build/\n!/build/\n", &[""], &[]);
+        let (_, left_out) = git_ignored("git-order", "!/build/\n/build/\n", &[""], &[]);
+
+        assert!(!kept.is_excluded(&top.join("build").join(MODULE)));
+        assert!(left_out.is_excluded(&top.join("build").join(MODULE)));
     }
 
     #[test]
@@ -1201,19 +1281,34 @@ mod tests {
         assert!(!excluded.is_excluded(&top.join("work/cf").join(MODULE)));
         let mut resolved = ResolvedDirs::default();
         assert!(!excluded.prunes_walked_dir(&top.join("build/cf"), false, &mut resolved));
-
-        std::fs::remove_dir_all(&top).unwrap();
     }
 
     #[test]
-    fn a_listed_directory_is_left_out_whole() {
+    fn a_worktree_below_a_root_is_left_out_whole() {
         let (top, excluded) = git_ignored("git-listed", "", &[""], &["nested/copy"]);
 
         assert!(excluded.is_excluded(&top.join("nested/copy").join(MODULE)));
         assert!(!excluded.is_excluded(&top.join("nested/other").join(MODULE)));
         assert!(!excluded.is_excluded(&top.join("nested/copy")), "only what lies below it");
+    }
 
-        std::fs::remove_dir_all(&top).unwrap();
+    #[test]
+    fn a_comment_or_a_worktree_that_changes_no_root_keeps_the_set_equal() {
+        let roots = ["src/cf"];
+        let (_, before) = git_ignored("git-equal", ".claude/\n", &roots, &[]);
+        // Outside the root and ignored, outside the root, and above the root.
+        let unrelated = [".claude/worktrees/one", "tools/two", "src"];
+        let (_, after) = git_ignored("git-equal", "# tools\n\n.claude/  \n", &roots, &unrelated);
+        let (top, inside) = git_ignored("git-equal", ".claude/\n", &roots, &["src/cf/three"]);
+
+        assert_eq!(before, after);
+        assert_eq!(hash_of(&before), hash_of(&after));
+        assert_ne!(before, inside, "a worktree a root loses changes the set");
+        assert!(inside.is_excluded(&top.join("src/cf/three").join(MODULE)));
+
+        let (_, plain) = git_ignored("git-equal-top", ".claude/\n", &[""], &[]);
+        let (_, ignored) = git_ignored("git-equal-top", ".claude/\n", &[""], &[".claude/x"]);
+        assert_eq!(plain, ignored, "a worktree the patterns leave out already adds nothing");
     }
 
     #[test]
@@ -1225,21 +1320,15 @@ mod tests {
         let mut outside = GitIgnored::default();
         outside.add_root(&top, None);
         assert_eq!(ExcludedPaths::default().with_git_ignored(outside), ExcludedPaths::default());
-
-        std::fs::remove_dir_all(&top).unwrap();
     }
 
     #[test]
-    fn equality_follows_the_rules_as_read() {
-        let (top, first) = git_ignored("git-equality", ".claude/\n", &[""], &[]);
-        let (_, same) = git_ignored("git-equality", ".claude/\n", &[""], &[]);
-        let (_, other) = git_ignored("git-equality", "build/\n", &[""], &[]);
+    fn different_patterns_make_different_sets() {
+        let (_, first) = git_ignored("git-patterns", ".claude/\n", &[""], &[]);
+        let (_, other) = git_ignored("git-patterns", "build/\n", &[""], &[]);
 
-        assert_eq!(first, same);
         assert_ne!(first, other);
         assert_ne!(first, ExcludedPaths::default());
-
-        std::fs::remove_dir_all(&top).unwrap();
     }
 
     #[cfg(windows)]
@@ -1249,7 +1338,5 @@ mod tests {
 
         assert!(excluded.is_excluded(&top.join(".claude/worktrees").join(MODULE)));
         assert!(excluded.is_excluded(&top.join("nested/copy").join(MODULE)));
-
-        std::fs::remove_dir_all(&top).unwrap();
     }
 }

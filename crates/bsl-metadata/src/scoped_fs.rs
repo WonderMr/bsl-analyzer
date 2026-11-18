@@ -48,7 +48,7 @@ impl<'a> ScopedFs<'a> {
     /// The resolved spelling of `dir` when it differs from the declared one — the second
     /// name its children can be excluded under.
     fn resolved_dir(&self, dir: &Path) -> Option<PathBuf> {
-        if self.excluded.is_empty() {
+        if !self.excluded.resolves_aliases() {
             return None;
         }
         stdx::path_exclusion::resolve(dir).ok().filter(|resolved| resolved != dir)
@@ -66,7 +66,8 @@ fn child_excluded(
     }
     excluded.is_excluded(path)
         || resolved_parent.is_some_and(|parent| excluded.is_excluded(&parent.join(name)))
-        || (std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        || (excluded.resolves_aliases()
+            && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
             && excluded.is_excluded_resolved(path))
 }
 

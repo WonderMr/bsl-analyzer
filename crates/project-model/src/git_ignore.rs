@@ -71,8 +71,34 @@ fn common_dir(git_dir: &Path) -> PathBuf {
 
 fn rules_of(top: &Path, git_dir: &Path) -> WorkTreeRules {
     let common = common_dir(git_dir);
-    let ignore_files = [top.join(".gitignore"), common.join("info").join("exclude")];
-    WorkTreeRules::new(top, &ignore_files, &linked_worktrees(&common, top))
+    // Git lets a `.gitignore` override `info/exclude`, and in the rules a later line wins
+    // over an earlier one, so `info/exclude` goes first.
+    let mut lines = ignore_file_lines(&common.join("info").join("exclude"));
+    lines.extend(ignore_file_lines(&top.join(".gitignore")));
+    WorkTreeRules::new(top, lines.iter().map(String::as_str), &linked_worktrees(&common, top))
+}
+
+/// The lines of an ignore file, without a leading byte order mark; none when the file
+/// cannot be read. Git reads an ignore file as bytes, so one saved in a legacy code page
+/// still counts: only a line that is not UTF-8, which cannot name a path the analyzer
+/// sees, is skipped, with a warning.
+fn ignore_file_lines(file: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(file) else { return Vec::new() };
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(&bytes);
+    let mut skipped = 0usize;
+    let lines = bytes
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r".as_slice()).unwrap_or(line);
+            let decoded = std::str::from_utf8(line).ok().map(str::to_owned);
+            skipped += usize::from(decoded.is_none());
+            decoded
+        })
+        .collect();
+    if skipped > 0 {
+        tracing::warn!(?file, skipped, "ignore file lines that are not UTF-8 were skipped");
+    }
+    lines
 }
 
 /// The repository's linked worktrees below `top`, relative to it. Each is listed in
@@ -103,7 +129,8 @@ fn linked_worktrees(common: &Path, top: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::hash::{Hash, Hasher};
+    use std::path::{Path, PathBuf};
 
     use crate::{ExcludedPaths, Project, SourceSet};
 
@@ -121,6 +148,18 @@ mod tests {
         write(&dir.join(MODULE), "Процедура Тест() Экспорт\nКонецПроцедуры\n");
     }
 
+    /// Makes `relative` below `top` a linked worktree of `top`'s repository, laid out
+    /// the way `git worktree add` leaves it: the worktree's `.git` file names its git
+    /// directory, and the repository lists the worktree there.
+    fn add_worktree(top: &Path, relative: &str) -> PathBuf {
+        let worktree = top.join(relative);
+        let admin = top.join(".git/worktrees").join(relative.replace('/', "-"));
+        write(&admin.join("commondir"), "../..\n");
+        write(&admin.join("gitdir"), &format!("{}\n", worktree.join(".git").display()));
+        write(&worktree.join(".git"), &format!("gitdir: {}\n", admin.display()));
+        worktree
+    }
+
     /// The `.bsl` files one scan of the project's roots reaches, relative to `top`.
     fn scanned(project: &Project, top: &Path) -> Vec<String> {
         let set =
@@ -136,6 +175,12 @@ mod tests {
             .collect();
         files.sort();
         files
+    }
+
+    fn hash_of(exclusions: &ExcludedPaths) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        exclusions.hash(&mut hasher);
+        hasher.finish()
     }
 
     #[test]
@@ -177,18 +222,58 @@ mod tests {
     }
 
     #[test]
+    fn a_gitignore_line_overrides_info_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        write(&top.join(".git/info/exclude"), "/build/\n");
+        write(&top.join(".gitignore"), "!/build/\n");
+        configuration(top);
+        configuration(&top.join("build/copy"));
+
+        let project = Project::new(top).unwrap();
+        assert_eq!(scanned(&project, top), [MODULE.to_owned(), format!("build/copy/{MODULE}")]);
+    }
+
+    #[test]
+    fn an_ignore_file_in_a_legacy_code_page_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        fs::create_dir_all(top.join(".git")).unwrap();
+        // "Временные" in Windows-1251, as a comment and as a pattern of its own.
+        const TEMPORARY: &[u8] = b"\xc2\xf0\xe5\xec\xe5\xed\xed\xfb\xe5";
+        let gitignore = [
+            b"# ".as_slice(),
+            TEMPORARY,
+            b"\r\n".as_slice(),
+            TEMPORARY,
+            b"/\r\n.claude/\r\n".as_slice(),
+        ]
+        .concat();
+        fs::write(top.join(".gitignore"), gitignore).unwrap();
+        configuration(top);
+        configuration(&top.join(".claude/worktrees/copy"));
+
+        let project = Project::new(top).unwrap();
+        assert_eq!(scanned(&project, top), [MODULE]);
+    }
+
+    #[test]
+    fn ignore_file_lines_drop_a_byte_order_mark_and_only_the_lines_that_are_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".gitignore");
+        fs::write(&file, b"\xef\xbb\xbf.claude/\r\n\xc2\xf0/\r\nbuild/").unwrap();
+
+        assert_eq!(super::ignore_file_lines(&file), [".claude/", "build/"]);
+        assert!(super::ignore_file_lines(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
     fn a_linked_worktree_inside_the_project_is_not_a_source() {
         let dir = tempfile::tempdir().unwrap();
         let top = dir.path();
         configuration(top);
-        let worktree = top.join("nested/copy");
+        let worktree = add_worktree(top, "nested/copy");
         configuration(&worktree);
-        // The layout `git worktree add nested/copy` leaves behind: the worktree's `.git`
-        // file names its git directory, and the repository lists the worktree there.
-        let admin = top.join(".git/worktrees/copy");
-        write(&admin.join("commondir"), "../..\n");
-        write(&admin.join("gitdir"), &format!("{}\n", worktree.join(".git").display()));
-        write(&worktree.join(".git"), &format!("gitdir: {}\n", admin.display()));
 
         let project = Project::new(top).unwrap();
         assert_eq!(scanned(&project, top), [MODULE]);
@@ -197,6 +282,30 @@ mod tests {
         // Opened on its own, the worktree is the project, and nothing of it is left out.
         let opened = Project::new(&worktree).unwrap();
         assert_eq!(scanned(&opened, &worktree), [MODULE]);
+    }
+
+    #[test]
+    fn an_unrelated_worktree_or_a_comment_leaves_the_exclusions_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        fs::create_dir_all(top.join(".git")).unwrap();
+        write(&top.join(".gitignore"), ".claude/\n");
+        configuration(&top.join("src/cf"));
+        let before = Project::new(top).unwrap();
+        assert_eq!(before.source_roots(), [top.join("src/cf")]);
+
+        add_worktree(top, ".claude/worktrees/one");
+        add_worktree(top, "tools/two");
+        write(&top.join(".gitignore"), "# local tool state\n\n.claude/\n");
+        let after = Project::new(top).unwrap();
+        assert_eq!(after.source_exclusions(), before.source_exclusions());
+        assert_eq!(hash_of(after.source_exclusions()), hash_of(before.source_exclusions()));
+
+        let inside = add_worktree(top, "src/cf/three");
+        configuration(&inside);
+        let changed = Project::new(top).unwrap();
+        assert_ne!(changed.source_exclusions(), before.source_exclusions());
+        assert_eq!(scanned(&changed, top), [format!("src/cf/{MODULE}")]);
     }
 
     #[test]
