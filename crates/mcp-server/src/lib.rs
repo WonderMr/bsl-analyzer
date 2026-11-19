@@ -1381,6 +1381,8 @@ impl McpServer {
     /// `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
     /// shortly instead of reading the answer as "no such object". The resident is a build of
     /// its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+    /// After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+    /// minutes on a large configuration.
     #[tool(name = "metadata", annotations(read_only_hint = true))]
     async fn metadata(
         &self,
@@ -5827,6 +5829,8 @@ mod tool_descriptions {
             `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
             shortly instead of reading the answer as "no such object". The resident is a build of
             its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+            After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+            minutes on a large configuration.
               - action: info | tree | object | form | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
               - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
@@ -7001,9 +7005,11 @@ mod resident_failed_answers {
         let body = result.structured_content.expect("the not-ready envelope is structured");
         assert_eq!(body["status"], "loading", "{body}");
         assert_eq!(body["state"], "loading", "{body}");
+        assert!(body["detail"].as_str().is_some_and(|detail| !detail.is_empty()), "{body}");
+        let text = result.content[0].as_text().expect("a text block").text.as_str();
         assert!(
-            body["detail"].as_str().is_some_and(|detail| detail.contains("`metadata` status")),
-            "the envelope names the probe that covers the resident: {body}",
+            text.starts_with("Метаданные загружаются") && text.contains("metadata action=status"),
+            "the sentence an agent reads names the probe that covers the resident: {text}",
         );
 
         gate.release();

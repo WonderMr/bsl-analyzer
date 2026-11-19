@@ -1380,8 +1380,8 @@ pub fn configs_from_db(
     (base, extensions)
 }
 
-/// A "still loading, retry shortly" envelope for a metadata call issued while the resident
-/// db is building (or rebuilding after an idle eviction). Never a hard "not loaded" error —
+/// A "still loading" envelope for a metadata call issued while the resident db is building
+/// (or rebuilding after an idle eviction). Never a hard "not loaded" error —
 /// the resident becomes ready, OR fails and is retried on its own backoff, so the answer is
 /// always either "ask again in a moment" or "here is why it stopped and when the next try
 /// comes". A `status` of `failed` (with `error` and `retry_after_ms`) is a build that did not
@@ -1393,18 +1393,18 @@ pub fn configs_from_db(
 /// sentence stays the text block instead of the JSON mirror `graph`/`diagnostics` emit:
 /// `metadata` is a text tool (its answers are listings, not JSON), and a consumer that
 /// matched the sentence before the envelope existed keeps working while it migrates to
-/// `structuredContent`.
+/// `structuredContent`. Both name `metadata` status as the readiness probe: an agent that
+/// waited for `graph` to be ready meets this envelope all the same.
 pub fn loading(report: &crate::diagnostics_state::StatusReport) -> CallToolResult {
     let mut msg = String::from("Метаданные загружаются, повторите запрос через несколько секунд.");
     if let Some(ms) = report.elapsed_ms {
         let _ = write!(msg, " (идёт загрузка, {ms} мс)");
     }
+    msg.push_str(" Готовность резидента показывает `metadata action=status`, а не `graph`.");
+    let detail = crate::tools::resident::not_ready_detail(report, "`metadata` status");
     crate::tools::response::structured_with_text(
         msg,
-        crate::tools::resident::loading_body(
-            report,
-            "resident analysis database is building, apart from the graph; poll `metadata` status",
-        ),
+        crate::tools::resident::loading_body(report, &detail),
     )
 }
 
@@ -2036,6 +2036,17 @@ mod tests {
             "the human sentence stays the text block: {}",
             extract_text(&result),
         );
+        assert!(
+            extract_text(&result).contains("metadata action=status"),
+            "the sentence names the readiness probe: {}",
+            extract_text(&result),
+        );
+
+        let failed = crate::diagnostics_state::StatusReport { state: "failed", ..report };
+        let failed = loading(&failed);
+        let failed = failed.structured_content.expect("a failed build answers structured");
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_ne!(failed["detail"], body["detail"], "a failed build is not told it is building");
     }
 
     #[test]
