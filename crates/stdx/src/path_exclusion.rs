@@ -859,13 +859,13 @@ impl RootIndex {
     }
 
     fn same_name(&self, left: &str, right: &str) -> bool {
-        self.key(left) == self.key(right)
+        left == right || (self.ignore_case && folded(left).eq(folded(right)))
     }
 
     /// `name` as the index keeps it: folded to lower case where case is ignored.
     fn key(&self, name: &str) -> String {
         if self.ignore_case {
-            name.chars().flat_map(char::to_lowercase).collect()
+            folded(name).collect()
         } else {
             name.to_owned()
         }
@@ -878,9 +878,14 @@ impl RootIndex {
         } else if name.is_ascii() {
             key.bytes().cmp(name.bytes().map(|byte| byte.to_ascii_lowercase()))
         } else {
-            key.chars().cmp(name.chars().flat_map(char::to_lowercase))
+            key.chars().cmp(folded(name))
         }
     }
+}
+
+/// `name` folded to lower case, character by character.
+fn folded(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars().flat_map(char::to_lowercase)
 }
 
 impl GitRoot {
@@ -1076,7 +1081,10 @@ fn anchored_names(line: &str) -> Option<Vec<globset::GlobMatcher>> {
     if !from_top && !glob.contains('/') {
         return None;
     }
-    if glob.contains("**") || glob.contains(|c: char| matches!(c, '\\' | '[' | ']' | '{' | '}')) {
+    if glob.contains("**") || glob.contains(['\\', '[', ']', '{', '}']) {
+        return None;
+    }
+    if glob.split('/').any(str::is_empty) {
         return None;
     }
     let compile = |name: &str| -> Option<globset::GlobMatcher> {
@@ -1088,7 +1096,7 @@ fn anchored_names(line: &str) -> Option<Vec<globset::GlobMatcher>> {
             .ok()?;
         Some(glob.compile_matcher())
     };
-    glob.split('/').map(|name| if name.is_empty() { None } else { compile(name) }).collect()
+    glob.split('/').map(compile).collect()
 }
 
 /// A builder for rules relative to `top`, matching names as git does on this system.
