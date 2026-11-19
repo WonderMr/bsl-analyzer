@@ -545,10 +545,11 @@ struct SyntaxHelpByNameParams {
     /// Owning platform type when `name` is a member of a specific type (optional).
     type_name: Option<String>,
     /// Output budget in tokens (~4 chars each) covering the compatibility Markdown and the
-    /// structured card together: the Markdown is truncated at a line boundary with a note
-    /// pointing at the single-member lookup, and the card's listings take what is left. A card
-    /// whose documentation does not fit beside the Markdown goes out without it
-    /// (`budget_exhausted` says when the card was cut). Default 6000.
+    /// structured card together: the Markdown is truncated, at a line boundary unless one line
+    /// is longer than half of it, and ends with a note; the card's listings take what is left.
+    /// The card drops its documentation when that leaves more Markdown (`budget_exhausted`
+    /// says the card was cut). Below the card's own size the answer is the minimal
+    /// `budget_exhausted` envelope with the start of the Markdown. Default 6000.
     max_output_tokens: Option<usize>,
 }
 
