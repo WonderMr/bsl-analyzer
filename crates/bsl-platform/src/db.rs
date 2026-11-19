@@ -82,20 +82,26 @@ pub(crate) fn load_pending() -> bool {
 pub(crate) fn wait_for_load(timeout: Option<Duration>) -> bool {
     // A timeout too large to add to the clock is no limit at all.
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    settle(deadline).1
+}
+
+/// Waits while an announced load has installed nothing, at most until `deadline` when one is
+/// given. Returns the load lock, still held, and whether no such load is left.
+fn settle(deadline: Option<Instant>) -> (MutexGuard<'static, usize>, bool) {
     let mut loads = loads_in_flight();
     while *loads > 0 && PLATFORM_DATA_SINGLETON.get().is_none() {
         loads = match deadline {
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return false;
+                    return (loads, false);
                 }
                 LOAD_SETTLED.wait_timeout(loads, left).unwrap_or_else(PoisonError::into_inner).0
             }
             None => LOAD_SETTLED.wait(loads).unwrap_or_else(PoisonError::into_inner),
         };
     }
-    true
+    (loads, true)
 }
 
 fn compare_active(
@@ -190,7 +196,10 @@ impl PlatformDataInner {
         if let Some(data) = PLATFORM_DATA_SINGLETON.get() {
             return data;
         }
-        wait_for_load(None);
+        // The default is fixed under the load lock: a load announced at the same moment either
+        // comes first, and this access waits for it, or finds the default fixed and is refused
+        // with a restart warning. It is never overridden by a default fixed behind its back.
+        let _loads = settle(None).0;
         PLATFORM_DATA_SINGLETON.get_or_init(|| {
             let help = PlatformHelp::unselected();
             // The corpus-contract suite asserts on the texts of its pinned
