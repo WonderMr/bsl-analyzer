@@ -22,9 +22,11 @@
 //! the directories the ignore rules of each root's work tree name, and the repository's
 //! linked worktrees. Those apply below a root only, never to the root itself.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A set of excluded directories.
@@ -59,6 +61,9 @@ pub struct ExcludedPaths {
 #[derive(Debug, Clone, Default)]
 pub struct GitIgnored {
     roots: Vec<GitRoot>,
+    /// Tells this set's answers apart from other sets' in [`LAST_ASKED`]: assigned when
+    /// the set is attached, shared by its clones, and no part of equality.
+    id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -163,8 +168,13 @@ impl ExcludedPaths {
 
     /// Adds what git leaves out below the source roots. Roots without rules add nothing,
     /// so the set stays equal to one built without them.
-    pub fn with_git_ignored(mut self, ignored: GitIgnored) -> Self {
-        self.git = if ignored.has_rules() { Some(Arc::new(ignored)) } else { None };
+    pub fn with_git_ignored(mut self, mut ignored: GitIgnored) -> Self {
+        self.git = if ignored.has_rules() {
+            ignored.id = NEXT_GIT_IGNORED_ID.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(ignored))
+        } else {
+            None
+        };
         self
     }
 
@@ -335,13 +345,15 @@ impl ExcludedPaths {
         if self.is_empty() {
             return false;
         }
+        self.is_listed(path) || self.git.as_ref().is_some_and(|git| git.leaves_out(path, false))
+    }
+
+    /// [`Self::is_excluded`] by the literal directories and the patterns alone.
+    fn is_listed(&self, path: &Path) -> bool {
         if self.any_spelling(|spelling| is_within(path, spelling)) {
             return true;
         }
         if self.patterns.as_ref().is_some_and(|patterns| patterns.matches_any_spelling(path)) {
-            return true;
-        }
-        if self.git.as_ref().is_some_and(|git| git.leaves_out(path, false)) {
             return true;
         }
         has_dot_components(path) && {
@@ -388,7 +400,7 @@ impl ExcludedPaths {
         if self.is_empty() {
             return false;
         }
-        if self.is_excluded(path) || (!is_symlink && self.git_leaves_out_dir(path)) {
+        if self.prunes(path, is_symlink) {
             return true;
         }
         let from_parent = || {
@@ -399,15 +411,16 @@ impl ExcludedPaths {
             (false, Some(canonical)) => canonical,
             _ => path.canonicalize().map(simplify_verbatim).unwrap_or_else(|_| path.to_path_buf()),
         };
-        let excluded =
-            self.is_excluded(&canonical) || (!is_symlink && self.git_leaves_out_dir(&canonical));
+        let excluded = canonical.as_path() != path && self.prunes(&canonical, is_symlink);
         resolved.0.insert(path.to_path_buf(), canonical);
         excluded
     }
 
-    /// Whether git leaves out the directory at `path` itself, not only what lies below it.
-    fn git_leaves_out_dir(&self, path: &Path) -> bool {
-        self.git.as_ref().is_some_and(|git| git.leaves_out(path, true))
+    /// Whether the entry at `path` lies in an excluded directory or, unless it is a
+    /// symlink, is a directory git leaves out: git is asked once per spelling.
+    fn prunes(&self, path: &Path, is_symlink: bool) -> bool {
+        self.is_listed(path)
+            || self.git.as_ref().is_some_and(|git| git.leaves_out(path, !is_symlink))
     }
 
     /// [`Self::is_excluded_resolved`] for many paths in a row: the resolved spelling of
@@ -609,29 +622,61 @@ impl GitIgnored {
     }
 
     fn leaves_out_normalized(&self, path: &Path, itself: bool) -> bool {
-        let mut innermost: Option<(&GitRoot, usize)> = None;
-        for root in &self.roots {
+        let mut innermost: Option<(usize, usize)> = None;
+        for (index, root) in self.roots.iter().enumerate() {
             for spelling in &root.spellings {
                 let Some(depth) = depth_within(path, spelling) else { continue };
                 if innermost.is_none_or(|(_, deepest)| depth > deepest) {
-                    innermost = Some((root, depth));
+                    innermost = Some((index, depth));
                 }
             }
         }
-        let Some((root, depth)) = innermost else { return false };
-        let Some(rules) = &root.rules else { return false };
+        let Some((index, depth)) = innermost else { return false };
+        let Some(rules) = &self.roots[index].rules else { return false };
         let below = path.components().skip(depth);
         let count = below.clone().count();
         let checked = if itself { count } else { count.saturating_sub(1) };
+        if checked == 0 {
+            return false;
+        }
         let mut relative = rules.prefix.clone();
         for component in below.take(checked) {
             push_name(&mut relative, component.as_os_str());
-            if rules.leaves_out(&relative) {
-                return true;
-            }
         }
-        false
+        LAST_ASKED.with(|last| {
+            let known =
+                last.borrow().as_ref().and_then(|asked| asked.answer(self.id, index, &relative));
+            if let Some(answer) = known {
+                return answer;
+            }
+            let answer = rules.leaves_out_down_to(&relative);
+            *last.borrow_mut() = Some(Asked { id: self.id, root: index, relative, answer });
+            answer
+        })
     }
+}
+
+static NEXT_GIT_IGNORED_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The last directory one thread asked a [`GitIgnored`] about, with the answer.
+struct Asked {
+    id: u64,
+    root: usize,
+    relative: String,
+    answer: bool,
+}
+
+impl Asked {
+    fn answer(&self, id: u64, root: usize, relative: &str) -> Option<bool> {
+        (self.id == id && self.root == root && self.relative == relative).then_some(self.answer)
+    }
+}
+
+thread_local! {
+    /// Walks, watchers and loaders ask about every entry of one directory in a row, and
+    /// for all of them git's answer is the directory's: kept here, it spares matching the
+    /// directory and its ancestors once per entry.
+    static LAST_ASKED: RefCell<Option<Asked>> = const { RefCell::new(None) };
 }
 
 impl GitRoot {
@@ -694,6 +739,23 @@ impl RootRules {
     fn leaves_out(&self, relative: &str) -> bool {
         self.tree.ignores(relative)
             || self.worktrees.iter().any(|worktree| same_name(worktree, relative))
+    }
+
+    /// Whether a directory from just below the root down to `relative` (to the top,
+    /// `/`-separated, starting with the root's prefix) is left out.
+    fn leaves_out_down_to(&self, relative: &str) -> bool {
+        let mut end = if self.prefix.is_empty() { 0 } else { self.prefix.len() + 1 };
+        loop {
+            let start = end;
+            end = relative[start..].find('/').map_or(relative.len(), |at| start + at);
+            if self.leaves_out(&relative[..end]) {
+                return true;
+            }
+            if end == relative.len() {
+                return false;
+            }
+            end += 1;
+        }
     }
 }
 
@@ -799,14 +861,23 @@ fn push_name(path: &mut String, name: &OsStr) {
 }
 
 /// Whether two names, or two `/`-separated relative paths, are the same, ignoring case
-/// on Windows as [`is_within`] does. Compared character by character, so nothing is
-/// allocated on a path every walk and loader asks about.
+/// on Windows as [`is_within`] does. Names spelled alike, the common case, cost one byte
+/// comparison; only a pair that differs is folded, character by character and without
+/// allocating, since every walk and loader asks about each path against every root.
 fn same_name(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        left.chars().flat_map(char::to_lowercase).eq(right.chars().flat_map(char::to_lowercase))
-    } else {
-        left == right
+    if left == right {
+        return true;
     }
+    #[cfg(test)]
+    FOLDED_COMPARISONS.with(|count| count.set(count.get() + 1));
+    cfg!(windows)
+        && left.chars().flat_map(char::to_lowercase).eq(right.chars().flat_map(char::to_lowercase))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many name comparisons on this thread got past byte equality.
+    static FOLDED_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl PartialEq for ExcludedPaths {
@@ -1329,6 +1400,33 @@ mod tests {
 
         assert_ne!(first, other);
         assert_ne!(first, ExcludedPaths::default());
+    }
+
+    #[test]
+    fn a_lookup_over_many_roots_compares_equal_names_without_folding() {
+        let names: Vec<String> = (0..25).map(|n| format!("src/cfe/Extension{n}")).collect();
+        let roots: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (top, excluded) = git_ignored("git-many-roots", ".claude/\n", &roots, &[]);
+        let file = top.join("src/cfe/Extension7").join(MODULE);
+
+        FOLDED_COMPARISONS.with(|count| count.set(0));
+        assert!(!excluded.is_excluded(&file));
+        let folded = FOLDED_COMPARISONS.with(std::cell::Cell::get);
+        // Each root that does not hold the file parts from it at one name.
+        assert!(folded < roots.len(), "{folded} comparisons were folded for {} roots", roots.len());
+    }
+
+    #[test]
+    fn an_answer_kept_for_a_directory_belongs_to_one_set() {
+        let (top, build) = git_ignored("git-memo", "build/\n", &[""], &[]);
+        let (_, tools) = git_ignored("git-memo", "tools/\n", &[""], &[]);
+
+        assert!(build.is_excluded(&top.join("build/A.bsl")));
+        assert!(!tools.is_excluded(&top.join("build/B.bsl")), "one set used another's answer");
+        assert!(build.is_excluded(&top.join("build/B.bsl")));
+        assert!(!build.is_excluded(&top.join("src/A.bsl")));
+        assert!(build.is_excluded(&top.join("build/deeper/A.bsl")));
+        assert!(tools.is_excluded(&top.join("tools/A.bsl")));
     }
 
     #[cfg(windows)]
