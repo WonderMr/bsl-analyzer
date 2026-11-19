@@ -7164,7 +7164,7 @@ mod platform_catalog_calls {
             }
             for (profile, server) in [("workspace", &workspace), ("reference", &reference)] {
                 let through = server
-                    .syntax_help(Parameters(syntax_help_params(&reference_id, sent)))
+                    .syntax_help(Parameters(syntax_help_params(&reference_id, sent)), token())
                     .await
                     .unwrap();
                 assert_eq!(wire(&through), wire(&direct), "{profile}, budget {sent:?}");
@@ -7213,7 +7213,7 @@ mod platform_catalog_calls {
         assert_eq!(started, 1, "reference_search list_platform");
         let started = blocking_threads_started_by(|| async {
             workspace
-                .syntax_help(Parameters(syntax_help_params(&reference_id, None)))
+                .syntax_help(Parameters(syntax_help_params(&reference_id, None)), token())
                 .await
                 .unwrap()
         });

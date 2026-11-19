@@ -993,7 +993,7 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:16ac68a2b10e4a20342f41a6fc435182996213e917a75a8a25077d3021f3d4c5",
+                        "output_schema_fingerprint": "blake3:d9a4e90f2d430785692de05265224a2d0c9311a81ae188a51e72f7b2c8790ad7",
                         "output_schema_version": "7",
                         "params": [
                           {
@@ -1035,7 +1035,7 @@ mod tests {
                         "actions": [],
                         "name": "syntax_help",
                         "note": "exactly one of `name` or `reference_id` is required",
-                        "output_schema_fingerprint": "blake3:219fdb853fb5b1c5a40de0010463c820ba26d85b01d9ee1ad8766ff45b848465",
+                        "output_schema_fingerprint": "blake3:0fe92382561d023a423e624531fc57966a2330072815e2b78f8f1e4b5313495b",
                         "output_schema_version": "2",
                         "params": [
                           {
@@ -1087,7 +1087,7 @@ mod tests {
                         "actions": [],
                         "name": "references",
                         "note": "one of `symbol` or `path` with `line` and/or `line_content` is required; opt-in — a launch has to name it with `--enable-tool references`",
-                        "output_schema_fingerprint": "blake3:2ee4fa6ea2bec6f9acd52f43f1aa20ed950fc9db1c30a48f45de299dbf772a4a",
+                        "output_schema_fingerprint": "blake3:f073c610fc16736b0e2b473fa7d243962760bbf764d196837921382f2d9eb05c",
                         "output_schema_version": "1",
                         "params": [
                           {
@@ -1311,7 +1311,7 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:253ed1cc1c5757ff39f5de35cdd81d724ab9509c93e6730f60c8302a4c11a553",
+                        "output_schema_fingerprint": "blake3:1ce6d5305650f1514374878def48c41b13e6ac3011c8704a93cb6396b06cf12e",
                         "output_schema_version": "9",
                         "params": [
                           {
@@ -1835,7 +1835,7 @@ mod tests {
                         "actions": [],
                         "name": "symbol_info",
                         "note": "one of `symbol` or `path`+`line` is required",
-                        "output_schema_fingerprint": "blake3:e32381f657fb0794a3f919d6efb66d7d8e0ac941e6c12a1fffd7b0fd1da0c48e",
+                        "output_schema_fingerprint": "blake3:a61b2200d03a0f5ae4d1191c70d0219fee2c24a3ff2541660fe7e0d2254a237d",
                         "output_schema_version": "1",
                         "params": [
                           {
@@ -1930,7 +1930,7 @@ mod tests {
                           }
                         ],
                         "name": "diagnostics",
-                        "output_schema_fingerprint": "blake3:2de7d4aa984c1a12c46e892e51dd64097a7087221b705850d7ebd90b609e1031",
+                        "output_schema_fingerprint": "blake3:6e04d4904cfeffa45b67bfe976fa2f87fb8b6159da8ebd10dd0856c679d69d0a",
                         "output_schema_version": "19",
                         "params": [
                           {
@@ -2061,7 +2061,7 @@ mod tests {
                         "actions": [],
                         "name": "syntax_help",
                         "note": "exactly one of `name` or `reference_id` is required",
-                        "output_schema_fingerprint": "blake3:219fdb853fb5b1c5a40de0010463c820ba26d85b01d9ee1ad8766ff45b848465",
+                        "output_schema_fingerprint": "blake3:0fe92382561d023a423e624531fc57966a2330072815e2b78f8f1e4b5313495b",
                         "output_schema_version": "2",
                         "params": [
                           {
