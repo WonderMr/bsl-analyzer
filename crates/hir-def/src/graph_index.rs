@@ -2182,11 +2182,72 @@ pub fn display_scope(key: &ModuleKey) -> String {
     }
 }
 
+/// The path half of a file-keyed graph id (`method/file/<key>::<name>`, `module/file/<key>`)
+/// for the file at `abs`, in a graph built against `workspace_root`.
+///
+/// A file under the root is keyed by its path relative to the root, as these ids have always
+/// been. A file outside it — a `[source] root` or an extension declared by an absolute path
+/// elsewhere on disk — is keyed by its whole path: no relative path names it, and keeping only
+/// its file name would give every form module of such a project the key `Module.bsl`, so
+/// namesake form methods would share one id and the store would keep only one of them.
+///
+/// The whole path is normalized so that every spelling of the file that reaches an encoder or
+/// a decoder yields one key: `/` separators and, on Windows, no verbatim prefix before a drive
+/// (`//?/C:/…`) or a share (`//?/UNC/…`), which `canonicalize` adds and a declared path lacks.
+/// Every place that mints or resolves these ids keys a file through this one function, which
+/// is what lets an id the build stored resolve when it is handed back. `None` only for an
+/// empty path.
+pub fn graph_file_key(abs: &str, workspace_root: &str) -> Option<String> {
+    file_key(abs, workspace_root, cfg!(windows))
+}
+
+/// [`graph_file_key`] under the path rules of Windows (`windows`) or of every other system,
+/// so both are testable on either.
+fn file_key(abs: &str, workspace_root: &str, windows: bool) -> Option<String> {
+    let abs = abs.replace('\\', "/");
+    if abs.is_empty() {
+        return None;
+    }
+    let root = workspace_root.replace('\\', "/");
+    if let Some(rel) = rel_under_root(&abs, root.trim_end_matches('/'), windows) {
+        return Some(rel.to_string());
+    }
+    if windows {
+        return Some(without_verbatim_prefix(&abs));
+    }
+    Some(abs)
+}
+
+/// `abs` relative to `root`, when it lies inside it. A longer-named sibling that merely starts
+/// with the root's spelling (`/ws/project` against `/ws/proj`) does not.
+fn rel_under_root<'a>(abs: &'a str, root: &str, windows: bool) -> Option<&'a str> {
+    let rest = strip_root(abs, root, windows)?;
+    let rel = rest.strip_prefix('/')?.trim_start_matches('/');
+    (!rel.is_empty()).then_some(rel)
+}
+
+/// `path` without the verbatim prefix Windows puts before a drive or a share. Any other
+/// verbatim path (a volume GUID) has no plainer spelling and keeps its own.
+fn without_verbatim_prefix(path: &str) -> String {
+    if let Some(share) = path.strip_prefix("//?/UNC/") {
+        return format!("//{share}");
+    }
+    match path.strip_prefix("//?/") {
+        Some(rest) if is_drive_path(rest) => rest.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+fn is_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// What is left of `abs` under `root`, both with forward slashes. Windows spells one directory
 /// several ways: `canonicalize` answers `//?/C:/…` while a walk keeps the spelling of its root,
 /// and paths there ignore case, so a literal comparison would lose the relative path.
-fn strip_root<'a>(abs: &'a str, root: &str) -> Option<&'a str> {
-    if !cfg!(windows) {
+fn strip_root<'a>(abs: &'a str, root: &str, windows: bool) -> Option<&'a str> {
+    if !windows {
         return abs.strip_prefix(root);
     }
     let (abs, root) = (without_windows_prefix(abs), without_windows_prefix(root));
@@ -2419,11 +2480,10 @@ impl<'a> GraphRowEncoder<'a> {
         self.paths.get(&file).map(|p| p.replace('\\', "/"))
     }
 
-    fn rel_path(&self, abs: &str) -> Option<String> {
-        let root = self.workspace_root?;
-        let root_str = root.to_str()?.replace('\\', "/");
-        let stripped = strip_root(abs, &root_str)?;
-        Some(stripped.trim_start_matches('/').to_string())
+    /// The path half of `abs`'s file-keyed ids, see [`graph_file_key`]; `None` without a root,
+    /// where no key can tell a workspace file from an outside one.
+    fn file_key(&self, abs: &str) -> Option<String> {
+        graph_file_key(abs, self.workspace_root?.to_str()?)
     }
 
     fn method_name(&self, method: MethodId) -> String {
@@ -2434,7 +2494,7 @@ impl<'a> GraphRowEncoder<'a> {
         let path = self.path_for(module.file_id)?;
         match module_key_for_path(&path) {
             Some(key) => Some(display_scope(&key)),
-            None => self.rel_path(&path).or_else(|| basename(&path).map(str::to_string)),
+            None => self.file_key(&path).or_else(|| basename(&path).map(str::to_string)),
         }
     }
 
@@ -2449,8 +2509,8 @@ impl<'a> GraphRowEncoder<'a> {
                 let path = self.path_for(module.file_id);
                 if let Some(key) = path.as_deref().and_then(module_key_for_path) {
                     (format!("module/{}", encode_scope(&key)), true)
-                } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
-                    (format!("module/file/{rel}"), true)
+                } else if let Some(key) = path.as_deref().and_then(|p| self.file_key(p)) {
+                    (format!("module/file/{key}"), true)
                 } else {
                     let base = path.as_deref().and_then(basename).unwrap_or("?");
                     (format!("module/file/{base}"), false)
@@ -2523,8 +2583,8 @@ impl<'a> GraphRowEncoder<'a> {
         let path = self.path_for(module.file_id);
         if let Some(key) = path.as_deref().and_then(module_key_for_path) {
             (format!("method/{}/", encode_scope(&key)), true)
-        } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
-            (format!("method/file/{rel}::"), true)
+        } else if let Some(key) = path.as_deref().and_then(|p| self.file_key(p)) {
+            (format!("method/file/{key}::"), true)
         } else {
             let base = path.as_deref().and_then(basename).unwrap_or("?");
             (format!("method/file/{base}::"), false)
@@ -2842,15 +2902,13 @@ mod module_layout_hash_tests {
     use super::*;
 
     #[test]
-    #[cfg(not(windows))]
     fn a_root_is_stripped_literally_outside_windows() {
-        assert_eq!(strip_root("/ws/a/M.bsl", "/ws"), Some("/a/M.bsl"));
-        assert_eq!(strip_root("/WS/a/M.bsl", "/ws"), None);
-        assert_eq!(strip_root("//?/ws/a/M.bsl", "/ws"), None);
+        assert_eq!(strip_root("/ws/a/M.bsl", "/ws", false), Some("/a/M.bsl"));
+        assert_eq!(strip_root("/WS/a/M.bsl", "/ws", false), None);
+        assert_eq!(strip_root("//?/ws/a/M.bsl", "/ws", false), None);
     }
 
     #[test]
-    #[cfg(windows)]
     fn every_windows_spelling_of_a_root_is_stripped() {
         for (abs, root) in [
             ("C:/ws/a/M.bsl", "C:/ws"),
@@ -2860,9 +2918,137 @@ mod module_layout_hash_tests {
             ("c:/проекты/a/M.bsl", "//?/C:/Проекты"),
             ("//server/share/a/M.bsl", "//?/UNC/server/share"),
         ] {
-            assert_eq!(strip_root(abs, root), Some("/a/M.bsl"), "{abs} under {root}");
+            assert_eq!(strip_root(abs, root, true), Some("/a/M.bsl"), "{abs} under {root}");
         }
-        assert_eq!(strip_root("D:/ws/a/M.bsl", "C:/ws"), None);
+        assert_eq!(strip_root("D:/ws/a/M.bsl", "C:/ws", true), None);
+    }
+
+    /// Under the root a file keeps the relative key its ids have always had, whichever way the
+    /// root is spelled; anything else is keyed by its whole path, never by a garbled remainder.
+    #[test]
+    fn a_file_key_is_relative_inside_the_root_and_absolute_outside_it() {
+        for root in ["/ws/proj", "/ws/proj/", "/ws/proj//"] {
+            let key = file_key("/ws/proj/a/b.bsl", root, false);
+            assert_eq!(key.as_deref(), Some("a/b.bsl"), "under {root}");
+        }
+        let key = file_key("/ws/proj//a/b.bsl", "/ws/proj", false);
+        assert_eq!(key.as_deref(), Some("a/b.bsl"));
+        let key = file_key("/elsewhere/a/b.bsl", "/ws/proj", false);
+        assert_eq!(key.as_deref(), Some("/elsewhere/a/b.bsl"));
+        let key = file_key("/ws/project/a.bsl", "/ws/proj", false);
+        assert_eq!(key.as_deref(), Some("/ws/project/a.bsl"), "a sibling is not under the root");
+        let key = file_key("//?/C:/base/a.bsl", "/ws", false);
+        assert_eq!(key.as_deref(), Some("//?/C:/base/a.bsl"), "outside Windows it is a name");
+        assert_eq!(file_key("", "/ws", false), None);
+        assert_eq!(file_key("", "C:/ws", true), None);
+    }
+
+    /// One Windows file, every spelling a walk, `canonicalize` or a client hands over: one key.
+    #[test]
+    fn every_windows_spelling_of_a_file_yields_one_key() {
+        let inside = [r"C:\ws\a\M.bsl", "//?/C:/ws/a/M.bsl", r"\\?\C:\ws\a\M.bsl", "c:/WS/a/M.bsl"];
+        for abs in inside {
+            for root in ["C:/ws", r"\\?\C:\ws", "//?/C:/ws/"] {
+                let key = file_key(abs, root, true);
+                assert_eq!(key.as_deref(), Some("a/M.bsl"), "{abs} under {root}");
+            }
+        }
+        for abs in [r"C:\base\a\M.bsl", "//?/C:/base/a/M.bsl", r"\\?\C:\base\a\M.bsl"] {
+            let key = file_key(abs, r"\\?\C:\ws", true);
+            assert_eq!(key.as_deref(), Some("C:/base/a/M.bsl"), "{abs} outside the root");
+        }
+        let key = file_key(r"\\?\UNC\server\share\a\M.bsl", "C:/ws", true);
+        assert_eq!(key.as_deref(), Some("//server/share/a/M.bsl"));
+        // A volume path has no plainer spelling to fall back to.
+        let key = file_key("//?/Volume{0}/a/M.bsl", "C:/ws", true);
+        assert_eq!(key.as_deref(), Some("//?/Volume{0}/a/M.bsl"));
+    }
+
+    /// One graph index over the given modules, each a `(path, source)` pair, and the paths
+    /// the encoder reads them from.
+    fn indexed(modules: &[(&str, &str)]) -> (GraphIndex, FxHashMap<FileId, String>) {
+        let mut index = GraphIndex::new();
+        let mut paths = FxHashMap::default();
+        for (i, (path, source)) in modules.iter().enumerate() {
+            let file = FileId(i as u32);
+            let parse = parser::parse(source);
+            let methods =
+                crate::call_graph::extract_graph_methods(&crate::ItemTree::from_parse(&parse));
+            index.insert_module_data(ModuleId::new(file), methods, None, false);
+            paths.insert(file, (*path).to_string());
+        }
+        (index, paths)
+    }
+
+    /// The id of the one method declared in `file`, and whether it is addressable.
+    fn only_method_id(encoder: &GraphRowEncoder<'_>, file: u32) -> (String, bool) {
+        let module = ModuleId::new(FileId(file));
+        let mut ids = encoder
+            .method_nodes_in_id_order()
+            .filter(|method| method.module == module)
+            .map(|method| encoder.encode(&GraphNode::Method(method)));
+        let id = ids.next().expect("the module declares a method");
+        assert!(ids.next().is_none(), "the module declares one method");
+        id
+    }
+
+    /// A form module outside the workspace root is keyed by its whole path, and that id is
+    /// addressable; a form module inside the root keeps the id it always had, byte for byte.
+    #[test]
+    fn method_ids_outside_the_workspace_root_are_absolute_and_addressable() {
+        let handler = "Процедура ПриОткрытии(Отказ)\nКонецПроцедуры";
+        let (index, paths) = indexed(&[
+            ("/ws/src/cf/CommonForms/Ф/Ext/Form/Module.bsl", handler),
+            ("/base/CommonForms/Ф/Ext/Form/Module.bsl", handler),
+        ]);
+        let no_objects = MdoFiles::default();
+        let encoder = GraphRowEncoder::new(&index, &paths, Some(Path::new("/ws")), &no_objects);
+
+        let (inside, addressable) = only_method_id(&encoder, 0);
+        assert_eq!(inside, "method/file/src/cf/CommonForms/Ф/Ext/Form/Module.bsl::ПриОткрытии");
+        assert!(addressable, "inside the root the id is the one it always was");
+
+        let (outside, addressable) = only_method_id(&encoder, 1);
+        assert_eq!(outside, "method/file//base/CommonForms/Ф/Ext/Form/Module.bsl::ПриОткрытии");
+        assert!(addressable, "the absolute id resolves on its own");
+        let module = ModuleId::new(FileId(1));
+        let (module_id, addressable) = encoder.encode(&GraphNode::ModuleCode(module));
+        assert_eq!(module_id, "module/file//base/CommonForms/Ф/Ext/Form/Module.bsl");
+        assert!(addressable);
+        let (prefix, addressable) = encoder.method_id_prefix(module);
+        assert_eq!(prefix, "method/file//base/CommonForms/Ф/Ext/Form/Module.bsl::");
+        assert!(addressable);
+        let row = encoder.node_row(&GraphNode::ModuleCode(module));
+        assert_eq!(row.module.as_deref(), Some("/base/CommonForms/Ф/Ext/Form/Module.bsl"));
+
+        // Without a root nothing tells a workspace file from an outside one, so the id stays
+        // the file name it has always been there, and says it does not resolve.
+        let rootless = GraphRowEncoder::new(&index, &paths, None, &no_objects);
+        let (id, addressable) = only_method_id(&rootless, 1);
+        assert_eq!(id, "method/file/Module.bsl::ПриОткрытии");
+        assert!(!addressable);
+    }
+
+    /// Two forms outside the root with a handler of one name: two ids, not one id the store
+    /// would keep a single row for.
+    #[test]
+    fn namesake_form_methods_in_two_outside_forms_get_distinct_ids() {
+        let handler = "&НаСервере\nПроцедура ОбновитьНаСервере()\nКонецПроцедуры";
+        let (index, paths) = indexed(&[
+            ("/base/CommonForms/Первая/Ext/Form/Module.bsl", handler),
+            ("/ext/Расш/CommonForms/Вторая/Ext/Form/Module.bsl", handler),
+        ]);
+        let no_objects = MdoFiles::default();
+        let encoder = GraphRowEncoder::new(&index, &paths, Some(Path::new("/ws")), &no_objects);
+
+        let (first, first_addressable) = only_method_id(&encoder, 0);
+        let (second, second_addressable) = only_method_id(&encoder, 1);
+        let first_module = "/base/CommonForms/Первая/Ext/Form/Module.bsl";
+        let second_module = "/ext/Расш/CommonForms/Вторая/Ext/Form/Module.bsl";
+        assert_eq!(first, format!("method/file/{first_module}::ОбновитьНаСервере"));
+        assert_eq!(second, format!("method/file/{second_module}::ОбновитьНаСервере"));
+        assert!(first_addressable && second_addressable);
+        assert_ne!(first, second);
     }
 
     fn hashes(source: &str) -> (u64, u64) {
