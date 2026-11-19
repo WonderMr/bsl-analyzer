@@ -436,6 +436,15 @@ impl ExcludedPaths {
                     .is_some_and(|resolved| self.is_excluded(&resolved)))
     }
 
+    /// Whether an entry directly inside the directory at `dir`, itself not excluded, may
+    /// be: when not, a listing takes every entry without asking about each. Literal
+    /// directories and patterns can match any entry; git's rules leave out what lies in a
+    /// directory they leave out, so only when that is `dir` itself does an entry need
+    /// asking about, since a root among the entries is still kept.
+    pub fn may_exclude_an_entry_of(&self, dir: &Path) -> bool {
+        self.resolves_aliases() || self.git.as_ref().is_some_and(|git| git.leaves_out(dir, true))
+    }
+
     /// Whether a decision must also ask under the spelling the file system resolves a
     /// path to. Literal directories and patterns are hard exclusions that a symlink alias
     /// must not lead around. Git's rules are asked under the spelling a path arrives in,
@@ -1898,6 +1907,24 @@ mod tests {
 
         let (_, outside) = git_ignored("git-below-none", "/tools/\nsrc/cfe/D/\n", &roots, &[]);
         assert!(outside.is_empty(), "patterns that match below no root leave nothing to ask");
+    }
+
+    #[test]
+    fn only_a_directory_git_leaves_out_has_entries_worth_asking_about() {
+        let roots = ["", "build/cf"];
+        let (top, excluded) = git_ignored("git-entries", ".claude/\nbuild/\n", &roots, &[]);
+
+        assert!(!excluded.may_exclude_an_entry_of(&top));
+        assert!(!excluded.may_exclude_an_entry_of(&top.join("CommonModules")));
+        assert!(excluded.may_exclude_an_entry_of(&top.join(".claude")));
+        assert!(excluded.may_exclude_an_entry_of(&top.join(".claude/worktrees")));
+        // A root among the entries of a directory left out stays: they are asked about.
+        assert!(excluded.may_exclude_an_entry_of(&top.join("build")));
+        assert!(!excluded.is_excluded(&top.join("build/cf")));
+        assert!(excluded.is_excluded(&top.join("build/other")));
+
+        assert!(ExcludedPaths::new([top.join(".tmp")]).may_exclude_an_entry_of(&top));
+        assert!(!ExcludedPaths::default().may_exclude_an_entry_of(&top));
     }
 
     #[test]

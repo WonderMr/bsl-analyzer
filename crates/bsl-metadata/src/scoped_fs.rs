@@ -38,10 +38,12 @@ impl<'a> ScopedFs<'a> {
         }
         let resolved = self.resolved_dir(dir);
         let excluded = self.excluded;
-        Ok(std::fs::read_dir(dir)?.filter(move |entry| {
-            entry.as_ref().map_or(true, |entry| {
+        let asks = excluded.may_exclude_an_entry_of(dir);
+        Ok(std::fs::read_dir(dir)?.filter(move |entry| match entry {
+            Ok(entry) if asks => {
                 !child_excluded(excluded, &entry.path(), resolved.as_deref(), &entry.file_name())
-            })
+            }
+            _ => true,
         }))
     }
 
@@ -83,9 +85,12 @@ impl DirTree for ScopedFs<'_> {
         if self.is_excluded(dir) {
             return Vec::new();
         }
+        let entries = RealFs.entries(dir);
+        if !self.excluded.may_exclude_an_entry_of(dir) {
+            return entries;
+        }
         let resolved = self.resolved_dir(dir);
-        RealFs
-            .entries(dir)
+        entries
             .into_iter()
             .filter(|entry| {
                 let name = entry.path.file_name().unwrap_or_default();
@@ -98,9 +103,12 @@ impl DirTree for ScopedFs<'_> {
         if self.is_excluded(dir) {
             return Vec::new();
         }
+        let names = RealFs.child_names(dir);
+        if !self.excluded.may_exclude_an_entry_of(dir) {
+            return names;
+        }
         let resolved = self.resolved_dir(dir);
-        RealFs
-            .child_names(dir)
+        names
             .into_iter()
             .filter(|name| {
                 !child_excluded(self.excluded, &dir.join(name), resolved.as_deref(), name)
@@ -139,6 +147,33 @@ mod tests {
         let visible_files: Vec<_> =
             fs.read_dir(&visible).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(visible_files, [OsString::from("Visible.xml")]);
+    }
+
+    #[test]
+    fn a_directory_git_leaves_out_lists_as_empty() {
+        use stdx::path_exclusion::{GitIgnored, WorkTreeRules};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let copy = root.join(".claude/worktrees/copy");
+        std::fs::create_dir_all(copy.join("Catalogs")).unwrap();
+        std::fs::create_dir_all(root.join("Catalogs/Visible")).unwrap();
+        std::fs::write(root.join("Catalogs/Visible.xml"), "public").unwrap();
+        let rules = std::sync::Arc::new(WorkTreeRules::new(root, ".claude/\n".lines(), &[]));
+        let mut ignored = GitIgnored::default();
+        ignored.add_root(root, Some((rules, Path::new(""))));
+        let excluded = ExcludedPaths::default().with_git_ignored(ignored);
+        let fs = ScopedFs::new(&excluded);
+
+        let names = fs.child_names(root);
+        assert!(names.iter().any(|name| name == ".claude"), "{names:?}");
+        assert!(names.iter().any(|name| name == "Catalogs"), "{names:?}");
+        let catalogs = fs.child_names(&root.join("Catalogs"));
+        assert_eq!(catalogs.len(), 2, "{catalogs:?}");
+        assert!(fs.child_names(&root.join(".claude")).is_empty());
+        assert!(fs.entries(&root.join(".claude")).is_empty());
+        assert!(fs.read_dir(&root.join(".claude")).unwrap().next().is_none());
+        assert!(fs.kind_of(&copy.join("Catalogs")).is_none());
     }
 
     #[cfg(unix)]
