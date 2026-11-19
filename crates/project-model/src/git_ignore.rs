@@ -14,12 +14,12 @@
 //! the project differ between machines.
 //!
 //! A project is derived many times over (MCP derives it again on every incremental
-//! reload), so the rules of a work tree are read and compiled once and kept with the
-//! state of every file they came from; they are read again only after one of those files
-//! changes.
+//! reload), so the rules of a work tree are kept, compiled, with the state of every file
+//! they came from, and taken again while none of those files has changed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -91,36 +91,49 @@ fn linked_git_dir(top: &Path, dot_git: &Path) -> Option<PathBuf> {
 
 /// The directory every worktree of a repository shares: a linked worktree's git
 /// directory names it in `commondir`, relative to itself.
-fn common_dir(git_dir: &Path) -> PathBuf {
-    match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(text) => git_dir.join(text.trim()),
-        Err(_) => git_dir.to_path_buf(),
+fn common_dir(git_dir: &Path, sources: &mut Sources) -> PathBuf {
+    let commondir = git_dir.join("commondir");
+    sources.stamp(&commondir);
+    let text = std::fs::read_to_string(&commondir);
+    match sources.checked(&commondir, text) {
+        Some(text) => git_dir.join(text.trim()),
+        None => git_dir.to_path_buf(),
     }
 }
 
-/// The rules of the work tree whose top is `top`, read again only when a file they came
-/// from has changed since they were last read.
+/// The rules of the work tree whose top is `top`. Rules read before are taken again while
+/// every file they came from is as it was; rules read from a file that had changed moments
+/// before, or that could not be read, are read again the next time.
 fn rules_of(top: &Path, git_dir: &Path) -> Arc<WorkTreeRules> {
-    let kept = READ.lock().unwrap_or_else(PoisonError::into_inner).get(top).cloned();
+    let kept = READ.lock().unwrap_or_else(PoisonError::into_inner).get_mut(top).map(Read::take);
     if let Some(kept) = kept.filter(|kept| kept.git_dir == git_dir && kept.is_current()) {
         return kept.rules;
     }
     let read_at = SystemTime::now();
-    let mut sources = Vec::new();
+    let mut sources = Sources::default();
     let rules = Arc::new(read_rules(top, git_dir, &mut sources));
     let mut read = READ.lock().unwrap_or_else(PoisonError::into_inner);
-    if sources.iter().all(|(_, stamp)| stamp.settled(read_at)) {
-        let git_dir = git_dir.to_path_buf();
-        let kept = Read { git_dir, sources: sources.into(), rules: rules.clone() };
-        read.insert(top.to_path_buf(), kept);
-    } else {
-        read.remove(top);
+    read.remove(top);
+    if !sources.settled(read_at) {
+        return rules;
     }
+    if read.len() >= KEPT_WORK_TREES {
+        let least = read.iter().min_by_key(|(_, kept)| kept.used).map(|(dir, _)| dir.clone());
+        read.retain(|dir, _| Some(dir) != least.as_ref());
+    }
+    read.insert(top.to_path_buf(), Read::new(git_dir, sources, rules.clone()));
     rules
 }
 
-/// The rules of each work tree read so far, by its top.
+/// The rules of the work trees read last, by their tops.
 static READ: LazyLock<Mutex<HashMap<PathBuf, Read>>> = LazyLock::new(Mutex::default);
+
+/// How many work trees' rules are kept: a process that opens more drops the rules taken
+/// longest ago.
+const KEPT_WORK_TREES: usize = 16;
+
+/// Counts the takes of kept rules, for telling which were taken longest ago.
+static TAKES: AtomicU64 = AtomicU64::new(0);
 
 /// Rules as read, with the state each file they came from was in.
 #[derive(Clone)]
@@ -128,11 +141,59 @@ struct Read {
     git_dir: PathBuf,
     sources: Arc<[(PathBuf, Stamp)]>,
     rules: Arc<WorkTreeRules>,
+    /// When the rules were last taken, by [`TAKES`].
+    used: u64,
 }
 
 impl Read {
+    fn new(git_dir: &Path, sources: Sources, rules: Arc<WorkTreeRules>) -> Self {
+        let used = TAKES.fetch_add(1, Ordering::Relaxed);
+        Self { git_dir: git_dir.to_path_buf(), sources: sources.0.into(), rules, used }
+    }
+
+    /// A copy, with this one marked as just taken.
+    fn take(&mut self) -> Self {
+        self.used = TAKES.fetch_add(1, Ordering::Relaxed);
+        self.clone()
+    }
+
     fn is_current(&self) -> bool {
-        self.sources.iter().all(|(path, stamp)| Stamp::of(path) == *stamp)
+        self.sources.iter().all(|(path, stamp)| stamp.is_current(path))
+    }
+}
+
+/// The state of every file one read of the rules depends on, each taken before the file
+/// is read: a change made while reading is seen the next time.
+#[derive(Default)]
+struct Sources(Vec<(PathBuf, Stamp)>);
+
+impl Sources {
+    fn stamp(&mut self, path: &Path) {
+        self.0.push((path.to_path_buf(), Stamp::of(path)));
+    }
+
+    /// Records that only whether the directory at `path` is there matters, not what it
+    /// holds.
+    fn presence(&mut self, path: &Path) {
+        self.0.push((path.to_path_buf(), Stamp::of(path).presence()));
+    }
+
+    /// What reading `path` gave, `None` when it is absent or could not be read. Rules read
+    /// without a file that is there but could not be read are not kept: the file's state
+    /// would not change when it becomes readable.
+    fn checked<T>(&mut self, path: &Path, read: std::io::Result<T>) -> Option<T> {
+        match read {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => {
+                self.0.push((path.to_path_buf(), Stamp::Unknown));
+                None
+            }
+        }
+    }
+
+    fn settled(&self, read_at: SystemTime) -> bool {
+        self.0.iter().all(|(_, stamp)| stamp.settled(read_at))
     }
 }
 
@@ -144,6 +205,8 @@ enum Stamp {
         len: u64,
         modified: SystemTime,
     },
+    /// A directory that is there, whatever it holds.
+    Exists,
     /// The metadata could not be read, or carries no modification time: never current.
     Unknown,
 }
@@ -165,10 +228,24 @@ impl Stamp {
         }
     }
 
+    /// The state with what a directory holds left out.
+    fn presence(self) -> Self {
+        match self {
+            Self::Present { .. } => Self::Exists,
+            other => other,
+        }
+    }
+
+    fn is_current(&self, path: &Path) -> bool {
+        let now = Self::of(path);
+        let now = if *self == Self::Exists { now.presence() } else { now };
+        now == *self
+    }
+
     /// Whether the state, taken just before `read_at`, can stand for what was read.
     fn settled(&self, read_at: SystemTime) -> bool {
         match self {
-            Self::Absent => true,
+            Self::Absent | Self::Exists => true,
             Self::Present { modified, .. } => {
                 read_at.duration_since(*modified).is_ok_and(|age| age >= SETTLED_AFTER)
             }
@@ -177,30 +254,25 @@ impl Stamp {
     }
 }
 
-/// Reads the rules, recording in `sources` the state of every file they come from, each
-/// taken before the file is read: a change made while reading is seen next time.
-fn read_rules(top: &Path, git_dir: &Path, sources: &mut Vec<(PathBuf, Stamp)>) -> WorkTreeRules {
-    let mut stamp = |path: &Path| sources.push((path.to_path_buf(), Stamp::of(path)));
-    stamp(&git_dir.join("commondir"));
-    let common = common_dir(git_dir);
-    let exclude = common.join("info").join("exclude");
-    let gitignore = top.join(".gitignore");
-    stamp(&exclude);
-    stamp(&gitignore);
+/// Reads the rules, recording in `sources` the state of every file they come from.
+fn read_rules(top: &Path, git_dir: &Path, sources: &mut Sources) -> WorkTreeRules {
+    let common = common_dir(git_dir, sources);
     // Git lets a `.gitignore` override `info/exclude`, and in the rules a later line wins
     // over an earlier one, so `info/exclude` goes first.
-    let mut lines = ignore_file_lines(&exclude);
-    lines.extend(ignore_file_lines(&gitignore));
-    let worktrees = linked_worktrees(&common, top, &mut stamp);
+    let mut lines = read_ignore_file(&common.join("info").join("exclude"), sources);
+    lines.extend(read_ignore_file(&top.join(".gitignore"), sources));
+    let worktrees = linked_worktrees(&common, top, sources);
     WorkTreeRules::new(top, lines.iter().map(String::as_str), &worktrees)
 }
 
-/// The lines of an ignore file, without a leading byte order mark; none when the file
-/// cannot be read. Git reads an ignore file as bytes, so one saved in a legacy code page
-/// still counts: only a line that is not UTF-8, which cannot name a path the analyzer
-/// sees, is skipped, with a warning.
-fn ignore_file_lines(file: &Path) -> Vec<String> {
-    let Ok(bytes) = std::fs::read(file) else { return Vec::new() };
+/// The lines of an ignore file, without a leading byte order mark; none when the file is
+/// absent or cannot be read. Git reads an ignore file as bytes, so one saved in a legacy
+/// code page still counts: only a line that is not UTF-8, which cannot name a path the
+/// analyzer sees, is skipped, with a warning.
+fn read_ignore_file(file: &Path, sources: &mut Sources) -> Vec<String> {
+    sources.stamp(file);
+    let bytes = std::fs::read(file);
+    let Some(bytes) = sources.checked(file, bytes) else { return Vec::new() };
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(&bytes);
     let mut skipped = 0usize;
     let lines = bytes
@@ -218,28 +290,36 @@ fn ignore_file_lines(file: &Path) -> Vec<String> {
     lines
 }
 
+/// [`read_ignore_file`] on its own.
+#[cfg(test)]
+fn ignore_file_lines(file: &Path) -> Vec<String> {
+    read_ignore_file(file, &mut Sources::default())
+}
+
 /// The repository's linked worktrees below `top`, relative to it. Each is listed in
 /// `worktrees/<id>/gitdir` of the common directory by the path of its `.git` file.
-/// `stamp` records each file the list depends on, before it is read.
-fn linked_worktrees(common: &Path, top: &Path, stamp: &mut impl FnMut(&Path)) -> Vec<PathBuf> {
+fn linked_worktrees(common: &Path, top: &Path, sources: &mut Sources) -> Vec<PathBuf> {
     let listing = common.join("worktrees");
     // Adding or removing a worktree adds or removes an entry here.
-    stamp(&listing);
-    let Ok(entries) = std::fs::read_dir(&listing) else { return Vec::new() };
+    sources.stamp(&listing);
+    let entries = std::fs::read_dir(&listing);
+    let Some(entries) = sources.checked(&listing, entries) else { return Vec::new() };
     let Ok(top) = stdx::path_exclusion::resolve(top) else { return Vec::new() };
     entries
         .flatten()
         .filter_map(|entry| {
             let admin = entry.path();
             let gitdir = admin.join("gitdir");
-            stamp(&gitdir);
-            let text = std::fs::read_to_string(&gitdir).ok()?;
+            sources.stamp(&gitdir);
+            let text = std::fs::read_to_string(&gitdir);
+            let text = sources.checked(&gitdir, text)?;
             // Absolute as git writes it by default; a relative path is taken from `admin`.
             let dot_git = admin.join(text.trim());
+            let worktree = dot_git.parent()?;
             // A worktree removed without `git worktree prune` stays listed; nothing of it
-            // is left to walk.
-            stamp(&dot_git);
-            let worktree = stdx::path_exclusion::resolve(dot_git.parent()?).ok()?;
+            // is left to walk until it is there again.
+            sources.presence(worktree);
+            let worktree = stdx::path_exclusion::resolve(worktree).ok()?;
             let relative = worktree.strip_prefix(&top).ok()?;
             if relative.as_os_str().is_empty() {
                 None
@@ -510,6 +590,32 @@ mod tests {
         let fresh = super::rules_of(top, &git_dir);
         assert!(leaves_out(&fresh, top, "gen"));
         assert!(!Arc::ptr_eq(&fresh, &super::rules_of(top, &git_dir)));
+    }
+
+    #[test]
+    fn rules_read_without_a_file_that_could_not_be_read_are_not_kept() {
+        let mut sources = super::Sources::default();
+        let path = Path::new("absent");
+        let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(sources.checked::<()>(path, Err(absent)).is_none());
+        assert!(sources.settled(SystemTime::now()), "an absent file is a state like any other");
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(sources.checked::<()>(Path::new("locked"), Err(denied)).is_none());
+        assert!(!sources.settled(SystemTime::now()));
+    }
+
+    #[test]
+    fn rules_are_kept_for_a_bounded_number_of_work_trees() {
+        let count = super::KEPT_WORK_TREES + 2;
+        let dirs: Vec<_> = (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
+        for dir in &dirs {
+            let git_dir = dir.path().join(".git");
+            let first = super::rules_of(dir.path(), &git_dir);
+            assert!(Arc::ptr_eq(&first, &super::rules_of(dir.path(), &git_dir)));
+        }
+        let kept = super::READ.lock().map_or(0, |read| read.len());
+        assert!(kept <= super::KEPT_WORK_TREES, "{kept} work trees kept");
     }
 
     #[test]
