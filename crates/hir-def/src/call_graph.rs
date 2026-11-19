@@ -326,6 +326,24 @@ pub enum EdgeKind {
     /// register via its record-set engine" — the code-level complement to `register_records`
     /// (declared document posts) and `register_movement` (a registrator's `Движения`).
     RegisterRecordSet,
+    /// An extension method takes over the base method its annotation names — `&Перед`,
+    /// `&После`, `&Вместо` or `&ИзменениеИКонтроль`, carried as the payload. From the
+    /// extension method's [`GraphNode::Method`] to the [`GraphNode::Method`] of the base
+    /// module the extension adopts. Not a call: the platform runs the interceptor before,
+    /// after or in place of the base method, so the edge is what a change to the base method
+    /// has to be checked against, and nothing in the base method's own code shows it.
+    Intercepts(AnnotationKind),
+}
+
+impl EdgeKind {
+    /// The annotation an [`EdgeKind::Intercepts`] edge was made from; `None` for every other
+    /// kind.
+    pub fn interception(self) -> Option<AnnotationKind> {
+        match self {
+            Self::Intercepts(annotation) => Some(annotation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

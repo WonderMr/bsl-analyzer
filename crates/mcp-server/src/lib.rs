@@ -5797,7 +5797,7 @@ mod tool_descriptions {
               - depth: Traversal depth for neighbors (default: 1).
               - detail: names | signatures | bodies (default: signatures).
               - dir: in | out | both — only for `neighbors` (default: in).
-              - edge_kinds: Keep only edges of these kinds (call|manager_creates|manager_access|query_ref|contains|data_binding|notify_ref|idle_handler|event_subscription|register_movement|subsystem_membership|role_reference|register_records|register_record_set); empty keeps all. Lets metadata-impact queries isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a register manager is `register_record_set`, not `manager_creates`; the `schema` action explains each kind.
+              - edge_kinds: Keep only edges of these kinds (call|manager_creates|manager_access|query_ref|contains|data_binding|notify_ref|idle_handler|event_subscription|register_movement|subsystem_membership|role_reference|register_records|register_record_set|intercepts); empty keeps all. Lets metadata-impact queries isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a register manager is `register_record_set`, not `manager_creates`; the `schema` action explains each kind.
               - id: Durable node id (required for node/neighbors/callers/callees).
               - ids: Durable node ids (required for `source`).
               - max_call_sites: Cap on places per edge when `call_sites` is on (default: 20, max: 200). What the cap

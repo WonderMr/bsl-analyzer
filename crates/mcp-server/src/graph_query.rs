@@ -371,8 +371,21 @@ fn edge_kind(kind: &str) -> &'static str {
         "role_reference" => "role_reference",
         "register_records" => "register_records",
         "register_record_set" => "register_record_set",
+        "intercepts" => "intercepts",
         _ => "call",
     }
+}
+
+/// The stored annotation of an `intercepts` edge in the spelling it was written with; a value
+/// no annotation spells is served as none rather than passed through.
+fn interception(stored: Option<&str>) -> Option<&'static str> {
+    use ide::AnnotationKind::{After, Before, ChangeAndValidate, Instead};
+
+    let stored = stored?;
+    [Before, After, Instead, ChangeAndValidate]
+        .into_iter()
+        .map(ide::AnnotationKind::as_str)
+        .find(|label| *label == stored)
 }
 
 fn provenance(p: &str) -> &'static str {
@@ -1283,8 +1296,8 @@ impl GraphDb {
         out: &mut Vec<StoredEdge>,
     ) -> anyhow::Result<()> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT from_id, to_id, kind, provenance, call_start, call_end, call_absent, crosses \
-             FROM edges WHERE {column} = ?1",
+            "SELECT from_id, to_id, kind, provenance, call_start, call_end, call_absent, crosses, \
+             interception FROM edges WHERE {column} = ?1",
         ))?;
         let rows = stmt.query_map(params![node_id], |r| {
             Ok(StoredEdge {
@@ -1296,6 +1309,7 @@ impl GraphDb {
                 call_end: r.get(5)?,
                 call_absent: r.get(6)?,
                 crosses: r.get::<_, i64>(7)? != 0,
+                interception: r.get(8)?,
             })
         })?;
         for row in rows {
@@ -1467,6 +1481,7 @@ impl GraphDb {
                 call_sites_total: sites.total,
                 call_sites_truncated: sites.truncated,
                 call_sites_unavailable: sites.unavailable,
+                interception: interception(first.interception.as_deref()),
             });
         }
 
@@ -1832,6 +1847,8 @@ struct StoredEdge {
     /// The contract code for why there is no range, when there is none.
     call_absent: Option<String>,
     crosses: bool,
+    /// The annotation of an `intercepts` edge; NULL on every other kind.
+    interception: Option<String>,
 }
 
 /// What one served edge answers when its caller asked where its call is written.
@@ -2161,6 +2178,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
                 // The object contains its own attribute, and the edge points back
                 // at the object exactly as the catalog pass writes it.
@@ -2173,6 +2191,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
             ])
             .unwrap();
@@ -2212,6 +2231,7 @@ mod tests {
         assert_eq!(edge_kind("notify_ref"), "notify_ref");
         assert_eq!(edge_kind("idle_handler"), "idle_handler");
         assert_eq!(edge_kind("event_subscription"), "event_subscription");
+        assert_eq!(edge_kind("intercepts"), "intercepts");
         assert_eq!(provenance("string_resolved"), "string_resolved");
         // The catch-all still normalizes a genuinely unknown string.
         assert_eq!(edge_kind("call"), "call");

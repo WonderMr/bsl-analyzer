@@ -56,6 +56,7 @@ pub use graph::{
     ROOTS_UNAVAILABLE, SOURCE_DRIFTED,
 };
 pub use hir::graph_index;
+pub use hir::pair_extension_module_paths;
 pub use hir::AnnotationKind;
 pub use hir::ModuleId;
 pub use hir::{call_hierarchy_method_digest, MethodCallDigest};

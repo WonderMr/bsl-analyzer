@@ -9864,9 +9864,9 @@ mod tests {
             14,
         );
         let edges = collect(
-            "SELECT from_id, to_id, kind, provenance, crosses FROM edges \
-             ORDER BY from_id, to_id, kind, provenance, crosses",
-            5,
+            "SELECT from_id, to_id, kind, provenance, crosses, interception FROM edges \
+             ORDER BY from_id, to_id, kind, provenance, crosses, interception",
+            6,
         );
         let in_degree = collect("SELECT id, degree FROM in_degree ORDER BY id", 2);
         let unresolved = collect(
@@ -10993,6 +10993,284 @@ mod tests {
             !inc_unres.iter().any(|u| u.contains("common/Ядро") && u.contains("новый")),
             "the resolved call is no longer in the unresolved index: {inc_unres:?}"
         );
+    }
+
+    const BASE_COMMON: &str = concat!(
+        "&НаСервере\nПроцедура Ф(Парам) Экспорт\nКонецПроцедуры\n\n",
+        "Функция Служебная()\nВозврат 1;\nКонецФункции\n",
+    );
+    const BASE_OBJECT: &str = "Процедура ПередЗаписью(Отказ)\nКонецПроцедуры\n";
+    const BASE_FORM: &str = concat!(
+        "&НаСервере\n",
+        "Процедура ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\nКонецПроцедуры\n",
+    );
+    const INTERCEPTED_COMMON: &str = concat!(
+        "&Вместо(\"Ф\")\nПроцедура Расш_Ф(Парам)\nКонецПроцедуры\n\n",
+        "&ИзменениеИКонтроль(\"Служебная\")\n",
+        "Функция Расш_Служебная()\nВозврат 1;\nКонецФункции\n\n",
+        "&После(\"НетТакого\")\nПроцедура Расш_НетТакого()\nКонецПроцедуры\n",
+    );
+    const INTERCEPTED_OBJECT: &str = concat!(
+        "&Перед(\"ПередЗаписью\")\n",
+        "Процедура Расш_ПередЗаписью(Отказ)\nКонецПроцедуры\n",
+    );
+    const INTERCEPTED_FORM: &str = concat!(
+        "&НаСервере\n&После(\"ПриСозданииНаСервере\")\n",
+        "Процедура Расш_ПриСозданииНаСервере(Отказ, СтандартнаяОбработка)\nКонецПроцедуры\n",
+    );
+
+    /// A base configuration and an extension `a` adopting a common module, a catalog's object
+    /// module and one of the catalog's forms; the extension's three modules hold the
+    /// interceptors.
+    fn write_intercepted_workspace(root: &Path) {
+        write(root, "Configuration.xml", "<Configuration/>");
+        write_common_module(root, "Ядро", true, BASE_COMMON);
+        write_catalog(root, "Товары", 1);
+        write(root, "Catalogs/Товары/Ext/ObjectModule.bsl", BASE_OBJECT);
+        write_catalog_form(root, "Товары", "ФормаЭлемента", BASE_FORM);
+        let ext = root.join("ext/a");
+        write(&ext, "Configuration.xml", "<Configuration/>");
+        write(
+            &ext,
+            "CommonModules/Ядро.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <CommonModule uuid="00000000-0000-0000-0000-000000000104">
+        <Properties>
+            <Name>Ядро</Name>
+            <ObjectBelonging>Adopted</ObjectBelonging>
+            <Server>true</Server>
+        </Properties>
+    </CommonModule>
+</MetaDataObject>"#,
+        );
+        write(&ext, "CommonModules/Ядро/Ext/Module.bsl", INTERCEPTED_COMMON);
+        write(&ext, "Catalogs/Товары/Ext/ObjectModule.bsl", INTERCEPTED_OBJECT);
+        write_catalog_form(&ext, "Товары", "ФормаЭлемента", INTERCEPTED_FORM);
+        declare_scoped_extension(root, "a", "ext/a");
+    }
+
+    fn intercept_meta() -> crate::graph_db::GraphMeta {
+        crate::graph_db::GraphMeta {
+            revision: 1,
+            fingerprint: crate::graph_db::GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        }
+    }
+
+    fn build_intercepted(root: &Path, name: &str) -> PathBuf {
+        let out = root.join(".build").join(name);
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        build_whole_graph(root, &out, 1, &intercept_meta()).expect("graph database builds");
+        out
+    }
+
+    /// The id of the one method node named `name`.
+    fn method_id_named(db: &Path, name: &str) -> String {
+        let conn = Connection::open(db).unwrap();
+        let sql = "SELECT id FROM nodes WHERE kind = 'method' AND name = ?1";
+        let id = conn.query_row(sql, [name], |row| row.get(0));
+        id.unwrap_or_else(|error| panic!("no method node named {name}: {error}"))
+    }
+
+    /// Every stored `intercepts` edge as `(from, to, interception)`, in a stable order.
+    fn intercepts_edges(db: &Path) -> Vec<(String, String, Option<String>)> {
+        let conn = Connection::open(db).unwrap();
+        let sql = "SELECT from_id, to_id, interception FROM edges WHERE kind = 'intercepts' \
+                   ORDER BY from_id, to_id";
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// The interceptors of `to` in `db`.
+    fn interceptors_of(db: &Path, to: &str) -> Vec<String> {
+        let edges = intercepts_edges(db).into_iter();
+        edges.filter(|(_, target, _)| target == to).map(|(from, _, _)| from).collect()
+    }
+
+    fn intercepts_neighbors(id: &str, dir: ide::Direction) -> ide::NeighborsParams<'_> {
+        ide::NeighborsParams {
+            id,
+            dir,
+            depth: 1,
+            max_nodes: 50,
+            detail: ide::GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        }
+    }
+
+    /// An extension method annotated `&Перед`/`&После`/`&Вместо`/`&ИзменениеИКонтроль` is
+    /// the incoming `intercepts` edge of the base method it names, in an adopted common
+    /// module, object module and form module alike, exported target or not, and the
+    /// interceptor's outgoing edge leads back to that method. The edge carries the annotation.
+    #[test]
+    fn an_interceptor_is_the_intercepts_edge_into_the_base_method_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_intercepted_workspace(root);
+        let out = build_intercepted(root, "graph.db");
+        let gdb = GraphDb::open(&out).expect("graph database opens");
+
+        assert_eq!(method_id_named(&out, "Ф"), "method/common/Ядро/Ф");
+        assert_eq!(method_id_named(&out, "Расш_Ф"), "method/common/Ядро/Расш_Ф");
+        assert_eq!(
+            method_id_named(&out, "Расш_ПередЗаписью"),
+            "method/object/Catalog/Товары/Расш_ПередЗаписью"
+        );
+        for (base, interceptor, interception) in [
+            ("Ф", "Расш_Ф", "instead"),
+            ("Служебная", "Расш_Служебная", "change_and_validate"),
+            ("ПередЗаписью", "Расш_ПередЗаписью", "before"),
+            ("ПриСозданииНаСервере", "Расш_ПриСозданииНаСервере", "after"),
+        ] {
+            let base = method_id_named(&out, base);
+            let interceptor = method_id_named(&out, interceptor);
+            let params = ide::NeighborsParams {
+                edge_kind_filter: vec!["intercepts".to_string()],
+                ..intercepts_neighbors(&base, ide::Direction::In)
+            };
+            let incoming = gdb.neighbors(&params, None).unwrap().expect("a base method node");
+            let callers: Vec<&str> = incoming.nodes.iter().map(|node| node.id.as_str()).collect();
+            assert_eq!(callers, [interceptor.as_str()], "{base}");
+            assert_eq!(incoming.edges.len(), 1, "{base}: {:?}", incoming.edges);
+            let edge = &incoming.edges[0];
+            assert_eq!(edge.kind, "intercepts", "{base}");
+            assert_eq!(edge.provenance, "resolved", "{base}");
+            assert_eq!(edge.interception, Some(interception), "{base}");
+            assert_eq!(edge.from.as_deref(), Some(interceptor.as_str()), "{base}");
+
+            let params = intercepts_neighbors(&interceptor, ide::Direction::Out);
+            let outgoing = gdb.neighbors(&params, None).unwrap().expect("an interceptor node");
+            let targets: Vec<&str> = outgoing.nodes.iter().map(|node| node.id.as_str()).collect();
+            assert_eq!(targets, [base.as_str()], "{interceptor}");
+            assert_eq!(outgoing.edges.len(), 1, "{interceptor}: {:?}", outgoing.edges);
+            assert_eq!(outgoing.edges[0].interception, Some(interception), "{interceptor}");
+        }
+
+        // The place of the edge is the annotation that makes it.
+        let conn = Connection::open(&out).unwrap();
+        let sql = "SELECT call_start, call_end FROM edges \
+                   WHERE kind = 'intercepts' AND from_id = 'method/common/Ядро/Расш_Ф'";
+        let (start, end): (u32, u32) =
+            conn.query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(&INTERCEPTED_COMMON[start as usize..end as usize], "&Вместо(\"Ф\")");
+
+        // A name the adopted module does not declare gives the interceptor no edge at all,
+        // and no stored `intercepts` edge leads to a node the store does not hold.
+        let missing = method_id_named(&out, "Расш_НетТакого");
+        let params = intercepts_neighbors(&missing, ide::Direction::Both);
+        let around = gdb.neighbors(&params, None).unwrap().expect("an interceptor node");
+        assert!(around.edges.is_empty(), "{:?}", around.edges);
+        assert_eq!(intercepts_edges(&out).len(), 4, "{:?}", intercepts_edges(&out));
+        let sql = "SELECT COUNT(*) FROM edges WHERE kind = 'intercepts' \
+                   AND to_id NOT IN (SELECT id FROM nodes)";
+        let dangling: i64 = conn.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(dangling, 0);
+    }
+
+    /// Editing an interceptor's annotation is an edit of the extension module alone, and the
+    /// patch moves the `intercepts` edges exactly as a full rebuild does: another annotation
+    /// on the same target, and a target that now exists.
+    #[test]
+    fn an_annotation_edit_moves_the_intercepts_edge_as_a_full_rebuild_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_intercepted_workspace(root);
+        let db_pre = build_intercepted(root, "pre.db");
+
+        let edited = INTERCEPTED_COMMON
+            .replace("&Вместо(\"Ф\")", "&Перед(\"Ф\")")
+            .replace("&После(\"НетТакого\")", "&После(\"Ф\")");
+        let module = "ext/a/CommonModules/Ядро/Ext/Module.bsl";
+        write(root, module, &edited);
+        let changed = [root.join(module).canonicalize().unwrap()];
+        let db_inc = root.join(".build/inc.db");
+        update_bodies_for_test(root, &db_pre, &db_inc, &changed, 1, &intercept_meta())
+            .expect("incremental update");
+        let db_full = build_intercepted(root, "full.db");
+        assert_eq!(dump_data(&db_inc), dump_data(&db_full), "the patch matches a full rebuild");
+
+        let to_f: Vec<(String, Option<String>)> = intercepts_edges(&db_inc)
+            .into_iter()
+            .filter(|(_, to, _)| to == "method/common/Ядро/Ф")
+            .map(|(from, _, interception)| (from, interception))
+            .collect();
+        let expected = [
+            ("method/common/Ядро/Расш_НетТакого".to_owned(), Some("after".to_owned())),
+            ("method/common/Ядро/Расш_Ф".to_owned(), Some("before".to_owned())),
+        ];
+        assert_eq!(to_f, expected);
+    }
+
+    /// A signature edit of the base module moves the interceptors' edges as a full rebuild
+    /// does: renaming the intercepted method takes its edge away, and renaming it back
+    /// restores it although nothing stored for the base module leads to the interceptor any
+    /// more. The same holds for a form module, whose methods are not keyed by name.
+    #[test]
+    fn a_base_signature_edit_moves_the_intercepts_edge_as_a_full_rebuild_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_intercepted_workspace(root);
+        let db_pre = build_intercepted(root, "pre.db");
+        assert_eq!(interceptors_of(&db_pre, "method/common/Ядро/Ф"), ["method/common/Ядро/Расш_Ф"]);
+
+        // Rename the intercepted method: the production path plans the reprojection from the
+        // stored edges, and the extension module is the one module it adds.
+        let module = "CommonModules/Ядро/Ext/Module.bsl";
+        write(root, module, &BASE_COMMON.replace("Ф(", "Ф2("));
+        let core = root.join(module).canonicalize().unwrap();
+        let core_key = core.to_string_lossy().into_owned();
+        let profiles = recompute_profiles_for_test(root, std::slice::from_ref(&core)).unwrap();
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let callers = crate::graph_db::caller_delta_plan(
+            &db_pre,
+            &[(core_key.as_str(), profiles.get(&core_key).unwrap())],
+            project.search_roots.as_ref(),
+        )
+        .unwrap()
+        .expect("a renamed intercepted method is caller-delta-safe");
+        assert_eq!(callers.len(), 1, "{callers:?}");
+        assert!(callers[0].ends_with(Path::new("ext/a").join(module)), "{callers:?}");
+        let mut changed = vec![core.clone()];
+        changed.extend(callers);
+        let db_renamed = root.join(".build/renamed.db");
+        update_bodies_for_test(root, &db_pre, &db_renamed, &changed, 1, &intercept_meta())
+            .expect("caller-delta update");
+        let db_full = build_intercepted(root, "full-renamed.db");
+        assert_eq!(dump_data(&db_renamed), dump_data(&db_full), "renamed: a full rebuild");
+        assert!(interceptors_of(&db_renamed, "method/common/Ядро/Ф").is_empty());
+        assert!(interceptors_of(&db_renamed, "method/common/Ядро/Ф2").is_empty());
+
+        // Rename it back, handing the patch the base module alone: no stored edge leads to
+        // the interceptor now, so only its pairing with the base module brings it along.
+        write(root, module, BASE_COMMON);
+        let db_restored = root.join(".build/restored.db");
+        update_bodies_for_test(root, &db_renamed, &db_restored, &[core], 1, &intercept_meta())
+            .expect("base-only update");
+        let db_full = build_intercepted(root, "full-restored.db");
+        assert_eq!(dump_data(&db_restored), dump_data(&db_full), "restored: a full rebuild");
+        let restored = interceptors_of(&db_restored, "method/common/Ядро/Ф");
+        assert_eq!(restored, ["method/common/Ядро/Расш_Ф"]);
+
+        // The base form's handler renamed, the base form module alone handed to the patch.
+        let form = "Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
+        let handler = method_id_named(&db_restored, "ПриСозданииНаСервере");
+        assert_eq!(interceptors_of(&db_restored, &handler).len(), 1);
+        write(root, form, &BASE_FORM.replace("ПриСозданииНаСервере", "ПриОткрытии"));
+        let form_path = [root.join(form).canonicalize().unwrap()];
+        let db_form = root.join(".build/form.db");
+        update_bodies_for_test(root, &db_restored, &db_form, &form_path, 1, &intercept_meta())
+            .expect("base form update");
+        let db_full = build_intercepted(root, "full-form.db");
+        assert_eq!(dump_data(&db_form), dump_data(&db_full), "form: a full rebuild");
+        assert!(interceptors_of(&db_form, &handler).is_empty());
+        assert_eq!(intercepts_edges(&db_form).len(), 3, "{:?}", intercepts_edges(&db_form));
     }
 
     /// The published graph must not depend on how the build was batched. A body whose

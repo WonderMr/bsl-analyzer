@@ -32,6 +32,7 @@ use crate::{
     },
     call_hierarchy_index::MethodCallPair,
     configs::{BodySearch, ConfigsDatabase},
+    item_tree::AnnotationKind,
     module_index::{module_key_for_path, ModuleKey},
     name::Name,
     resolver::Resolver,
@@ -333,6 +334,14 @@ impl GraphIndex {
     /// reconstructed `MethodId` is identical.
     fn find_method(&self, target: ModuleId, name: &Name) -> Option<MethodRef> {
         self.methods.get(&target)?.by_name.get(&NormName::intern(name.as_str())).copied()
+    }
+
+    /// The method node `name` resolves to in `target`, exported or not, by the same
+    /// first-declaration rule as [`Self::find_method`]. `None` when the module is not
+    /// indexed or does not declare the name.
+    pub fn method_by_name(&self, target: ModuleId, name: &Name) -> Option<MethodId> {
+        let found = self.find_method(target, name)?;
+        Some(MethodId { module: target, local_id: found.local_id })
     }
 
     /// Whether `target`'s body could be read, as recorded by the database that indexed
@@ -1057,6 +1066,43 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
         unresolved_declared_common.extend(declared.iter().cloned());
     }
     BatchCallProjection { edges, unresolved, unresolved_declared_common }
+}
+
+/// Project one extension module's `intercepts` edges: each method annotated with
+/// `&Перед`/`&После`/`&Вместо`/`&ИзменениеИКонтроль` links to the method of `base` that the
+/// annotation names, exported or not. `base` is the module the extension adopts; which one
+/// that is depends on the workspace's configuration roots, so the caller pairs it.
+///
+/// A name `base` does not declare gives no edge: the platform refuses such an extension,
+/// and an edge to a node that does not exist would dangle. The target is looked up in the
+/// resident `index`, so `base` may belong to another batch.
+pub fn project_module_intercept_edges(
+    db: &dyn ConfigsDatabase,
+    module: ModuleId,
+    base: ModuleId,
+    index: &GraphIndex,
+) -> Vec<WorkspaceCallEdge> {
+    use crate::{symbol_tree::method_node_at, weaving::interception_annotation};
+
+    let item_tree = db.item_tree(module.file_id);
+    let parse = db.parse_ref(module.file_id);
+    item_tree
+        .methods()
+        .filter(|method| method.annotations().iter().any(|a| a.kind.is_interception()))
+        .filter_map(|method| {
+            let node = method_node_at(parse, method.source_range(), method.is_function())?;
+            let annotation = interception_annotation(&node)?;
+            let target = index.method_by_name(base, &Name::new(&annotation.target))?;
+            Some(WorkspaceCallEdge {
+                from: GraphNode::Method(MethodId { module, local_id: method.key() }),
+                to: GraphNode::Method(target),
+                kind: EdgeKind::Intercepts(annotation.kind),
+                provenance: EdgeProvenance::Resolved,
+                call_site: CallSite::Recorded(annotation.range),
+                crosses_client_to_server: false,
+            })
+        })
+        .collect()
 }
 
 /// Keep a reverse reference for a qualified call only when its common-module
@@ -2238,6 +2284,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::RoleReference => "role_reference",
         EdgeKind::RegisterRecords => "register_records",
         EdgeKind::RegisterRecordSet => "register_record_set",
+        EdgeKind::Intercepts(_) => "intercepts",
     }
 }
 
@@ -2319,6 +2366,9 @@ pub struct EdgeRow {
     /// says which — least of all `kind`.
     pub call_site_absent: Option<&'static str>,
     pub crosses: bool,
+    /// The annotation an `intercepts` edge stands for, in its wire spelling
+    /// (`before`/`after`/`instead`/`change_and_validate`); `None` on every other kind.
+    pub interception: Option<&'static str>,
 }
 
 /// Encodes graph nodes/edges to durable rows at build time — method names/ranges
@@ -2766,6 +2816,7 @@ impl<'a> GraphRowEncoder<'a> {
             call_end,
             call_site_absent,
             crosses: edge.crosses_client_to_server,
+            interception: edge.kind.interception().map(AnnotationKind::as_str),
         }
     }
 }
