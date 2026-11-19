@@ -2961,11 +2961,14 @@ fn effective_visibility_fixture(
     (temp, db, FileId(0), FileId(1))
 }
 
-/// The inference diagnostics of the effective module of `extension`, as their debug text.
-fn effective_diagnostics(db: &RootDatabaseImpl, base: FileId, extension: FileId) -> Vec<String> {
+/// The names the effective inference of `extension` reports unresolved, as the debug text of
+/// each finding. A resolved common-module call also leaves candidate records naming its
+/// module, which the diagnostics layer judges later; they are not misses.
+fn effective_unresolved(db: &RootDatabaseImpl, base: FileId, extension: FileId) -> Vec<String> {
     let eid = hir::EffectiveModuleId::new(db, base, extension);
     let result = hir::infer_effective(db, eid);
-    result.diagnostics.iter().map(|(_, diagnostic)| format!("{diagnostic:?}")).collect()
+    let found = result.diagnostics.iter().map(|(_, diagnostic)| format!("{diagnostic:?}"));
+    found.filter(|diagnostic| diagnostic.starts_with("Unresolved")).collect()
 }
 
 /// Code inserted into a changed method runs in the extension: it sees the extension's own
@@ -2978,17 +2981,17 @@ fn infer_effective_inserted_code_sees_its_extension_and_dependencies() {
     Пусто = Обработки.НетТакой;";
 
     let (_temp, db, base, extension) = effective_visibility_fixture(INSERTED);
-    let diagnostics = effective_diagnostics(&db, base, extension);
+    let unresolved = effective_unresolved(&db, base, extension);
 
     for name in ["E_Обработка", "D_Модуль"] {
         assert!(
-            !diagnostics.iter().any(|diagnostic| diagnostic.contains(name)),
-            "`{name}` must resolve in inserted code: {diagnostics:?}"
+            !unresolved.iter().any(|finding| finding.contains(name)),
+            "`{name}` must resolve in inserted code: {unresolved:?}"
         );
     }
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.contains("НетТакой")),
-        "a data processor no configuration declares stays unresolved: {diagnostics:?}"
+        unresolved.iter().any(|finding| finding.contains("НетТакой")),
+        "a data processor no configuration declares stays unresolved: {unresolved:?}"
     );
 }
 
@@ -2998,11 +3001,11 @@ fn infer_effective_inserted_code_sees_its_extension_and_dependencies() {
 fn infer_effective_inserted_code_does_not_see_unrelated_extensions() {
     let (_temp, db, base, extension) =
         effective_visibility_fixture("    Чужая = Обработки.F_Обработка;");
-    let diagnostics = effective_diagnostics(&db, base, extension);
+    let unresolved = effective_unresolved(&db, base, extension);
 
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.contains("F_Обработка")),
-        "the object of an extension `E` does not depend on stays unresolved: {diagnostics:?}"
+        unresolved.iter().any(|finding| finding.contains("F_Обработка")),
+        "the object of an extension `E` does not depend on stays unresolved: {unresolved:?}"
     );
 }
 
