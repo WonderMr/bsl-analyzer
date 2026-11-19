@@ -23,11 +23,11 @@
 //! linked worktrees. Those apply below a root only, never to the root itself.
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A set of excluded directories.
 ///
@@ -54,13 +54,21 @@ pub struct ExcludedPaths {
 /// by one: a 1C dump keeps parts of its objects (`*.bin`, text templates) out of git
 /// while they stay on disk and in the configuration, so only whole directories go.
 ///
-/// Equality looks only at what can change the files of a root: the patterns in effect
-/// and the worktrees a root loses. A comment in an ignore file, or a worktree outside
-/// every root or ignored already, leaves two sets equal, so consumers that compare sets
-/// do not re-scope for it.
+/// Equality looks only at what can change the files of a root: the patterns that can
+/// match below it and the worktrees it loses. A comment in an ignore file, a pattern
+/// anchored outside every root, or a worktree outside every root or ignored already,
+/// leaves two sets equal, so consumers that compare sets do not re-scope for it.
 #[derive(Debug, Clone, Default)]
 pub struct GitIgnored {
     roots: Vec<GitRoot>,
+    /// Every spelling of every root, by name: the innermost root of a path is found in one
+    /// pass over the path's names, however many roots there are.
+    index: RootIndex,
+    /// Whether every spelling of a root reaches the roots nested in it under spellings of
+    /// their own, so that a path a walk reaches without passing a symlink finds the same
+    /// root, at the same place, under the spelling it arrives in as under its resolved
+    /// one. Decided when the set is attached.
+    spelled_alike: bool,
     /// Tells this set's answers apart from other sets' in [`LAST_ASKED`]: assigned when
     /// the set is attached, shared by its clones, and no part of equality.
     id: u64,
@@ -79,7 +87,8 @@ struct GitRoot {
 /// What the work tree of one root leaves out below it.
 #[derive(Debug, Clone)]
 struct RootRules {
-    tree: Arc<WorkTreeRules>,
+    /// The patterns that can match a directory below the root.
+    patterns: Arc<RootPatterns>,
     /// The root's path relative to the top of the work tree, `/`-separated.
     prefix: String,
     /// The linked worktrees strictly below the root that the patterns do not leave out
@@ -90,13 +99,54 @@ struct RootRules {
 /// The ignore rules of one git work tree, matched against the directories below it.
 #[derive(Debug)]
 pub struct WorkTreeRules {
-    /// The patterns in effect, in order: what equality compares, since the compiled
-    /// matcher cannot be compared.
-    patterns: Vec<String>,
+    top: PathBuf,
+    /// The patterns in effect, in order.
+    patterns: Vec<Pattern>,
+    /// All of them, for whether a root lies in a directory they leave out.
     matcher: ignore::gitignore::Gitignore,
     /// Every linked worktree of the repository below the top, relative to it,
     /// `/`-separated.
     worktrees: Vec<String>,
+    /// The patterns that can match below a root, compiled once for every root they
+    /// agree for: the extension roots of one repository usually keep the same ones.
+    below: Mutex<Vec<Arc<RootPatterns>>>,
+}
+
+#[derive(Debug)]
+struct Pattern {
+    line: String,
+    /// For a pattern that matches only from the top of the work tree, each of its names
+    /// compiled on its own; `None` for one that matches at any depth, or whose names
+    /// cannot be told apart safely, which is then kept for every root.
+    anchored: Option<Vec<globset::GlobMatcher>>,
+}
+
+/// The patterns of a work tree that can match below some root, in their order.
+#[derive(Debug)]
+struct RootPatterns {
+    /// Their positions among the work tree's patterns.
+    kept: Vec<usize>,
+    /// What equality compares, since the compiled matcher cannot be compared.
+    lines: Vec<String>,
+    matcher: ignore::gitignore::Gitignore,
+}
+
+/// The spellings of the roots as a tree of names.
+#[derive(Debug, Clone)]
+struct RootIndex {
+    /// Whether names are compared ignoring case, as the file system compares them.
+    ignore_case: bool,
+    /// The first node stands for the empty path.
+    nodes: Vec<IndexNode>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IndexNode {
+    /// The names one step further, as [`RootIndex::key`] spells them, in order, each with
+    /// its node.
+    children: Vec<(Box<str>, usize)>,
+    /// The first root added whose spelling ends here.
+    root: Option<usize>,
 }
 
 /// Glob patterns and the base they are relative to.
@@ -171,6 +221,7 @@ impl ExcludedPaths {
     pub fn with_git_ignored(mut self, mut ignored: GitIgnored) -> Self {
         self.git = if ignored.has_rules() {
             ignored.id = NEXT_GIT_IGNORED_ID.fetch_add(1, Ordering::Relaxed);
+            ignored.spelled_alike = ignored.spells_nested_roots_alike();
             Some(Arc::new(ignored))
         } else {
             None
@@ -350,6 +401,9 @@ impl ExcludedPaths {
 
     /// [`Self::is_excluded`] by the literal directories and the patterns alone.
     fn is_listed(&self, path: &Path) -> bool {
+        if self.entries.is_empty() && self.patterns.is_none() {
+            return false;
+        }
         if self.any_spelling(|spelling| is_within(path, spelling)) {
             return true;
         }
@@ -391,6 +445,12 @@ impl ExcludedPaths {
     /// lead the walk back in under a name no exclusion carries. The resolved spelling is derived from
     /// the parent's, recorded in `resolved`, so only the walk's start and symlinks cost
     /// a resolution; a walk that follows links must pass every directory it enters.
+    ///
+    /// A set that holds only git's rules keeps no resolved spelling for a directory a
+    /// walk reaches under a root's spelling without passing a symlink: git's answer is
+    /// the same under both spellings there, so the walk pays neither a resolution nor a
+    /// record per directory. A symlink, and everything a walk reaches through one, is
+    /// still asked about under the spelling it resolves to.
     pub fn prunes_walked_dir(
         &self,
         path: &Path,
@@ -409,11 +469,21 @@ impl ExcludedPaths {
         };
         let canonical = match (is_symlink, from_parent()) {
             (false, Some(canonical)) => canonical,
+            (false, None) if self.git_answers_alike(path) => return false,
             _ => path.canonicalize().map(simplify_verbatim).unwrap_or_else(|_| path.to_path_buf()),
         };
         let excluded = canonical.as_path() != path && self.prunes(&canonical, is_symlink);
         resolved.0.insert(path.to_path_buf(), canonical);
         excluded
+    }
+
+    /// Whether git's rules, the only thing this set holds, answer for the resolved
+    /// spelling of a directory reached under `path` with no symlink on the way what they
+    /// answer for `path`: `path` lies under a spelling of a root, and every root reaches
+    /// the roots nested in it under spellings of their own.
+    fn git_answers_alike(&self, path: &Path) -> bool {
+        let Some(git) = self.git.as_deref() else { return false };
+        !self.resolves_aliases() && git.spelled_alike && git.index.innermost(path).is_some()
     }
 
     /// Whether the entry at `path` lies in an excluded directory or, unless it is a
@@ -604,12 +674,36 @@ impl GitIgnored {
                 spellings.push(spelling);
             }
         }
-        let rules = tree.and_then(|(tree, relative)| RootRules::new(tree, relative));
+        let added = self.roots.len();
+        for spelling in &spellings {
+            self.index.insert(spelling, added);
+        }
+        let rules = tree.and_then(|(tree, relative)| RootRules::new(&tree, relative));
         self.roots.push(GitRoot { declared, spellings, rules });
     }
 
     fn has_rules(&self) -> bool {
         self.roots.iter().any(|root| root.rules.is_some())
+    }
+
+    /// Whether every spelling of each root reaches each root nested in it under one of
+    /// that root's own spellings. A root declared through a link while a root inside it is
+    /// declared under the resolved spelling is the case that fails: there a walked path
+    /// and its resolved spelling can have different innermost roots.
+    fn spells_nested_roots_alike(&self) -> bool {
+        self.roots.iter().all(|outer| {
+            let Some(outer_resolved) = outer.spellings.last() else { return true };
+            self.roots.iter().all(|inner| {
+                let Some(inner_resolved) = inner.spellings.last() else { return true };
+                let Some(tail) = self.index.names_below(inner_resolved, outer_resolved) else {
+                    return true;
+                };
+                outer.spellings.iter().all(|spelling| {
+                    let nested: Vec<&String> = spelling.iter().chain(tail).collect();
+                    inner.spellings.iter().any(|other| self.index.same_names(other, &nested))
+                })
+            })
+        })
     }
 
     /// Whether `path` lies in a directory below its innermost root that the root's rules
@@ -622,35 +716,34 @@ impl GitIgnored {
     }
 
     fn leaves_out_normalized(&self, path: &Path, itself: bool) -> bool {
-        let mut innermost: Option<(usize, usize)> = None;
-        for (index, root) in self.roots.iter().enumerate() {
-            for spelling in &root.spellings {
-                let Some(depth) = depth_within(path, spelling) else { continue };
-                if innermost.is_none_or(|(_, deepest)| depth > deepest) {
-                    innermost = Some((index, depth));
+        let Some((index, depth)) = self.index.innermost(path) else { return false };
+        let Some(rules) = &self.roots[index].rules else { return false };
+        // The directory whose answer this is: `path` itself, or the one holding it.
+        let judged = if itself { Some(path) } else { path.parent() };
+        let Some(judged) = judged.filter(|judged| judged.components().count() > depth) else {
+            return false;
+        };
+        LAST_ASKED.with(|last| {
+            let mut last = last.borrow_mut();
+            let mut known_kept = 0;
+            let asked = last.as_ref().filter(|asked| asked.is_about(self.id, index, depth));
+            if let Some(asked) = asked {
+                if asked.judged.as_os_str() == judged.as_os_str() {
+                    return asked.answer;
+                }
+                // Every directory down to the last one asked about is kept, so of the
+                // directories the two share, none needs asking again.
+                if !asked.answer {
+                    let shared = shared_names(Path::new(&asked.judged), judged);
+                    known_kept = shared.saturating_sub(depth);
                 }
             }
-        }
-        let Some((index, depth)) = innermost else { return false };
-        let Some(rules) = &self.roots[index].rules else { return false };
-        let below = path.components().skip(depth);
-        let count = below.clone().count();
-        let checked = if itself { count } else { count.saturating_sub(1) };
-        if checked == 0 {
-            return false;
-        }
-        let mut relative = rules.prefix.clone();
-        for component in below.take(checked) {
-            push_name(&mut relative, component.as_os_str());
-        }
-        LAST_ASKED.with(|last| {
-            let known =
-                last.borrow().as_ref().and_then(|asked| asked.answer(self.id, index, &relative));
-            if let Some(answer) = known {
-                return answer;
+            let answer = rules.leaves_out_below(judged.components().skip(depth), known_kept);
+            let judged = judged.as_os_str();
+            match last.as_mut() {
+                Some(asked) => asked.remember(self.id, index, depth, judged, answer),
+                None => *last = Some(Asked::new(self.id, index, depth, judged, answer)),
             }
-            let answer = rules.leaves_out_down_to(&relative);
-            *last.borrow_mut() = Some(Asked { id: self.id, root: index, relative, answer });
             answer
         })
     }
@@ -658,30 +751,141 @@ impl GitIgnored {
 
 static NEXT_GIT_IGNORED_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The last directory one thread asked a [`GitIgnored`] about, with the answer.
+/// The last directory one thread asked a [`GitIgnored`] about, with the answer for it and
+/// every directory above it below its root.
 struct Asked {
     id: u64,
     root: usize,
-    relative: String,
+    /// The number of names of the root's spelling the directory was found under.
+    depth: usize,
+    judged: OsString,
     answer: bool,
 }
 
 impl Asked {
-    fn answer(&self, id: u64, root: usize, relative: &str) -> Option<bool> {
-        (self.id == id && self.root == root && self.relative == relative).then_some(self.answer)
+    fn new(id: u64, root: usize, depth: usize, judged: &OsStr, answer: bool) -> Self {
+        Self { id, root, depth, judged: judged.to_owned(), answer }
+    }
+
+    fn is_about(&self, id: u64, root: usize, depth: usize) -> bool {
+        self.id == id && self.root == root && self.depth == depth
+    }
+
+    /// Keeps another answer in place of this one, in the same buffer.
+    fn remember(&mut self, id: u64, root: usize, depth: usize, judged: &OsStr, answer: bool) {
+        self.id = id;
+        self.root = root;
+        self.depth = depth;
+        self.judged.clear();
+        self.judged.push(judged);
+        self.answer = answer;
     }
 }
 
 thread_local! {
     /// Walks, watchers and loaders ask about every entry of one directory in a row, and
-    /// for all of them git's answer is the directory's: kept here, it spares matching the
-    /// directory and its ancestors once per entry.
+    /// for all of them git's answer is the directory's; a walk then goes on into a
+    /// directory below the last one. Kept here, the answer spares matching the directory
+    /// once per entry, and its ancestors once per directory below them.
     static LAST_ASKED: RefCell<Option<Asked>> = const { RefCell::new(None) };
+}
+
+/// How many leading names two paths share, spelled byte for byte alike.
+fn shared_names(left: &Path, right: &Path) -> usize {
+    left.components().zip(right.components()).take_while(|(left, right)| left == right).count()
+}
+
+impl Default for RootIndex {
+    fn default() -> Self {
+        Self::new(cfg!(windows))
+    }
+}
+
+impl RootIndex {
+    fn new(ignore_case: bool) -> Self {
+        Self { ignore_case, nodes: vec![IndexNode::default()] }
+    }
+
+    /// Adds a spelling of `root`. A node another root's spelling already ends at keeps
+    /// that root, the one added first.
+    fn insert(&mut self, spelling: &[String], root: usize) {
+        let mut node = 0;
+        for name in spelling {
+            let key = self.key(name);
+            let children = &self.nodes[node].children;
+            let found = children.binary_search_by(|(existing, _)| str::cmp(existing, &key));
+            node = match found {
+                Ok(at) => children[at].1,
+                Err(at) => {
+                    let child = self.nodes.len();
+                    self.nodes.push(IndexNode::default());
+                    self.nodes[node].children.insert(at, (key.into_boxed_str(), child));
+                    child
+                }
+            };
+        }
+        self.nodes[node].root.get_or_insert(root);
+    }
+
+    /// The innermost root `path` lies at or below, with the number of names of the
+    /// spelling that holds it: one step per name of `path`, whatever the number of roots.
+    fn innermost(&self, path: &Path) -> Option<(usize, usize)> {
+        let mut node = self.nodes.first()?;
+        let mut innermost = node.root.map(|root| (root, 0));
+        for (at, component) in path.components().enumerate() {
+            let name = component.as_os_str().to_string_lossy();
+            let found = node.children.binary_search_by(|(key, _)| self.order(key, &name));
+            let Ok(found) = found else { break };
+            node = &self.nodes[node.children[found].1];
+            if let Some(root) = node.root {
+                innermost = Some((root, at + 1));
+            }
+        }
+        innermost
+    }
+
+    /// The names of `path` past `prefix` when `path` lies strictly below it, both given by
+    /// name and compared as the index compares them.
+    fn names_below<'a>(&self, path: &'a [String], prefix: &[String]) -> Option<&'a [String]> {
+        let tail = path.get(prefix.len()..).filter(|tail| !tail.is_empty())?;
+        let within = path.iter().zip(prefix).all(|(name, other)| self.same_name(name, other));
+        within.then_some(tail)
+    }
+
+    /// Whether two spellings, given by name, are the same as the index compares them.
+    fn same_names(&self, left: &[String], right: &[&String]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(name, other)| self.same_name(name, other))
+    }
+
+    fn same_name(&self, left: &str, right: &str) -> bool {
+        self.key(left) == self.key(right)
+    }
+
+    /// `name` as the index keeps it: folded to lower case where case is ignored.
+    fn key(&self, name: &str) -> String {
+        if self.ignore_case {
+            name.chars().flat_map(char::to_lowercase).collect()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// How `key` orders against the key of `name`, without spelling that key out.
+    fn order(&self, key: &str, name: &str) -> std::cmp::Ordering {
+        if !self.ignore_case {
+            key.cmp(name)
+        } else if name.is_ascii() {
+            key.bytes().cmp(name.bytes().map(|byte| byte.to_ascii_lowercase()))
+        } else {
+            key.chars().cmp(name.chars().flat_map(char::to_lowercase))
+        }
+    }
 }
 
 impl GitRoot {
     /// What equality and hashing look at: the declared spelling, the root's place in its
-    /// work tree, the patterns in effect and the worktrees the root loses.
+    /// work tree, the patterns that can match below it and the worktrees it loses.
     fn identity(&self) -> (&Path, Option<&str>, &[String], &[String]) {
         let Some(rules) = &self.rules else {
             return (self.declared.as_path(), None, &[], &[]);
@@ -689,7 +893,7 @@ impl GitRoot {
         (
             self.declared.as_path(),
             Some(rules.prefix.as_str()),
-            &rules.tree.patterns,
+            &rules.patterns.lines,
             &rules.worktrees,
         )
     }
@@ -714,14 +918,16 @@ impl Hash for GitIgnored {
 impl RootRules {
     /// `None` when the patterns leave out the root itself, since a root is still a root,
     /// and when nothing below the root can be left out.
-    fn new(tree: Arc<WorkTreeRules>, relative: &Path) -> Option<Self> {
+    fn new(tree: &WorkTreeRules, relative: &Path) -> Option<Self> {
         let mut prefix = String::new();
+        let mut names = Vec::new();
         for component in relative.components() {
             let Component::Normal(name) = component else { continue };
             push_name(&mut prefix, name);
             if tree.ignores(&prefix) {
                 return None;
             }
+            names.push(name.to_string_lossy().into_owned());
         }
         let worktrees: Vec<String> = tree
             .worktrees
@@ -729,33 +935,34 @@ impl RootRules {
             .filter(|worktree| tree.adds_below(&prefix, worktree))
             .cloned()
             .collect();
-        if tree.matcher.is_empty() && worktrees.is_empty() {
+        let patterns = tree.patterns_below(&names);
+        if patterns.lines.is_empty() && worktrees.is_empty() {
             return None;
         }
-        Some(Self { tree, prefix, worktrees })
+        Some(Self { patterns, prefix, worktrees })
     }
 
     /// Whether the directory at `relative` (to the top, `/`-separated) is left out.
     fn leaves_out(&self, relative: &str) -> bool {
-        self.tree.ignores(relative)
+        self.patterns.matcher.matched(Path::new(relative), true).is_ignore()
             || self.worktrees.iter().any(|worktree| same_name(worktree, relative))
     }
 
-    /// Whether a directory from just below the root down to `relative` (to the top,
-    /// `/`-separated, starting with the root's prefix) is left out.
-    fn leaves_out_down_to(&self, relative: &str) -> bool {
-        let mut end = if self.prefix.is_empty() { 0 } else { self.prefix.len() + 1 };
-        loop {
-            let start = end;
-            end = relative[start..].find('/').map_or(relative.len(), |at| start + at);
-            if self.leaves_out(&relative[..end]) {
+    /// Whether a directory from just below the root down to the last of `names` (the
+    /// names below the root) is left out, the first `known_kept` of them known not to be.
+    fn leaves_out_below<'a>(
+        &self,
+        names: impl Iterator<Item = Component<'a>>,
+        known_kept: usize,
+    ) -> bool {
+        let mut relative = self.prefix.clone();
+        for (at, name) in names.enumerate() {
+            push_name(&mut relative, name.as_os_str());
+            if at >= known_kept && self.leaves_out(&relative) {
                 return true;
             }
-            if end == relative.len() {
-                return false;
-            }
-            end += 1;
         }
+        false
     }
 }
 
@@ -769,10 +976,7 @@ impl WorkTreeRules {
         lines: impl IntoIterator<Item = &'a str>,
         worktrees: &[PathBuf],
     ) -> Self {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(top);
-        // Git ignores case in its patterns where the file system does (`core.ignorecase`),
-        // and so does the rest of this set.
-        let _ = builder.case_insensitive(cfg!(windows));
+        let mut builder = gitignore_builder(top);
         let mut patterns = Vec::new();
         for line in lines {
             // As git reads a line: trailing spaces go unless escaped, and a blank line or a
@@ -782,7 +986,7 @@ impl WorkTreeRules {
                 continue;
             }
             if builder.add_line(None, line).is_ok() {
-                patterns.push(line.to_owned());
+                patterns.push(Pattern { line: line.to_owned(), anchored: anchored_names(line) });
             }
         }
         let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
@@ -792,13 +996,34 @@ impl WorkTreeRules {
             .map(slash_separated)
             .filter(|worktree| !worktree.is_empty())
             .collect();
-        Self { patterns, matcher, worktrees }
+        Self { top: top.to_path_buf(), patterns, matcher, worktrees, below: Mutex::default() }
     }
 
     /// Whether the patterns leave out the directory at `relative` (to the top,
     /// `/`-separated).
     fn ignores(&self, relative: &str) -> bool {
         self.matcher.matched(Path::new(relative), true).is_ignore()
+    }
+
+    /// The patterns that can match a directory below a root whose path relative to the
+    /// top has the names `prefix`. The others cannot change any answer below the root, so
+    /// the root neither matches against them nor changes when they do.
+    fn patterns_below(&self, prefix: &[String]) -> Arc<RootPatterns> {
+        let can_match = |at: &usize| self.patterns[*at].can_match_below(prefix);
+        let kept: Vec<usize> = (0..self.patterns.len()).filter(can_match).collect();
+        let mut compiled = self.below.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = compiled.iter().find(|patterns| patterns.kept == kept) {
+            return found.clone();
+        }
+        let mut builder = gitignore_builder(&self.top);
+        let lines: Vec<String> = kept.iter().map(|&at| self.patterns[at].line.clone()).collect();
+        for line in &lines {
+            let _ = builder.add_line(None, line);
+        }
+        let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
+        let patterns = Arc::new(RootPatterns { kept, lines, matcher });
+        compiled.push(patterns.clone());
+        patterns
     }
 
     /// Whether `worktree` lies strictly below `prefix` (both relative to the top,
@@ -824,22 +1049,61 @@ impl WorkTreeRules {
     }
 }
 
-/// The components of `path` as text, for [`depth_within`].
+impl Pattern {
+    /// Whether the pattern can match a directory strictly below a root whose path
+    /// relative to the top has the names `prefix`: one that matches from the top only
+    /// cannot when it has no more names than the root, or when one of its first names does
+    /// not match the root's name in that place.
+    fn can_match_below(&self, prefix: &[String]) -> bool {
+        let Some(names) = &self.anchored else { return true };
+        names.len() > prefix.len()
+            && names.iter().zip(prefix).all(|(name, root_name)| name.is_match(root_name))
+    }
+}
+
+/// The names of a pattern that matches only from the top of the work tree, each compiled
+/// the way the rules compile the whole pattern, so that matching them one by one against
+/// one name each agrees with matching the pattern. `None` for a pattern that matches at
+/// any depth, and for one this does not take apart: a `**`, an escape, a class or an
+/// alternation can span names.
+fn anchored_names(line: &str) -> Option<Vec<globset::GlobMatcher>> {
+    let line = line.strip_prefix('!').unwrap_or(line);
+    let (from_top, glob) = match line.strip_prefix('/') {
+        Some(glob) => (true, glob),
+        None => (false, line),
+    };
+    let glob = glob.strip_suffix('/').unwrap_or(glob);
+    if !from_top && !glob.contains('/') {
+        return None;
+    }
+    if glob.contains("**") || glob.contains(|c: char| matches!(c, '\\' | '[' | ']' | '{' | '}')) {
+        return None;
+    }
+    let compile = |name: &str| -> Option<globset::GlobMatcher> {
+        let glob = globset::GlobBuilder::new(name)
+            .literal_separator(true)
+            .case_insensitive(cfg!(windows))
+            .backslash_escape(true)
+            .build()
+            .ok()?;
+        Some(glob.compile_matcher())
+    };
+    glob.split('/').map(|name| if name.is_empty() { None } else { compile(name) }).collect()
+}
+
+/// A builder for rules relative to `top`, matching names as git does on this system.
+fn gitignore_builder(top: &Path) -> ignore::gitignore::GitignoreBuilder {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(top);
+    // Git ignores case in its patterns where the file system does (`core.ignorecase`),
+    // and so does the rest of this set.
+    let _ = builder.case_insensitive(cfg!(windows));
+    builder
+}
+
+/// The components of `path` as text, for [`RootIndex`].
 fn component_names(path: &Path) -> Vec<String> {
     let name = |component: Component<'_>| component.as_os_str().to_string_lossy().into_owned();
     path.components().map(name).collect()
-}
-
-/// The number of components `spelling` stands for, when `path` lies at or below it.
-fn depth_within(path: &Path, spelling: &[String]) -> Option<usize> {
-    let mut components = path.components();
-    for expected in spelling {
-        let actual = components.next()?;
-        if !same_name(&actual.as_os_str().to_string_lossy(), expected) {
-            return None;
-        }
-    }
-    Some(spelling.len())
 }
 
 /// `path`'s plain names joined by `/`.
@@ -863,7 +1127,7 @@ fn push_name(path: &mut String, name: &OsStr) {
 /// Whether two names, or two `/`-separated relative paths, are the same, ignoring case
 /// on Windows as [`is_within`] does. Names spelled alike, the common case, cost one byte
 /// comparison; only a pair that differs is folded, character by character and without
-/// allocating, since every walk and loader asks about each path against every root.
+/// allocating.
 fn same_name(left: &str, right: &str) -> bool {
     if left == right {
         return true;
@@ -1436,5 +1700,201 @@ mod tests {
 
         assert!(excluded.is_excluded(&top.join(".claude/worktrees").join(MODULE)));
         assert!(excluded.is_excluded(&top.join("nested/copy").join(MODULE)));
+    }
+
+    /// An index over `roots`, `/`-separated relative paths added in order.
+    fn index_of(ignore_case: bool, roots: &[&str]) -> RootIndex {
+        let mut index = RootIndex::new(ignore_case);
+        for (at, root) in roots.iter().enumerate() {
+            index.insert(&component_names(Path::new(root)), at);
+        }
+        index
+    }
+
+    #[test]
+    fn the_index_finds_the_innermost_of_nested_roots() {
+        let roots = ["top", "top/src/cfe/A", "top/src/cfe/A/nested/B", "top/src/cfe/C"];
+        let index = index_of(false, &roots);
+        let innermost = |path: &str| index.innermost(Path::new(path));
+
+        assert_eq!(innermost("top/src/cfe/A/CommonModules/M"), Some((1, 4)));
+        assert_eq!(innermost("top/src/cfe/A/nested/B/Ext/Module.bsl"), Some((2, 6)));
+        assert_eq!(innermost("top/src/cfe/A/nested/Other"), Some((1, 4)));
+        assert_eq!(innermost("top/src/cfe/C"), Some((3, 4)));
+        assert_eq!(innermost("top/src/cfe/AB/Module.bsl"), Some((0, 1)), "names, not prefixes");
+        assert_eq!(innermost("top"), Some((0, 1)));
+        assert_eq!(innermost("elsewhere/src/cfe/A"), None);
+        assert_eq!(innermost("to"), None);
+    }
+
+    #[test]
+    fn the_index_ignores_case_where_the_file_system_does() {
+        let roots = ["Top/Src/РасширениеУчета", "Top/Src/Ext"];
+        let ignoring = index_of(true, &roots);
+        let exact = index_of(false, &roots);
+
+        let folded = Path::new("top/SRC/расширениеучета/Module.bsl");
+        assert_eq!(ignoring.innermost(folded), Some((0, 3)));
+        assert_eq!(ignoring.innermost(Path::new("TOP/src/EXT")), Some((1, 3)));
+        assert_eq!(exact.innermost(folded), None);
+        assert_eq!(exact.innermost(Path::new("Top/Src/Ext/Module.bsl")), Some((1, 3)));
+        assert_eq!(exact.innermost(Path::new("Top/Src/EXT/Module.bsl")), None);
+    }
+
+    #[test]
+    fn of_two_roots_spelled_alike_the_one_added_first_holds_a_path() {
+        let index = index_of(true, &["top/Cf", "top/cf"]);
+
+        assert_eq!(index.innermost(Path::new("top/CF/Module.bsl")), Some((0, 2)));
+    }
+
+    /// `relative` (`/`-separated) below `base`, joined name by name: a verbatim Windows
+    /// path takes only `\` as a separator.
+    #[cfg(windows)]
+    fn under(base: &Path, relative: &str) -> PathBuf {
+        relative.split('/').fold(base.to_path_buf(), |path, name| path.join(name))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_root_declared_verbatim_holds_its_paths_under_either_spelling() {
+        let base = absolute("git-verbatim");
+        std::fs::create_dir_all(base.join("src/cf")).unwrap();
+        let verbatim = base.canonicalize().unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"), "{}", verbatim.display());
+        let plain = simplify_verbatim(verbatim.clone());
+        let rules = Arc::new(WorkTreeRules::new(&verbatim, ".claude/\n".lines(), &[]));
+        let mut ignored = GitIgnored::default();
+        ignored.add_root(&under(&verbatim, "src/cf"), Some((rules, Path::new("src/cf"))));
+        let excluded = ExcludedPaths::default().with_git_ignored(ignored);
+
+        for top in [&verbatim, &plain] {
+            let copy = under(top, "src/cf/.claude/worktrees/copy");
+            assert!(excluded.is_excluded(&under(&copy, MODULE)), "{}", copy.display());
+            let kept = under(top, "src/cf/CommonModules");
+            assert!(!excluded.is_excluded(&under(&kept, "M/Ext/Module.bsl")), "{}", kept.display());
+        }
+    }
+
+    #[test]
+    fn a_root_keeps_only_the_patterns_that_can_match_below_it() {
+        let rules = "/tools/\nsrc/cfe/A/gen/\nsrc/*/B/gen/\nsrc/**/deep/\n.claude/\n";
+        let roots = ["src/cfe/A", "src/cfe/B", "src/cfe/C"];
+        let (top, excluded) = git_ignored("git-below", rules, &roots, &[]);
+
+        assert!(excluded.is_excluded(&top.join("src/cfe/A/gen").join(MODULE)));
+        assert!(excluded.is_excluded(&top.join("src/cfe/B/gen").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("src/cfe/C/gen").join(MODULE)));
+        assert!(excluded.is_excluded(&top.join("src/cfe/C/x/deep").join(MODULE)));
+        assert!(excluded.is_excluded(&top.join("src/cfe/C/.claude").join(MODULE)));
+
+        // A pattern anchored outside every root, or below a directory that is no root,
+        // changes no root.
+        let fewer = "src/cfe/A/gen/\nsrc/*/B/gen/\nsrc/**/deep/\n.claude/\n";
+        let (_, without) = git_ignored("git-below", fewer, &roots, &[]);
+        assert_eq!(without, excluded);
+        assert_eq!(hash_of(&without), hash_of(&excluded));
+        let more = format!("{rules}/docs/\nsrc/cfe/D/x/\n");
+        assert_eq!(git_ignored("git-below", &more, &roots, &[]).1, excluded);
+        let inside = format!("{rules}src/cfe/C/x/\n");
+        assert_ne!(git_ignored("git-below", &inside, &roots, &[]).1, excluded);
+
+        let (_, outside) = git_ignored("git-below-none", "/tools/\nsrc/cfe/D/\n", &roots, &[]);
+        assert!(outside.is_empty(), "patterns that match below no root leave nothing to ask");
+    }
+
+    #[test]
+    fn an_answer_kept_for_a_directory_does_not_hide_a_directory_below_it() {
+        let (top, excluded) = git_ignored("git-memo-below", "build/\n", &[""], &[]);
+
+        assert!(!excluded.is_excluded(&top.join("a/b/M.bsl")));
+        assert!(excluded.is_excluded(&top.join("a/b/build/M.bsl")));
+        assert!(!excluded.is_excluded(&top.join("a/M.bsl")));
+        assert!(excluded.is_excluded(&top.join("a/b/c/build/d/M.bsl")));
+        assert!(!excluded.is_excluded(&top.join("a/b/c/d/M.bsl")));
+        assert!(excluded.is_excluded(&top.join("build/M.bsl")));
+        let mut resolved = ResolvedDirs::default();
+        assert!(excluded.prunes_walked_dir(&top.join("a/b/c/build"), false, &mut resolved));
+        assert!(!excluded.prunes_walked_dir(&top.join("a/b/c/kept"), false, &mut resolved));
+    }
+
+    #[test]
+    fn a_walk_under_a_root_keeps_no_resolved_spelling_for_git_alone() {
+        let (top, excluded) = git_ignored("git-walk", ".claude/\n", &[""], &[]);
+        let mut resolved = ResolvedDirs::default();
+
+        assert!(!excluded.prunes_walked_dir(&top, false, &mut resolved));
+        for dir in ["CommonModules", "CommonModules/M", "CommonModules/M/Ext"] {
+            assert!(!excluded.prunes_walked_dir(&top.join(dir), false, &mut resolved), "{dir}");
+        }
+        assert!(excluded.prunes_walked_dir(&top.join(".claude"), false, &mut resolved));
+        assert!(resolved.0.is_empty(), "resolved {:?}", resolved.0.keys().collect::<Vec<_>>());
+
+        // Outside every root there is no root to answer alike: the walk resolves.
+        assert!(!excluded.prunes_walked_dir(&absolute("git-walk-outside"), false, &mut resolved));
+        assert_eq!(resolved.0.len(), 1);
+        // A literal exclusion is asked under resolved spellings too.
+        let listed = ExcludedPaths::new([top.join(".tmp")]).with_git_ignored(GitIgnored::default());
+        let mut resolved = ResolvedDirs::default();
+        assert!(!listed.prunes_walked_dir(&top.join("CommonModules"), false, &mut resolved));
+        assert_eq!(resolved.0.len(), 1);
+    }
+
+    /// A set of git's rules over `roots`, each with its path relative to the top.
+    #[cfg(unix)]
+    fn git_ignored_at(rules: &Arc<WorkTreeRules>, roots: &[(PathBuf, &str)]) -> ExcludedPaths {
+        let mut ignored = GitIgnored::default();
+        for (root, relative) in roots {
+            ignored.add_root(root, Some((rules.clone(), Path::new(relative))));
+        }
+        ExcludedPaths::default().with_git_ignored(ignored)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_nested_under_another_spelling_keeps_a_walk_resolving() {
+        let base = absolute("git-alias-roots");
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("top/inner/sub")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("alias")).unwrap();
+        let outer = base.join("alias/top");
+        let rules = Arc::new(WorkTreeRules::new(&outer, ".claude/\n".lines(), &[]));
+
+        // The inner root is declared under the resolved spelling only, so a walk of the
+        // outer root through the link must still ask under the resolved spelling.
+        let apart = [(outer.clone(), ""), (real.join("top/inner"), "inner")];
+        let mut resolved = ResolvedDirs::default();
+        let set = git_ignored_at(&rules, &apart);
+        assert!(!set.prunes_walked_dir(&outer.join("inner/sub"), false, &mut resolved));
+        assert!(!resolved.0.is_empty());
+
+        let alike = [(outer.clone(), ""), (outer.join("inner"), "inner")];
+        let mut resolved = ResolvedDirs::default();
+        let set = git_ignored_at(&rules, &alike);
+        assert!(!set.prunes_walked_dir(&outer.join("inner/sub"), false, &mut resolved));
+        assert!(resolved.0.is_empty());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_still_leads_git_to_what_it_points_at() {
+        let top = absolute("git-symlink");
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(top.join(".claude/worktrees/copy/CommonModules")).unwrap();
+        std::fs::create_dir_all(top.join("build/sub")).unwrap();
+        std::os::unix::fs::symlink(top.join(".claude/worktrees/copy"), top.join("copy")).unwrap();
+        std::os::unix::fs::symlink(top.join("build"), top.join("output")).unwrap();
+        let rules = Arc::new(WorkTreeRules::new(&top, ".claude/\nbuild/\n".lines(), &[]));
+        let excluded = git_ignored_at(&rules, &[(top.clone(), "")]);
+        let mut resolved = ResolvedDirs::default();
+
+        assert!(excluded.prunes_walked_dir(&top.join("copy"), true, &mut resolved));
+        assert!(!excluded.prunes_walked_dir(&top.join("output"), true, &mut resolved));
+        assert!(excluded.prunes_walked_dir(&top.join("output/sub"), false, &mut resolved));
+
+        std::fs::remove_dir_all(&top).unwrap();
     }
 }
