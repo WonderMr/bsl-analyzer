@@ -1205,6 +1205,51 @@ jobs:
           }
           run_tests -p project-model -- partitioned_baseline_path_security
           run_tests -p ide -- selective_loader_rejects_unsafe_enabled_paths_and_links
+      - name: Path exclusion and git ignore rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            # run_tests [--exact] <cargo test selection>... [-- <filter>...]
+            # One cargo invocation for every filter. A filter that ran no passing test
+            # fails the step, so a renamed or moved test cannot silently drop out, unless
+            # the selection still lists it as an `ignore`d test; with no filter the
+            # selection must run at least one test. Output streams, so a
+            # step the runner cancels still shows the command that hung.
+            local exact=() selection=() filters=() log status passed disabled= listed=0 match filter missing=0
+            if [ "${1-}" = --exact ]; then exact=(--exact); shift; fi
+            while [ "$#" -gt 0 ] && [ "$1" != -- ]; do selection+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; filters=("$@"); fi
+            log=$(mktemp)
+            printf '>>> cargo test %s\n' "${selection[*]} -- ${exact[*]} ${filters[*]}"
+            cargo test "${selection[@]}" -- "${exact[@]}" "${filters[@]}" 2>&1 | tee "$log" && status=0 || status=$?
+            printf '<<< cargo test %s: exit %s\n' "${selection[*]}" "$status"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            passed=$(sed -n 's/^test \(.*\) \.\.\. ok$/\1/p' "$log" | sed 's/ - should panic$//')
+            if [ "${#filters[@]}" -eq 0 ] && [ -z "$passed" ]; then
+              echo "::error::cargo test ${selection[*]} ran no test"
+              return 1
+            fi
+            for filter in "${filters[@]}"; do
+              if [ "${#exact[@]}" -gt 0 ]; then match=-Fxq; else match=-Fq; fi
+              if grep "$match" -- "$filter" <<<"$passed"; then continue; fi
+              # A test disabled with `ignore` runs nothing; it only has to stay in the target.
+              if [ "$listed" -eq 0 ]; then
+                disabled=$(cargo test --color never "${selection[@]}" -- --list --ignored "${exact[@]}" "${filters[@]}" 2>&1 | sed -n 's/: test$//p') || disabled=
+                listed=1
+              fi
+              if grep "$match" -- "$filter" <<<"$disabled"; then
+                echo "::notice::$filter: отключён (ignore), запуск не требуется"
+              else
+                echo "::error::$filter ran no test"; missing=1
+              fi
+            done
+            return "$missing"
+          }
+          run_tests -p stdx --lib -- path_exclusion::
+          run_tests -p project-model --lib -- git_ignore::
       - name: Shared workspace host
         shell: bash
         run: |
