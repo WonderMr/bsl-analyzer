@@ -114,6 +114,25 @@ impl<'db, DB: HirDatabase + base_db::RootQueryDb> Semantics<'db, DB> {
     ) -> Option<SemanticSymbol> {
         FileSymbolCtx::new(self.db, file_id).symbol_for_token(token)
     }
+
+    /// The symbol a qualified name in code inserted with `#Вставка` stands for. The
+    /// extension's own parse keeps such code as raw tokens, so `token` is taken from the
+    /// assembled module ([`crate::parse_effective`]), where it is ordinary code. That code
+    /// runs in the extension, so the name resolves with the visibility of `ext_file`: the
+    /// extension's own objects and the extensions it depends on. A name whose meaning
+    /// depends on the assembled body — a local, a member of a typed value, a bare call —
+    /// answers `None`, because that body is not resolved token by token here.
+    pub fn symbol_for_inserted_token(
+        &self,
+        ext_file: FileId,
+        token: &syntax::SyntaxToken,
+    ) -> Option<SemanticSymbol> {
+        let NameClass::FieldName { token, .. } = crate::classify_token(token) else {
+            return None;
+        };
+        let definition = self.try_resolve_qualified_name_for_token(ext_file, &token)?;
+        Some(symbol_from_definition(self.db, definition, None))
+    }
 }
 
 /// Per-file symbol resolution that shares lookup state across tokens.

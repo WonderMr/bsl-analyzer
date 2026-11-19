@@ -112,6 +112,7 @@ mod record_form_common_attributes;
 mod record_form_record_manager;
 mod recovered_expr_inference;
 mod references_by_name;
+mod references_inserted_code;
 mod references_typed_receiver;
 mod resolve_qualified_call;
 mod sdbl_completion_integration_test;
