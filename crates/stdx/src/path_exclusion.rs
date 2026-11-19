@@ -119,16 +119,23 @@ struct Pattern {
     /// compiled on its own; `None` for one that matches at any depth, or whose names
     /// cannot be told apart safely, which is then kept for every root.
     anchored: Option<Vec<globset::GlobMatcher>>,
+    /// Whether the pattern matches a directory by its name alone, wherever it lies.
+    by_name: bool,
 }
 
 /// The patterns of a work tree that can match below some root, in their order.
 #[derive(Debug)]
 struct RootPatterns {
+    /// Tells these patterns' answers apart from other sets' in [`NAMES`].
+    id: u64,
     /// Their positions among the work tree's patterns.
     kept: Vec<usize>,
     /// What equality compares, since the compiled matcher cannot be compared.
     lines: Vec<String>,
     matcher: ignore::gitignore::Gitignore,
+    /// Whether every one of them matches a directory by its name alone: then whether a
+    /// directory is left out depends on its name and on nothing above it.
+    by_name: bool,
 }
 
 /// The spellings of the roots as a tree of names.
@@ -736,31 +743,33 @@ impl GitIgnored {
     fn leaves_out_normalized(&self, path: &Path, itself: bool) -> bool {
         let Some((index, depth)) = self.index.innermost(path) else { return false };
         let Some(rules) = &self.roots[index].rules else { return false };
-        // The directory whose answer this is: `path` itself, or the one holding it.
+        // The directory whose answer this is, `path` itself or the one holding it, by its
+        // names below the root: the answer depends on nothing else, so two spellings of
+        // one directory share it.
         let judged = if itself { Some(path) } else { path.parent() };
-        let Some(judged) = judged.filter(|judged| judged.components().count() > depth) else {
+        let Some(below) = judged.map(|judged| names_past(judged, depth)) else { return false };
+        if below.as_os_str().is_empty() {
             return false;
-        };
+        }
         LAST_ASKED.with(|last| {
             let mut last = last.borrow_mut();
             let mut known_kept = 0;
-            let asked = last.as_ref().filter(|asked| asked.is_about(self.id, index, depth));
+            let asked = last.as_ref().filter(|asked| asked.id == self.id && asked.root == index);
             if let Some(asked) = asked {
-                if asked.judged.as_os_str() == judged.as_os_str() {
+                if asked.below.as_os_str() == below.as_os_str() {
                     return asked.answer;
                 }
                 // Every directory down to the last one asked about is kept, so of the
                 // directories the two share, none needs asking again.
                 if !asked.answer {
-                    let shared = shared_names(Path::new(&asked.judged), judged);
-                    known_kept = shared.saturating_sub(depth);
+                    known_kept = shared_names(Path::new(&asked.below), below);
                 }
             }
-            let answer = rules.leaves_out_below(judged.components().skip(depth), known_kept);
-            let judged = judged.as_os_str();
+            let answer = rules.leaves_out_below(below, known_kept);
+            let below = below.as_os_str();
             match last.as_mut() {
-                Some(asked) => asked.remember(self.id, index, depth, judged, answer),
-                None => *last = Some(Asked::new(self.id, index, depth, judged, answer)),
+                Some(asked) => asked.remember(self.id, index, below, answer),
+                None => *last = Some(Asked::new(self.id, index, below, answer)),
             }
             answer
         })
@@ -774,28 +783,22 @@ static NEXT_GIT_IGNORED_ID: AtomicU64 = AtomicU64::new(1);
 struct Asked {
     id: u64,
     root: usize,
-    /// The number of names of the root's spelling the directory was found under.
-    depth: usize,
-    judged: OsString,
+    /// The directory's names below the root.
+    below: OsString,
     answer: bool,
 }
 
 impl Asked {
-    fn new(id: u64, root: usize, depth: usize, judged: &OsStr, answer: bool) -> Self {
-        Self { id, root, depth, judged: judged.to_owned(), answer }
-    }
-
-    fn is_about(&self, id: u64, root: usize, depth: usize) -> bool {
-        self.id == id && self.root == root && self.depth == depth
+    fn new(id: u64, root: usize, below: &OsStr, answer: bool) -> Self {
+        Self { id, root, below: below.to_owned(), answer }
     }
 
     /// Keeps another answer in place of this one, in the same buffer.
-    fn remember(&mut self, id: u64, root: usize, depth: usize, judged: &OsStr, answer: bool) {
+    fn remember(&mut self, id: u64, root: usize, below: &OsStr, answer: bool) {
         self.id = id;
         self.root = root;
-        self.depth = depth;
-        self.judged.clear();
-        self.judged.push(judged);
+        self.below.clear();
+        self.below.push(below);
         self.answer = answer;
     }
 }
@@ -806,6 +809,15 @@ thread_local! {
     /// directory below the last one. Kept here, the answer spares matching the directory
     /// once per entry, and its ancestors once per directory below them.
     static LAST_ASKED: RefCell<Option<Asked>> = const { RefCell::new(None) };
+}
+
+/// `path` past its first `count` names.
+fn names_past(path: &Path, count: usize) -> &Path {
+    let mut names = path.components();
+    for _ in 0..count {
+        names.next();
+    }
+    names.as_path()
 }
 
 /// How many leading names two paths share, spelled byte for byte alike.
@@ -971,15 +983,15 @@ impl RootRules {
             || self.worktrees.iter().any(|worktree| same_name(worktree, relative))
     }
 
-    /// Whether a directory from just below the root down to the last of `names` (the
-    /// names below the root) is left out, the first `known_kept` of them known not to be.
-    fn leaves_out_below<'a>(
-        &self,
-        names: impl Iterator<Item = Component<'a>>,
-        known_kept: usize,
-    ) -> bool {
+    /// Whether a directory from just below the root down to `below` (its names below the
+    /// root) is left out, the first `known_kept` of them known not to be.
+    fn leaves_out_below(&self, below: &Path, known_kept: usize) -> bool {
+        if self.worktrees.is_empty() && self.patterns.by_name {
+            let mut names = below.components().skip(known_kept);
+            return names.any(|name| self.patterns.leave_out_name(name.as_os_str()));
+        }
         let mut relative = self.prefix.clone();
-        for (at, name) in names.enumerate() {
+        for (at, name) in below.components().enumerate() {
             push_name(&mut relative, name.as_os_str());
             if at >= known_kept && self.leaves_out(&relative) {
                 return true;
@@ -987,6 +999,46 @@ impl RootRules {
         }
         false
     }
+}
+
+impl RootPatterns {
+    /// Whether the patterns, all of which match a directory by its name alone, leave out
+    /// a directory named `name`.
+    fn leave_out_name(&self, name: &OsStr) -> bool {
+        let name = name.to_string_lossy();
+        NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            if names.patterns != self.id || names.answers.len() >= KEPT_NAMES {
+                names.patterns = self.id;
+                names.answers.clear();
+            }
+            if let Some(&answer) = names.answers.get(&*name) {
+                return answer;
+            }
+            let answer = self.matcher.matched(Path::new(&*name), true).is_ignore();
+            names.answers.insert(name.into(), answer);
+            answer
+        })
+    }
+}
+
+/// The answers one thread got from one set of patterns, by directory name.
+#[derive(Default)]
+struct NameAnswers {
+    /// The set they came from, by [`RootPatterns::id`].
+    patterns: u64,
+    answers: std::collections::HashMap<Box<str>, bool>,
+}
+
+/// How many names one thread keeps answers for before it starts over.
+const KEPT_NAMES: usize = 4096;
+
+static NEXT_PATTERNS_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// A 1C dump repeats a handful of directory names (`Ext`, `Forms`, `Templates`) in
+    /// every object, so patterns that match by name are matched once per name.
+    static NAMES: RefCell<NameAnswers> = RefCell::default();
 }
 
 impl WorkTreeRules {
@@ -1009,7 +1061,8 @@ impl WorkTreeRules {
                 continue;
             }
             if builder.add_line(None, line).is_ok() {
-                patterns.push(Pattern { line: line.to_owned(), anchored: anchored_names(line) });
+                let (anchored, by_name) = (anchored_names(line), matches_by_name(line));
+                patterns.push(Pattern { line: line.to_owned(), anchored, by_name });
             }
         }
         let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
@@ -1044,7 +1097,9 @@ impl WorkTreeRules {
             let _ = builder.add_line(None, line);
         }
         let matcher = builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
-        let patterns = Arc::new(RootPatterns { kept, lines, matcher });
+        let by_name = kept.iter().all(|&at| self.patterns[at].by_name);
+        let id = NEXT_PATTERNS_ID.fetch_add(1, Ordering::Relaxed);
+        let patterns = Arc::new(RootPatterns { id, kept, lines, matcher, by_name });
         compiled.push(patterns.clone());
         patterns
     }
@@ -1115,6 +1170,16 @@ fn anchored_names(line: &str) -> Option<Vec<globset::GlobMatcher>> {
         Some(glob.compile_matcher())
     };
     glob.split('/').map(compile).collect()
+}
+
+/// Whether a pattern matches a directory by its name alone, wherever it lies: one with no
+/// `/` but a trailing one matches at any depth, and the rules then match only the last
+/// name of a path against it. A `**`, an escape, a class or an alternation is taken as
+/// possibly spanning names.
+fn matches_by_name(line: &str) -> bool {
+    let glob = line.strip_prefix('!').unwrap_or(line);
+    let glob = glob.strip_suffix('/').unwrap_or(glob);
+    !glob.is_empty() && !glob.contains("**") && !glob.contains(['/', '\\', '[', ']', '{', '}'])
 }
 
 /// A builder for rules relative to `top`, matching names as git does on this system.
@@ -1251,7 +1316,11 @@ pub fn resolve_as_far_as_it_goes(path: &Path) -> Option<PathBuf> {
 }
 
 fn has_dot_components(path: &Path) -> bool {
-    path.components().any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    // A `.` or `..` name shows in the bytes; only then are the components worth parsing.
+    let separator = |byte: &u8| *byte == b'/' || (cfg!(windows) && *byte == b'\\');
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes.split(separator).any(|name| name == b"." || name == b"..")
+        && path.components().any(|name| matches!(name, Component::CurDir | Component::ParentDir))
 }
 
 fn push_unique(spellings: &mut Vec<PathBuf>, spelling: PathBuf) {
@@ -1829,6 +1898,35 @@ mod tests {
 
         let (_, outside) = git_ignored("git-below-none", "/tools/\nsrc/cfe/D/\n", &roots, &[]);
         assert!(outside.is_empty(), "patterns that match below no root leave nothing to ask");
+    }
+
+    #[test]
+    fn a_pattern_matches_by_name_without_a_slash_inside() {
+        for line in [".claude/", "*.q9save", "history.md", "!keep.tmp/"] {
+            assert!(matches_by_name(line), "{line}");
+        }
+        for line in ["/build/", "src/gen/", "**/deep", "a[/]b", "\\!x", "{a,b}", "!", "/"] {
+            assert!(!matches_by_name(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn patterns_that_match_by_name_answer_by_the_name() {
+        let rules = "*.tmp/\n!keep.tmp/\nhistory.md\n";
+        let (top, excluded) = git_ignored("git-by-name", rules, &[""], &[]);
+
+        for _ in 0..2 {
+            assert!(excluded.is_excluded(&top.join("a/x.tmp").join(MODULE)));
+            assert!(!excluded.is_excluded(&top.join("a/keep.tmp").join(MODULE)));
+            assert!(excluded.is_excluded(&top.join("history.md/b").join(MODULE)));
+            assert!(!excluded.is_excluded(&top.join("a/b").join(MODULE)));
+            assert!(excluded.is_excluded(&top.join("c/x.tmp/d").join(MODULE)));
+        }
+        // Another set asked about the same names answers by its own patterns.
+        let (other_top, other) = git_ignored("git-by-name-other", "keep.tmp/\n", &[""], &[]);
+        assert!(other.is_excluded(&other_top.join("a/keep.tmp").join(MODULE)));
+        assert!(!other.is_excluded(&other_top.join("a/x.tmp").join(MODULE)));
+        assert!(!excluded.is_excluded(&top.join("e/keep.tmp").join(MODULE)));
     }
 
     #[test]
