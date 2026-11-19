@@ -4410,8 +4410,8 @@ mod tests {
                 14,
             ),
             collect(
-                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
-                8,
+                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception",
+                9,
             ),
         )
     }
@@ -12043,8 +12043,8 @@ mod form_twin_tests {
                 14,
             ),
             collect(
-                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
-                8,
+                "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception",
+                9,
             ),
         )
     }
@@ -12645,8 +12645,8 @@ mod form_twin_tests {
                     14,
                 ),
                 read(
-                    "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
-                    8,
+                    "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception",
+                    9,
                 ),
             )
         };
