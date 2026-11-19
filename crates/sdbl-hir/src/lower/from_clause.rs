@@ -698,11 +698,11 @@ impl LoweringContext<'_> {
         fields.extend(attributes.iter().cloned());
 
         // The register's object-model standard fields (`Регистратор`/`Активность`/`НомерСтроки`
-        // [/`Период`]) are synthesised by the metadata XML reader and already sit in
-        // `attributes` above; they are NOT repeated here, so each name is offered exactly
-        // once. Only the query table's own additions are appended: virtual columns and the
-        // conditional names the reader did not emit for this very register. What the reader
-        // did emit is answered by `attributes` itself, not by re-deriving the condition.
+        // [/`Период`]) already sit in `attributes` above, from the metadata XML reader or, for
+        // an independent information register, from `recorder_fields_not_listed`; they are NOT
+        // repeated here, so each name is offered exactly once. Only the query table's own
+        // additions are appended: virtual columns and the conditional names the reader did not
+        // emit for this very register.
         let reader_has_period = attributes.iter().any(|field| field.matches_name("Период"));
         let (query_only_fields, standard_complete) =
             Self::register_query_only_fields(mdo_type, reader_has_period);
@@ -736,12 +736,13 @@ impl LoweringContext<'_> {
         })
     }
 
-    /// Whether a register field of this kind exists only under object settings the metadata
-    /// model does not read.
+    /// Whether the query layer treats a register field of this kind as provisional.
     ///
-    /// Only the information register qualifies: its recorder-mode fields are absent from an
-    /// independent register. An accumulation register is always subordinate to a recorder, so
-    /// the same names are unconditional there.
+    /// Only the information register qualifies: its recorder-mode fields exist only in the
+    /// recorder-subordinate write mode. The metadata model reads that mode, but the query rules
+    /// still take these names as provisional on every information register, so no rule reports
+    /// them as unknown or counts them towards an ambiguity. An accumulation register is always
+    /// subordinate to a recorder, so the same names are unconditional there.
     fn is_conditional_standard_field(mdo_type: MdoType, name: &str) -> bool {
         if mdo_type != MdoType::InformationRegister {
             return false;

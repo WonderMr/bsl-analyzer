@@ -125,6 +125,8 @@ pub enum PresenceCondition {
     HasOwners,
     IsPeriodic,
     DependsOnCalculationTypes,
+    /// The register is subordinate to a recorder (`WriteMode` = `RecorderSubordinate`).
+    RecorderSubordinate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,19 +581,19 @@ static INFORMATION_REGISTER_OBJECT: &[StandardAttrSpec] = &[
     StandardAttrSpec {
         kind: StandardKind::Active,
         value: AttrValueKind::Boolean,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::LineNumber,
         value: AttrValueKind::NumberLineNumber,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: true,
     },
     StandardAttrSpec {
         kind: StandardKind::Recorder,
         value: AttrValueKind::AnyDocumentRef,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: false,
     },
     StandardAttrSpec {
@@ -606,19 +608,19 @@ static INFORMATION_REGISTER_RECORD_SET: &[StandardAttrSpec] = &[
     StandardAttrSpec {
         kind: StandardKind::Active,
         value: AttrValueKind::Boolean,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::LineNumber,
         value: AttrValueKind::NumberLineNumber,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: true,
     },
     StandardAttrSpec {
         kind: StandardKind::Recorder,
         value: AttrValueKind::AnyDocumentRef,
-        condition: PresenceCondition::Always,
+        condition: PresenceCondition::RecorderSubordinate,
         is_readonly: false,
     },
     StandardAttrSpec {
@@ -828,6 +830,15 @@ mod tests {
         assert!(kinds.contains(&StandardKind::Active));
         assert!(kinds.contains(&StandardKind::LineNumber));
         assert!(kinds.contains(&StandardKind::Recorder));
+        // An independent register has none of the three; only a recorder writes them.
+        let recorder = [StandardKind::Active, StandardKind::LineNumber, StandardKind::Recorder];
+        for view in [ObjectView::Object, ObjectView::RecordSet] {
+            for spec in standard_attributes_for(MdoTemplateKind::InformationRegister, view) {
+                if recorder.contains(&spec.kind) {
+                    assert_eq!(spec.condition, PresenceCondition::RecorderSubordinate, "{spec:?}");
+                }
+            }
+        }
         let period_spec = specs.iter().find(|s| s.kind == StandardKind::Period);
         assert!(
             period_spec.map(|s| s.condition) == Some(PresenceCondition::IsPeriodic),
