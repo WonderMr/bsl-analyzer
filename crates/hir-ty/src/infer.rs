@@ -2209,10 +2209,8 @@ impl<'db> InferenceContext<'db> {
         if missing.is_empty() {
             return;
         }
-        let module_type = self
-            .db
-            .module_metadata(hir_def::ModuleId { file_id: self.module_file_id })
-            .module_type;
+        let module_type =
+            self.db.module_metadata(hir_def::ModuleId { file_id: self.module_file_id }).module_type;
         if hir_def::execution_env::local_server_call_is_remote(module_type) {
             missing = missing & EnvFlags::SERVER_SIDE;
         }
@@ -3961,8 +3959,7 @@ impl<'db> InferenceContext<'db> {
         if !matches!(self.body.expr(arg_id), Expr::Literal(Literal::String(_))) {
             return Arc::from([]);
         }
-        let Some(pkg) =
-            hir_def::sdbl_package_for(self.db, self.module_file_id, self.owner, arg_id)
+        let Some(pkg) = hir_def::sdbl_package_for(self.db, self.module_file_id, self.owner, arg_id)
         else {
             return Arc::from([]);
         };
