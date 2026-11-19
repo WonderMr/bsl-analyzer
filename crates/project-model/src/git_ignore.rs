@@ -140,7 +140,10 @@ impl Read {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Stamp {
     Absent,
-    Present { len: u64, modified: SystemTime },
+    Present {
+        len: u64,
+        modified: SystemTime,
+    },
     /// The metadata could not be read, or carries no modification time: never current.
     Unknown,
 }
