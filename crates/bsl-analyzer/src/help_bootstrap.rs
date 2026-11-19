@@ -40,10 +40,11 @@ pub fn bootstrap_for_config(config: &ProjectConfig, root: &Path) {
 pub fn spawn_bootstrap(root: Option<PathBuf>) {
     let load = bsl_platform::begin_platform_help_load();
     let thread_root = root.clone();
-    let spawned = std::thread::Builder::new().name("bsl-platform-help".to_owned()).spawn(move || {
-        let _load = load;
-        bootstrap_at(thread_root.as_deref());
-    });
+    let spawned =
+        std::thread::Builder::new().name("bsl-platform-help".to_owned()).spawn(move || {
+            let _load = load;
+            bootstrap_at(thread_root.as_deref());
+        });
     if let Err(error) = spawned {
         // The announcement ended with the closure, and nothing has read the help yet: the
         // selection is made here instead, at the price of the wait it was meant to spare.
