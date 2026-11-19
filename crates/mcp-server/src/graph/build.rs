@@ -9289,6 +9289,13 @@ mod tests {
             base.join("CommonForms/Первая").join(module),
             extension.join("CommonForms/Вторая").join(module),
         ];
+        // Declared as a user writes them: the real spelling of each directory, not the 8.3
+        // short name a Windows temp directory may carry, and without the verbatim prefix.
+        let declared = |path: &Path| {
+            let real = path.canonicalize().unwrap().to_string_lossy().into_owned();
+            PathBuf::from(real.trim_start_matches(r"\\?\"))
+        };
+        let (base, extension) = (declared(&base), declared(&extension));
         let entry = format!("{{ name = \"Расш\", path = {extension:?}, scope = \"InfoBase\" }}");
         let toml = format!("[source]\nroot = {base:?}\nextensions = [{entry}]\n");
         fs::write(project.join("bsl-analyzer.toml"), toml).unwrap();
@@ -9317,8 +9324,8 @@ mod tests {
             max_call_sites: 0,
         };
         let callers = gdb.neighbors(&params, None).unwrap().expect("the callee is in the graph");
-        // The id each form's handler must have, derived without the key function: the whole
-        // path the walk records, `/` separators, no verbatim prefix.
+        // The id each form's handler must have, derived without the key function: the form's
+        // whole real path, `/` separators, no verbatim prefix.
         let expected_id = |form: &Path| {
             let walked = form.canonicalize().unwrap().to_string_lossy().replace('\\', "/");
             format!("method/file/{}::ОбновитьНаСервере", walked.trim_start_matches("//?/"))
@@ -9334,6 +9341,13 @@ mod tests {
             let node = gdb.node(id, ide::GraphDetail::Names, None).unwrap();
             let node = node.unwrap_or_else(|error| panic!("`node` refused {id}: {error:?}"));
             assert_eq!(node.node.id, *id);
+        }
+        // The bridge from a search hit, a finding or a card keys the file the same way.
+        let strip_root = ide::StripRoot::resolve(&project);
+        for form in &forms {
+            let path = form.canonicalize().unwrap().to_string_lossy().into_owned();
+            let bridged = ide::method_graph_id(&path, "ОбновитьНаСервере", Some(&strip_root));
+            assert!(bridged.as_ref().is_some_and(|id| expected.contains(id)), "{bridged:?}");
         }
     }
 
