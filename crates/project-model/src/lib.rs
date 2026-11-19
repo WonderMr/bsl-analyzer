@@ -6095,6 +6095,37 @@ extensions = [{ name = "T" }]
         );
     }
 
+    /// A `[source] root` and an extension `path` may name directories outside the project by
+    /// absolute paths, as a project kept apart from the repositories it analyses declares them:
+    /// both resolve to those directories, and no source root lies under the project.
+    #[test]
+    fn absolute_source_root_outside_the_project_resolves() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        touch_configuration(dir.path(), "base");
+        touch_configuration(dir.path(), "ext/Расш");
+        let base = dir.path().join("base");
+        let extension = dir.path().join("ext").join("Расш");
+        let entry = format!("{{ name = \"Расш\", path = {extension:?}, scope = \"InfoBase\" }}");
+        let toml = format!("[source]\nroot = {base:?}\nextensions = [{entry}]\n");
+        std::fs::write(project_root.join("bsl-analyzer.toml"), toml).unwrap();
+
+        let project = Project::new(&project_root).expect("absolute roots outside the project load");
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        let configuration = project.configuration_path().expect("the base is configured");
+        assert_eq!(canonical(configuration), canonical(&base));
+        let extensions = project.extension_paths();
+        assert_eq!(extensions.len(), 1, "{extensions:?}");
+        assert_eq!(extensions[0].0, "Расш");
+        assert_eq!(canonical(&extensions[0].1), canonical(&extension));
+        let inside = canonical(&project_root);
+        for root in project.source_roots() {
+            assert!(root.is_absolute(), "{root:?}");
+            assert!(!canonical(&root).starts_with(&inside), "{root:?} is inside the project");
+        }
+    }
+
     /// A path is not a string literal: in `ONEC_CONFIGURATIONS_ROOT="C:\1C\Store"`
     /// the backslashes are the path, not escape sequences. Dropping them turns a
     /// correctly-written Windows `.env` into an unloadable project.
