@@ -99,6 +99,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 bsl-search = { workspace = true, features = ["test-seams"] }
+# Self-written help archives: an installed platform whose help the server extracts.
+html-parser = { workspace = true, features = ["test-support"] }
 test-utils.workspace = true
 expect-test.workspace = true
 rmcp = { version = "3.1", features = ["client"] }
