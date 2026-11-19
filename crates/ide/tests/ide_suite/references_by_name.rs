@@ -1988,6 +1988,10 @@ fn a_name_of_a_configuration_the_project_does_not_load_says_so() {
 
 const INTERCEPTOR: &str = "\
 Функция Расш_ВыполнитьВФоне() Экспорт
+    Возврат Расш_Служебная();
+КонецФункции
+
+Функция Расш_Служебная()
     Возврат 1;
 КонецФункции
 ";
@@ -2080,6 +2084,20 @@ fn an_adopted_owner_is_unloaded_and_a_declared_family_is_held() {
         Some("РегламентноеЗадание.НетТакого"),
         "a scheduled job is looked for in its own family, not as a module",
     );
+}
+
+/// A member the adopted copy declares itself — here a function the extension adds to the
+/// module it adopts and keeps private — is the extension's: its miss names no absent
+/// configuration, while a member the copy does not declare still does.
+#[test]
+fn a_member_an_adopted_copy_declares_is_held() {
+    let db = adopting_extension();
+    let owner = |name: &str| ide::owner_outside_loaded_configurations(&db, name);
+
+    let private = by_name(&db, "Длительные.Расш_Служебная");
+    assert_eq!(private.outcome, ReferencesOutcome::NotFound, "a private member is not addressed");
+    assert_eq!(private.unloaded_owner, None, "and it is declared by the loaded copy");
+    assert_eq!(owner("Длительные.ВыполнитьВФоне").as_deref(), Some("Длительные"));
 }
 
 /// A two-segment name whose first segment is both a type word and a module the extension

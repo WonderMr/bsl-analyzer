@@ -196,30 +196,60 @@ pub fn resolve_declarations(db: &RootDatabaseImpl, name: &str) -> Vec<Declaratio
 /// declares no root at all says nothing about which configuration it was written for, and is
 /// left alone too. A two-segment name is read both as `Тип.Объект` and as `Модуль.Член`; it
 /// is about an absent owner only when neither reading names an owner a loaded root holds.
+/// A member that a loaded body of the owner declares — an adopted copy included, exported or
+/// not — is conclusive too: the extension added it, and the configuration it extends is not
+/// where it would be.
 pub fn owner_outside_loaded_configurations(db: &RootDatabaseImpl, name: &str) -> Option<String> {
     let roots = db.workspace_configs_snapshot();
     if roots.paths.is_empty() || roots.has_base() {
         return None;
     }
     let segments: Vec<&str> = name.split('.').map(str::trim).filter(|s| !s.is_empty()).collect();
-    let readings: Vec<(Addressed, String)> = match segments.as_slice() {
+    // Each reading: what it addresses, how the answer spells that owner, and the member it
+    // names, when it names one.
+    let readings: Vec<(Addressed, String, Option<&str>)> = match segments.as_slice() {
         [first, second] => {
             let spelled = format!("{first}.{second}");
-            let typed = addressed_by_type(first, second).map(|it| (it, spelled));
+            let typed = addressed_by_type(first, second).map(|it| (it, spelled, None));
             let module = Addressed::Owner(Owner::Common { name: first.fold_lower() });
-            typed.into_iter().chain([(module, (*first).to_string())]).collect()
+            typed.into_iter().chain([(module, (*first).to_string(), Some(*second))]).collect()
         }
-        [mdo, object, _] => match addressed_by_type(mdo, object)? {
+        [mdo, object, member] => match addressed_by_type(mdo, object)? {
             // A role, a subscription or a subsystem has no members to name.
             Addressed::Family(..) => return None,
-            owner => vec![(owner, format!("{mdo}.{object}"))],
+            owner => vec![(owner, format!("{mdo}.{object}"), Some(*member))],
         },
         _ => return None,
     };
-    if readings.iter().any(|(addressed, _)| held_as_own(db, &roots, addressed)) {
+    let conclusive = |(addressed, _, member): &(Addressed, String, Option<&str>)| {
+        held_as_own(db, &roots, addressed)
+            || member.is_some_and(|member| body_declares(db, addressed, member))
+    };
+    if readings.iter().any(conclusive) {
         return None;
     }
-    readings.into_iter().next().map(|(_, spelled)| spelled)
+    readings.into_iter().next().map(|(_, spelled, _)| spelled)
+}
+
+/// Whether a loaded module body of the addressed owner declares `member`, exported or not.
+fn body_declares(db: &RootDatabaseImpl, addressed: &Addressed, member: &str) -> bool {
+    let Addressed::Owner(owner) = addressed else { return false };
+    let member = Name::new(member);
+    let source_root = db.source_root_input(ROOT).root(db);
+    let file_set = source_root.file_set();
+    for file_id in source_root.iter() {
+        db.unwind_if_revision_cancelled();
+        let Some(path) = file_set.path_for_file(&file_id) else { continue };
+        let path = path.as_path().to_string_lossy().replace('\\', "/");
+        if !module_key_for_path(&path).is_some_and(|key| owner.rank_of(&key).is_some()) {
+            continue;
+        }
+        let tree = db.symbol_tree(ModuleId::new(file_id));
+        if tree.find_method(&member).is_some() || tree.find_variable(&member).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// What the leading segments of a qualified name address.
