@@ -2560,15 +2560,21 @@ impl McpServer {
                                     tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
                                 );
                                 let found = ide::lookup_names(db, &query, &[&source]);
-                                tools::name_answer::NameAnswer::render(
+                                let answer = tools::name_answer::NameAnswer::render(
                                     db,
                                     Some(resident.workspace_roots()),
                                     &found,
-                                )
+                                );
+                                (answer, ide::owner_outside_loaded_configurations(db, symbol))
                             });
                             match answer {
-                                ResidentOutcome::Ready(answer, _) => {
-                                    Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                                ResidentOutcome::Ready((answer, unloaded_owner), _) => {
+                                    Ok(tools::symbol_info::render_not_found(
+                                        symbol,
+                                        answer,
+                                        unloaded_owner.as_deref(),
+                                        &stamp,
+                                    ))
                                 }
                                 // The resident was evicted between the card read and this
                                 // one; a retry envelope is the honest answer, not a miss
