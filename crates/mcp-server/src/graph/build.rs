@@ -9265,6 +9265,78 @@ mod tests {
         assert_ne!(server_sig(&out), base, "renaming a method changes the signature hash");
     }
 
+    /// A project whose configuration and extension are both declared by absolute paths outside
+    /// it, as a project directory kept apart from the repositories it analyses has them. Two
+    /// forms, one in each, have a handler of the same name calling one common method: the
+    /// callers are two addressable nodes named by each form's whole path, and `node` accepts
+    /// each id the traversal hands out.
+    #[test]
+    fn callers_in_forms_outside_the_project_are_distinct_and_addressable() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let base = dir.path().join("base");
+        let extension = dir.path().join("ext").join("Расш");
+        fs::create_dir_all(&project).unwrap();
+        write(&base, "Configuration.xml", "<Configuration/>");
+        write(&extension, "Configuration.xml", "<Configuration/>");
+        let callee = "&НаСервере\nПроцедура Сделать() Экспорт\nКонецПроцедуры";
+        write_common_module(&base, "Общий", true, callee);
+        let handler = "&НаСервере\nПроцедура ОбновитьНаСервере()\nОбщий.Сделать();\nКонецПроцедуры";
+        let module = "Ext/Form/Module.bsl";
+        write(&base, &format!("CommonForms/Первая/{module}"), handler);
+        write(&extension, &format!("CommonForms/Вторая/{module}"), handler);
+        let forms = [
+            base.join("CommonForms/Первая").join(module),
+            extension.join("CommonForms/Вторая").join(module),
+        ];
+        let entry = format!("{{ name = \"Расш\", path = {extension:?}, scope = \"InfoBase\" }}");
+        let toml = format!("[source]\nroot = {base:?}\nextensions = [{entry}]\n");
+        fs::write(project.join("bsl-analyzer.toml"), toml).unwrap();
+
+        let out = graph_db_path(&project);
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let meta = crate::graph_db::GraphMeta {
+            revision: 1,
+            fingerprint: crate::graph_db::GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        };
+        build_whole_graph(&project, &out, 1, &meta).expect("graph database builds");
+        let gdb = GraphDb::open(&out).expect("graph database opens and validates");
+
+        let params = ide::NeighborsParams {
+            id: "method/common/Общий/Сделать",
+            dir: ide::Direction::In,
+            depth: 1,
+            max_nodes: 50,
+            detail: ide::GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let callers = gdb.neighbors(&params, None).unwrap().expect("the callee is in the graph");
+        // The id each form's handler must have, derived without the key function: the whole
+        // path the walk records, `/` separators, no verbatim prefix.
+        let expected_id = |form: &Path| {
+            let walked = form.canonicalize().unwrap().to_string_lossy().replace('\\', "/");
+            format!("method/file/{}::ОбновитьНаСервере", walked.trim_start_matches("//?/"))
+        };
+        let mut expected: Vec<String> =
+            forms.iter().map(|form| expected_id(form.as_path())).collect();
+        expected.sort();
+        let mut ids: Vec<&str> = callers.nodes.iter().map(|node| node.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "two callers, one per form: {:?}", callers.nodes);
+        assert!(callers.nodes.iter().all(|node| node.addressable), "{:?}", callers.nodes);
+        for id in &expected {
+            let node = gdb.node(id, ide::GraphDetail::Names, None).unwrap();
+            let node = node.unwrap_or_else(|error| panic!("`node` refused {id}: {error:?}"));
+            assert_eq!(node.node.id, *id);
+        }
+    }
+
     // ---- call sites on edges ------------------------------------------------------
 
     /// Build the artefact for `root` and open it together with the workspace's own root
