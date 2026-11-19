@@ -622,6 +622,18 @@ pub fn get_object_structure(
         };
     }
 
+    if mdo_type == MdoType::ScheduledJob {
+        return match config.find_scheduled_job(object_name) {
+            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_scheduled_job_structure(job),
+            )])),
+            None => Err(McpError::invalid_params(
+                format!("РегламентноеЗадание.{object_name} не найдено в конфигурации"),
+                None,
+            )),
+        };
+    }
+
     if let Some(obj) = config.find_metadata_object(mdo_type, object_name) {
         return Ok(CallToolResult::success(vec![ContentBlock::text(
             format_metadata_object_structure(obj, mdo_type),
@@ -686,6 +698,19 @@ fn format_event_subscription_structure(sub: &bsl_metadata::EventSubscription) ->
         writeln!(out, "  - Модуль: {}", handler.module_name).ok();
         writeln!(out, "  - Метод: {}", handler.method_name).ok();
     }
+    out
+}
+
+fn format_scheduled_job_structure(job: &bsl_metadata::ScheduledJob) -> String {
+    let yes_no = |flag: bool| if flag { "да" } else { "нет" };
+    let mut out = format!("# РегламентноеЗадание.{}\n\n", job.name());
+    writeln!(out, "- Имя метода: {}", dash(job.method_name())).ok();
+    if let Some(handler) = job.parse_handler() {
+        writeln!(out, "  - Модуль: {}", handler.module_name).ok();
+        writeln!(out, "  - Метод: {}", handler.method_name).ok();
+    }
+    writeln!(out, "- Использование: {}", yes_no(job.is_enabled())).ok();
+    writeln!(out, "- Предопределенное: {}", yes_no(job.is_predefined())).ok();
     out
 }
 
@@ -1297,6 +1322,20 @@ pub fn object_from_db(
             )])),
             None => Err(McpError::invalid_params(
                 format!("ПодпискаНаСобытие.{object_name} не найдена в конфигурации"),
+                None,
+            )),
+        };
+    }
+
+    // Like a subscription, a scheduled job lives in its own catalog, not among the objects
+    // and registers the lookups below read.
+    if mdo_type == MdoType::ScheduledJob {
+        return match db.resolve_scheduled_job_across_roots(object_name) {
+            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                format_scheduled_job_structure(&job),
+            )])),
+            None => Err(McpError::invalid_params(
+                format!("РегламентноеЗадание.{object_name} не найдено в конфигурации"),
                 None,
             )),
         };
@@ -2172,11 +2211,63 @@ mod tests {
         assert!(text.contains("Метод: ПриЗаписиСправочника"), "parsed handler method");
     }
 
+    /// A scheduled job parses as a metadata type, so the action must find it where it
+    /// lives instead of calling an existing job absent.
+    #[test]
+    fn test_object_structure_scheduled_job() {
+        let config = fixture_config();
+        let result =
+            get_object_structure(&config, "РегламентноеЗадание", "РегламентноеЗадание1").unwrap();
+        let text = extract_text(&result);
+        assert!(text.contains("# РегламентноеЗадание.РегламентноеЗадание1"), "{text}");
+        assert!(text.contains("Модуль: ПервыйОбщийМодуль"), "{text}");
+        assert!(text.contains("Метод: НеУстаревшаяПроцедура"), "{text}");
+        assert!(get_object_structure(&config, "ScheduledJob", "НетТакого").is_err());
+    }
+
     #[test]
     fn test_object_structure_event_subscription_not_found_is_graceful() {
         let config = fixture_config();
         // A missing subscription is an in-band invalid-params error, not a parse crash.
         assert!(get_object_structure(&config, "ПодпискаНаСобытие", "НетТакой").is_err());
+    }
+
+    /// The resident path answers for a scheduled job a loaded root declares, from the job's
+    /// own catalog, and names a missing one as missing.
+    #[test]
+    fn object_from_db_describes_a_scheduled_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("Configuration.xml", "<Configuration/>");
+        write(
+            "CommonModules/Обмен/Ext/Module.bsl",
+            "Процедура ВыполнитьОбмен() Экспорт\nКонецПроцедуры",
+        );
+        write(
+            "ScheduledJobs/ОбменДанными.xml",
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><ScheduledJob uuid="00000000-0000-0000-0000-000000000073"><Properties><Name>ОбменДанными</Name><MethodName>CommonModule.Обмен.ВыполнитьОбмен</MethodName><Use>true</Use><Predefined>false</Predefined></Properties></ScheduledJob></MetaDataObject>"#,
+        );
+        let state = crate::diagnostics_state::DiagnosticsState::for_workspace(root.to_path_buf());
+        state.ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(&state);
+
+        let read = |name: &str| {
+            let outcome = state.read(|r, _| object_from_db(r.db(), "РегламентноеЗадание", name));
+            match outcome {
+                crate::diagnostics_state::ResidentOutcome::Ready(answer, _) => answer,
+                _ => panic!("the resident is ready"),
+            }
+        };
+        let found = read("ОбменДанными").expect("a declared job is found");
+        let text = extract_text(&found);
+        assert!(text.contains("Модуль: Обмен"), "{text}");
+        assert!(text.contains("Использование: да"), "{text}");
+        assert!(read("НетТакого").is_err(), "a missing job is reported as missing");
     }
 
     #[test]

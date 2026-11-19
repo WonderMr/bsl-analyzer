@@ -1643,16 +1643,16 @@ pub(crate) fn local_metadata_delta(
                 return Ok(None);
             }
         }
-        // A scheduled job's edge leads into its handler method, and the metadata-only
-        // projection has no method index to derive it again: replacing the job as an
-        // owner would delete the edge and never write it back. Its XML edits stay on the
-        // full-build path.
-        let job_prefix = format!("mdo/{}/", bsl_metadata::MdoType::ScheduledJob.english_name());
-        if current_owner
-            .into_iter()
-            .chain(&previous_mdo_owners)
-            .any(|owner| owner.starts_with(&job_prefix))
-        {
+        // An event subscription's or a scheduled job's edge leads into its handler method,
+        // and the metadata-only projection has no method index to derive it again: replacing
+        // such an owner would delete the edge and never write it back. Their XML edits stay
+        // on the full-build path.
+        let handler_owner = |owner: &String| {
+            [bsl_metadata::MdoType::EventSubscription, bsl_metadata::MdoType::ScheduledJob]
+                .iter()
+                .any(|kind| owner.starts_with(&format!("mdo/{}/", kind.english_name())))
+        };
+        if current_owner.into_iter().chain(&previous_mdo_owners).any(handler_owner) {
             return Ok(None);
         }
         // An MDO's forms can bind directly to its attributes. Reproject every form
@@ -2333,7 +2333,10 @@ fn write_body_patch(
             // references from unchanged BSL and neighboring forms when their target node
             // still exists in the new projection; those consumers are outside this patch
             // and cannot be reconstructed by the metadata-only projector. Drop incoming
-            // edges only when the referenced owner node disappeared.
+            // edges when the referenced owner node disappeared, and the incoming metadata
+            // references (a subsystem's member, a role's object, a document's declared
+            // register) the projector writes again for the owner: kept, they would be
+            // stored twice.
             tx.execute(
                 "INSERT OR IGNORE INTO affected_degree (id)
                  SELECT DISTINCT edges.to_id FROM edges
@@ -2345,7 +2348,8 @@ fn write_body_patch(
                     WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
                       AND (
                         NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
-                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding',
+                                          'subsystem_membership','role_reference','register_records')
                       )
                  )",
                 [],
@@ -2359,7 +2363,8 @@ fn write_body_patch(
                     WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
                       AND (
                         NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
-                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding',
+                                          'subsystem_membership','role_reference','register_records')
                       )
                  )",
                 [],
@@ -3423,51 +3428,56 @@ mod tests {
     }
 
     #[test]
-    fn caller_delta_bails_to_full_rebuild_for_subscription_handler() {
-        // A signature change in a module that handles an event subscription must NOT take
-        // the body-only caller-delta path: the subscription's `mdo -> method` edge has a
-        // fileless source the delta never revisits, so it would go stale. The planner must
-        // return None (force a full rebuild).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bsl-graph.db");
+    fn caller_delta_bails_to_full_rebuild_for_handler_modules() {
+        // A signature change in a module that handles an event subscription or a scheduled
+        // job must NOT take the body-only caller-delta path: the `mdo -> method` handler
+        // edge has a fileless source the delta never revisits, so it would go stale. The
+        // planner must return None (force a full rebuild) for either kind.
+        for (source, kind) in [
+            ("mdo/EventSubscription/ПриЗаписи", "event_subscription"),
+            ("mdo/ScheduledJob/ОбменДанными", "scheduled_job"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bsl-graph.db");
 
-        let handler = method_node("method/common/X/Обработчик", "Обработчик");
-        let mut subscription = method_node("mdo/EventSubscription/ПриЗаписи", "ПриЗаписи");
-        subscription.kind = "mdo";
-        subscription.module = None;
-        subscription.file = None; // config-level node: no owning file
-        subscription.is_export = None;
+            let handler = method_node("method/common/X/Обработчик", "Обработчик");
+            let mut object = method_node(source, "Объект");
+            object.kind = "mdo";
+            object.module = None;
+            object.file = None; // config-level node: no owning file
+            object.is_export = None;
 
-        let mut w = GraphDbWriter::create(&path).unwrap();
-        w.write_nodes(&[handler, subscription]).unwrap();
-        let mut sub_edge = edge("mdo/EventSubscription/ПриЗаписи", "method/common/X/Обработчик");
-        sub_edge.kind = "event_subscription";
-        sub_edge.provenance = "string_resolved";
-        w.write_edges(&[sub_edge]).unwrap();
-        w.finalize(&GraphMeta {
-            revision: 1,
-            fingerprint: GraphFp { files: 1, topology: 0 },
-            files: 1,
-            built_at: "t".to_string(),
-            publication_id: "test-1".to_owned(),
-        })
-        .unwrap();
-        open(&path)
-            .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+            let mut w = GraphDbWriter::create(&path).unwrap();
+            w.write_nodes(&[handler, object]).unwrap();
+            let mut handler_edge = edge(source, "method/common/X/Обработчик");
+            handler_edge.kind = kind;
+            handler_edge.provenance = "string_resolved";
+            w.write_edges(&[handler_edge]).unwrap();
+            w.finalize(&GraphMeta {
+                revision: 1,
+                fingerprint: GraphFp { files: 1, topology: 0 },
+                files: 1,
+                built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
+            })
             .unwrap();
+            open(&path)
+                .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+                .unwrap();
 
-        let profile = ModuleProfile {
-            sig_hash: 999,
-            exported_lower: std::collections::BTreeSet::new(),
-            has_collision: false,
-            unread: false,
-        };
-        let plan = caller_delta_plan(&path, &[("CommonModules/X/Ext/Module.bsl", &profile)], None)
-            .unwrap();
-        assert!(
-            plan.is_none(),
-            "a signature change to a subscription handler module must force a full rebuild"
-        );
+            let profile = ModuleProfile {
+                sig_hash: 999,
+                exported_lower: std::collections::BTreeSet::new(),
+                has_collision: false,
+                unread: false,
+            };
+            let changed = [("CommonModules/X/Ext/Module.bsl", &profile)];
+            let plan = caller_delta_plan(&path, &changed, None).unwrap();
+            assert!(
+                plan.is_none(),
+                "a signature change to a `{kind}` handler module must force a full rebuild"
+            );
+        }
     }
 
     /// Everything a build needs to see one catalog and one module.

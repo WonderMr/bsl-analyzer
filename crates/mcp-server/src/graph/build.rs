@@ -11910,11 +11910,11 @@ mod form_twin_tests {
         assert_eq!(fold(lower_form), fold(upper_form), "квалификация форменного обработчика");
     }
 
-    /// A scheduled job's edge leads into a method, which the metadata-only patch cannot
-    /// project: an edit of the job's XML is never taken as a local owner delta, while an
-    /// edit of a catalog in the same tree still is.
+    /// An event subscription's and a scheduled job's edges lead into a method, which the
+    /// metadata-only patch cannot project: an edit of either XML is never taken as a local
+    /// owner delta, while an edit of a catalog in the same tree still is.
     #[test]
-    fn a_scheduled_job_xml_edit_is_not_a_local_owner_delta() {
+    fn handler_owner_xml_edits_are_not_local_owner_deltas() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, "Configuration.xml", "<Configuration/>");
@@ -11924,6 +11924,11 @@ mod form_twin_tests {
             root,
             "ScheduledJobs/Пересчет.xml",
             r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><ScheduledJob uuid="00000000-0000-0000-0000-000000000073"><Properties><Name>Пересчет</Name><MethodName>CommonModule.Сервер.Считать</MethodName><Use>true</Use><Predefined>false</Predefined></Properties></ScheduledJob></MetaDataObject>"#,
+        );
+        write(
+            root,
+            "EventSubscriptions/ПриЗаписи.xml",
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><EventSubscription uuid="00000000-0000-0000-0000-000000000074"><Properties><Name>ПриЗаписи</Name><Source><Type>cfg:CatalogObject.Товары</Type></Source><Event>OnWrite</Event><Handler>CommonModule.Сервер.Считать</Handler></Properties></EventSubscription></MetaDataObject>"#,
         );
 
         let graph = GraphState::for_workspace_with_cache(
@@ -11936,9 +11941,13 @@ mod form_twin_tests {
 
         let db_path = crate::cache::graph_db_path(root);
         let (_, edges) = full_projection(&db_path);
-        let job_edges: Vec<_> =
-            edges.iter().filter(|row| row.contains("mdo/ScheduledJob/Пересчет")).collect();
-        assert!(job_edges.iter().any(|row| row.contains("scheduled_job")), "{job_edges:?}");
+        for (owner, kind) in [
+            ("mdo/ScheduledJob/Пересчет", "scheduled_job"),
+            ("mdo/EventSubscription/ПриЗаписи", "event_subscription"),
+        ] {
+            let owned: Vec<_> = edges.iter().filter(|row| row.contains(owner)).collect();
+            assert!(owned.iter().any(|row| row.contains(kind)), "{owner}: {owned:?}");
+        }
 
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         let project = crate::graph::ProjectSnapshot::load_excluding(root, &cache.exclusions(root));
@@ -11950,6 +11959,60 @@ mod form_twin_tests {
         };
         assert!(delta("Catalogs/Товары.xml").is_some(), "a catalog edit stays a local owner delta");
         assert!(delta("ScheduledJobs/Пересчет.xml").is_none(), "a job edit takes the full build");
+        assert!(
+            delta("EventSubscriptions/ПриЗаписи.xml").is_none(),
+            "a subscription edit takes the full build"
+        );
+    }
+
+    /// A local owner patch replaces the incoming metadata references it writes again instead
+    /// of keeping the old row beside the new one: the subsystem that lists the catalog holds
+    /// one edge to it after the patch, as after a cold build.
+    #[test]
+    fn a_local_owner_patch_keeps_one_incoming_subsystem_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Configuration.xml", "<Configuration/>");
+        sample_workspace(root);
+        write_catalog_attribute(root, "Товары", "ИНН");
+        write(
+            root,
+            "Subsystems/Продажи.xml",
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><Subsystem uuid="00000000-0000-0000-0000-000000000075"><Properties><Name>Продажи</Name><Content><xr:Item xsi:type="xr:MDObjectRef">Catalog.Товары</xr:Item></Content></Properties></Subsystem></MetaDataObject>"#,
+        );
+
+        let graph = GraphState::for_workspace_with_cache(
+            root.to_path_buf(),
+            crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        );
+        graph.ensure_loading();
+        wait_ready(&graph);
+        wait_for_build_to_settle(&graph);
+
+        let membership = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM edges WHERE kind = 'subsystem_membership' \
+                     AND to_id = 'mdo/Catalog/Товары'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let published = crate::cache::graph_db_path(root);
+        assert_eq!(membership(&published), 1, "the first build holds one edge");
+
+        write_catalog_attribute(root, "Товары", "КПП");
+        let cold = root.join("cold-membership.db");
+        build(root, &cold);
+        assert_eq!(membership(&cold), 1, "a cold build of the edited tree holds one edge");
+        assert!(!graph.build_in_flight(), "the patch starts after the first build settles");
+        assert!(
+            matches!(graph.try_incremental_reload(root, 2, 0), PublishAttemptOutcome::Published),
+            "a catalog XML edit is published as a local owner patch"
+        );
+        assert_eq!(membership(&published), 1, "the patch replaced the edge, not copied it");
     }
 
     #[test]
