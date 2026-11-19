@@ -713,9 +713,8 @@ impl DiagnosticsResident {
                 let file_id = *file_id;
                 let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
                 if !worker.registered {
-                    cancel.register(salsa::Database::cancellation_token(
-                        worker.analysis.database(),
-                    ));
+                    cancel
+                        .register(salsa::Database::cancellation_token(worker.analysis.database()));
                     worker.registered = true;
                 }
                 if cancel.is_cancelled() {
