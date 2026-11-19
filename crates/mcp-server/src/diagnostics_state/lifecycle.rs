@@ -1118,8 +1118,7 @@ impl DiagnosticsState {
             if cancel.is_cancelled() {
                 return;
             }
-            let warmed =
-                self.read_mut(|resident, _| resident.warm_name_indexes_of(chunk, cancel));
+            let warmed = self.read_mut(|resident, _| resident.warm_name_indexes_of(chunk, cancel));
             if !matches!(warmed, ResidentOutcome::Ready(true, _)) {
                 return;
             }
