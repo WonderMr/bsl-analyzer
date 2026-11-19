@@ -114,15 +114,20 @@ fn rules_of(top: &Path, git_dir: &Path) -> Arc<WorkTreeRules> {
     let rules = Arc::new(read_rules(top, git_dir, &mut sources));
     let mut read = READ.lock().unwrap_or_else(PoisonError::into_inner);
     read.remove(top);
-    if !sources.settled(read_at) {
-        return rules;
+    if sources.settled(read_at) {
+        keep(&mut read, top, Read::new(git_dir, sources, rules.clone()));
     }
-    if read.len() >= KEPT_WORK_TREES {
-        let least = read.iter().min_by_key(|(_, kept)| kept.used).map(|(dir, _)| dir.clone());
-        read.retain(|dir, _| Some(dir) != least.as_ref());
-    }
-    read.insert(top.to_path_buf(), Read::new(git_dir, sources, rules.clone()));
     rules
+}
+
+/// Keeps `read` as the rules of the work tree at `top`, dropping the rules taken longest
+/// ago when as many work trees as are kept are kept already.
+fn keep(kept: &mut HashMap<PathBuf, Read>, top: &Path, read: Read) {
+    if kept.len() >= KEPT_WORK_TREES && !kept.contains_key(top) {
+        let least = kept.iter().min_by_key(|(_, entry)| entry.used).map(|(dir, _)| dir.clone());
+        kept.retain(|dir, _| Some(dir) != least.as_ref());
+    }
+    kept.insert(top.to_path_buf(), read);
 }
 
 /// The rules of the work trees read last, by their tops.
@@ -332,6 +337,7 @@ fn linked_worktrees(common: &Path, top: &Path, sources: &mut Sources) -> Vec<Pat
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::hash::{Hash, Hasher};
     use std::path::{Path, PathBuf};
@@ -607,15 +613,19 @@ mod tests {
 
     #[test]
     fn rules_are_kept_for_a_bounded_number_of_work_trees() {
-        let count = super::KEPT_WORK_TREES + 2;
-        let dirs: Vec<_> = (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
-        for dir in &dirs {
-            let git_dir = dir.path().join(".git");
-            let first = super::rules_of(dir.path(), &git_dir);
-            assert!(Arc::ptr_eq(&first, &super::rules_of(dir.path(), &git_dir)));
+        // A map of its own: the process-wide one is shared with the other tests.
+        let rules = Arc::new(WorkTreeRules::new(Path::new("top"), std::iter::empty(), &[]));
+        let mut kept = HashMap::new();
+        let top = |n: usize| PathBuf::from(format!("top{n}"));
+        let git_dir = Path::new(".git");
+        for n in 0..super::KEPT_WORK_TREES + 2 {
+            let read = super::Read::new(git_dir, super::Sources::default(), rules.clone());
+            super::keep(&mut kept, &top(n), read);
         }
-        let kept = super::READ.lock().map_or(0, |read| read.len());
-        assert!(kept <= super::KEPT_WORK_TREES, "{kept} work trees kept");
+        assert_eq!(kept.len(), super::KEPT_WORK_TREES);
+        assert!(!kept.contains_key(&top(0)), "the rules taken longest ago go first");
+        assert!(!kept.contains_key(&top(1)));
+        assert!(kept.contains_key(&top(super::KEPT_WORK_TREES + 1)));
     }
 
     #[test]
