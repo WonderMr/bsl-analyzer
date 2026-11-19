@@ -623,7 +623,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                     .filter(|el| el.as_token().is_some_and(|t| t.kind() == SyntaxKind::COMMA))
                     .count();
 
-                if texts.iter().any(|text| is_wrong_str_template(text, param_count)) {
+                if texts.iter().any(|text| is_wrong_str_template(&text.text, param_count)) {
                     ctx.emit(BodyDiagnostic::IncorrectUseOfStrTemplate {
                         range: node.text_range(),
                     });

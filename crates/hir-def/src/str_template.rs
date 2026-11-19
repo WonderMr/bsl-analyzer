@@ -16,13 +16,28 @@ use crate::Name;
 /// `НСтр` multiplies the texts of whatever is added to it.
 const MAX_TEMPLATE_TEXTS: usize = 16;
 
+/// One text a template can take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateText {
+    /// The language of the `НСтр` translation the text holds when the language at run time
+    /// chooses that translation, `None` otherwise.
+    pub language: Option<String>,
+    pub text: String,
+}
+
+impl TemplateText {
+    fn plain(text: String) -> Self {
+        Self { language: None, text }
+    }
+}
+
 /// Whether `name` names the global function `СтрШаблон` / `StrTemplate`.
 pub fn is_str_template_name(name: &str) -> bool {
     matches!(name.fold_lower().as_str(), "стршаблон" | "strtemplate")
 }
 
 /// [`template_texts`] of a template that reads no variable.
-pub fn constant_template_texts(body: &Body, expr: ExprIdx) -> Option<Vec<String>> {
+pub fn constant_template_texts(body: &Body, expr: ExprIdx) -> Option<Vec<TemplateText>> {
     template_texts(body, expr, &mut |_: &Name| None)
 }
 
@@ -36,17 +51,19 @@ pub fn constant_template_texts(body: &Body, expr: ExprIdx) -> Option<Vec<String>
 pub fn template_texts(
     body: &Body,
     expr: ExprIdx,
-    resolve_name: &mut dyn FnMut(&Name) -> Option<Vec<String>>,
-) -> Option<Vec<String>> {
+    resolve_name: &mut dyn FnMut(&Name) -> Option<Vec<TemplateText>>,
+) -> Option<Vec<TemplateText>> {
     let texts = match body.expr_idx(expr) {
-        Expr::Literal(Literal::String(text)) => vec![text.clone()],
+        Expr::Literal(Literal::String(text)) => vec![TemplateText::plain(text.clone())],
         Expr::BinaryOp { lhs, rhs, op: BinaryOp::Add } => {
             let lhs = template_texts(body, *lhs, resolve_name)?;
             let rhs = template_texts(body, *rhs, resolve_name)?;
             let mut texts = Vec::with_capacity(lhs.len() * rhs.len());
             for left in &lhs {
-                for right in &rhs {
-                    texts.push(format!("{left}{right}"));
+                for right in rhs.iter().filter(|right| same_language(left, right)) {
+                    let language = left.language.clone().or_else(|| right.language.clone());
+                    let text = format!("{}{}", left.text, right.text);
+                    texts.push(TemplateText { language, text });
                 }
             }
             texts
@@ -60,7 +77,7 @@ pub fn template_texts(
             nstr_texts(body, args, resolve_name)?
         }
         Expr::Field { base, field } if is_path_named(body, *base, is_chars_name) => {
-            vec![chars_property(field.as_str())?.to_string()]
+            vec![TemplateText::plain(chars_property(field.as_str())?.to_string())]
         }
         Expr::Path(name) => resolve_name(name)?,
         _ => return None,
@@ -68,13 +85,22 @@ pub fn template_texts(
     distinct_within_limit(texts)
 }
 
+/// Whether `left` and `right` can stand side by side in one result: every `НСтр` without a
+/// language of its own returns the translation of the same language at run time.
+fn same_language(left: &TemplateText, right: &TemplateText) -> bool {
+    match (&left.language, &right.language) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
 /// The texts `НСтр(source, language)` can return: every translation of each source text,
 /// or only the one of `language` when the language is known.
 fn nstr_texts(
     body: &Body,
     args: &[ExprIdx],
-    resolve_name: &mut dyn FnMut(&Name) -> Option<Vec<String>>,
-) -> Option<Vec<String>> {
+    resolve_name: &mut dyn FnMut(&Name) -> Option<Vec<TemplateText>>,
+) -> Option<Vec<TemplateText>> {
     let sources = template_texts(body, *args.first()?, resolve_name)?;
     let languages = match args.get(1) {
         Some(&language) => template_texts(body, language, resolve_name),
@@ -82,37 +108,44 @@ fn nstr_texts(
     };
     let mut texts = Vec::new();
     for source in &sources {
-        texts.extend(translations(source, languages.as_deref())?);
+        texts.extend(translations(&source.text, languages.as_deref())?);
     }
     Some(texts)
 }
 
 /// The translations of `source` that `НСтр` can return, or `None` when a known language has
-/// no translation in it. A source without language entries, or with a value that is not
-/// closed, stays one text as written: the platform's reading of it is unclear.
-fn translations(source: &str, languages: Option<&[String]>) -> Option<Vec<String>> {
+/// no translation in it. A translation the language at run time chooses keeps its language;
+/// the translation of a known language is plain text. A source without language entries, or
+/// with a value that is not closed, stays one text as written: the platform's reading of it
+/// is unclear.
+fn translations(source: &str, languages: Option<&[TemplateText]>) -> Option<Vec<TemplateText>> {
     let entries: Option<Vec<(String, String)>> = extract_language_entries(source)
         .into_iter()
         .map(|(language, value)| value.map(|value| (language, value)))
         .collect();
     let entries = match entries {
         Some(entries) if !entries.is_empty() => entries,
-        _ => return Some(vec![source.to_owned()]),
+        _ => return Some(vec![TemplateText::plain(source.to_owned())]),
     };
     let Some(languages) = languages else {
-        return Some(entries.into_iter().map(|(_, value)| value).collect());
+        let mut texts = Vec::with_capacity(entries.len());
+        for (language, text) in entries {
+            texts.push(TemplateText { language: Some(language), text });
+        }
+        return Some(texts);
     };
     languages
         .iter()
         .map(|language| {
-            let language = language.trim().fold_lower();
-            entries.iter().find(|(key, _)| *key == language).map(|(_, value)| value.clone())
+            let language = language.text.trim().fold_lower();
+            let (_, text) = entries.iter().find(|(key, _)| *key == language)?;
+            Some(TemplateText::plain(text.clone()))
         })
         .collect()
 }
 
-fn distinct_within_limit(texts: Vec<String>) -> Option<Vec<String>> {
-    let mut distinct: Vec<String> = Vec::with_capacity(texts.len());
+fn distinct_within_limit(texts: Vec<TemplateText>) -> Option<Vec<TemplateText>> {
+    let mut distinct: Vec<TemplateText> = Vec::with_capacity(texts.len());
     for text in texts {
         if !distinct.contains(&text) {
             distinct.push(text);
@@ -299,22 +332,37 @@ fn compare_template_and_params(template: &str, used_params_count: usize) -> bool
 mod tests {
     use super::*;
 
-    fn texts(items: &[&str]) -> Option<Vec<String>> {
-        Some(items.iter().map(|item| item.to_string()).collect())
+    fn plain(texts: &[&str]) -> Option<Vec<TemplateText>> {
+        Some(texts.iter().map(|text| TemplateText::plain(text.to_string())).collect())
+    }
+
+    fn translated(language: &str, text: &str) -> TemplateText {
+        TemplateText { language: Some(language.to_string()), text: text.to_string() }
     }
 
     #[test]
     fn translations_split_a_multilingual_text_by_language() {
         let source = "ru = 'Документ %1'; en = 'Document'";
-        assert_eq!(translations(source, None), texts(&["Документ %1", "Document"]));
-        assert_eq!(translations(source, Some(&["EN".to_string()][..])), texts(&["Document"]));
-        assert_eq!(translations(source, Some(&["uk".to_string()][..])), None);
+        let by_language = vec![translated("ru", "Документ %1"), translated("en", "Document")];
+        assert_eq!(translations(source, None), Some(by_language));
+        let english = [TemplateText::plain("EN".to_string())];
+        assert_eq!(translations(source, Some(&english[..])), plain(&["Document"]));
+        let ukrainian = [TemplateText::plain("uk".to_string())];
+        assert_eq!(translations(source, Some(&ukrainian[..])), None);
     }
 
     #[test]
     fn translations_keep_a_text_without_closed_entries_as_written() {
-        assert_eq!(translations("Документ %1", None), texts(&["Документ %1"]));
-        assert_eq!(translations("ru = 'Документ %1", None), texts(&["ru = 'Документ %1"]));
+        assert_eq!(translations("Документ %1", None), plain(&["Документ %1"]));
+        assert_eq!(translations("ru = 'Документ %1", None), plain(&["ru = 'Документ %1"]));
+    }
+
+    #[test]
+    fn translations_of_different_languages_never_stand_side_by_side() {
+        let english = translated("en", "Document");
+        assert!(same_language(&english, &translated("en", " %1")));
+        assert!(!same_language(&english, &translated("ru", " %1")));
+        assert!(same_language(&english, &TemplateText::plain(" %1".to_string())));
     }
 
     #[test]

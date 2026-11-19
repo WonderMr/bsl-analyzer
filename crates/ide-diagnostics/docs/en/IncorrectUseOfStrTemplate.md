@@ -23,7 +23,8 @@ Each branch of `?(Condition, "...", "...")` is checked as a template of its own.
 multilingual `NStr("ru = '...'; en = '...'")` the translation into each language is
 checked separately, and a translation whose placeholders do not match the arguments is
 reported. When the second argument of `NStr` is a language code given as a string, only
-the translation into that language is checked.
+the translation into that language is checked. The translations of several `NStr` calls in
+one template are joined only within one language: the user's language selects all of them.
 
 A template held in a local variable is checked when every assignment that reaches the
 call builds it from the same kinds of parts and all of them give the same text:

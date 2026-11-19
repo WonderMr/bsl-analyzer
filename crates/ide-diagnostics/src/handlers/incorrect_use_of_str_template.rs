@@ -5,7 +5,7 @@ use crate::{BodyContext, Diagnostic, DiagnosticCode};
 use hir::dataflow::reaching_defs::{DefSite, ReachingDefsResult};
 use hir::str_template::{
     constant_template_texts, count_required_params, is_str_template_name, is_wrong_str_template,
-    template_texts,
+    template_texts, TemplateText,
 };
 use hir::LocalRange;
 use hir::{Expr, ExprId, ExprIdx, IdConversion, Name, Stmt, StmtId};
@@ -94,15 +94,15 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
 
     for (stmt_id, template, param_count) in candidates {
         let texts = resolve_template_texts(template, body, &reaching_defs, stmt_id, 0);
-        let wrong = texts.iter().flatten().find(|text| is_wrong_str_template(text, param_count));
-        if let Some(template_string) = wrong {
+        let wrong = texts.iter().flatten().find(|t| is_wrong_str_template(&t.text, param_count));
+        if let Some(wrong_text) = wrong {
             if let Some(range) = source_map.expr_range(ExprId::from_idx(template)) {
                 acc.push(Diagnostic {
                     code,
                     message: format!(
                         "Template '{}' requires {} parameters but {} provided",
-                        template_string.chars().take(50).collect::<String>(),
-                        count_required_params(template_string),
+                        wrong_text.text.chars().take(50).collect::<String>(),
+                        count_required_params(&wrong_text.text),
                         param_count
                     ),
                     severity: ctx.severity(code),
@@ -123,7 +123,7 @@ fn resolve_template_texts(
     reaching_defs: &ReachingDefsResult,
     stmt_id: StmtId,
     depth: u32,
-) -> Option<Vec<String>> {
+) -> Option<Vec<TemplateText>> {
     const MAX_DEPTH: u32 = 10;
 
     if depth > MAX_DEPTH {
@@ -144,8 +144,8 @@ fn resolve_variable_texts(
     reaching_defs: &ReachingDefsResult,
     stmt_id: StmtId,
     depth: u32,
-) -> Option<Vec<String>> {
-    let mut texts: Option<Vec<String>> = None;
+) -> Option<Vec<TemplateText>> {
+    let mut texts: Option<Vec<TemplateText>> = None;
     for def in reaching_defs.defs_for_var_at_stmt(name.as_str(), stmt_id)? {
         let DefSite::Assignment(assign_raw_idx) = def.def_site else {
             return None;
@@ -165,7 +165,7 @@ fn resolve_variable_texts(
 
 /// Whether two lists of distinct texts hold the same texts: `?(...)` branches and `НСтр`
 /// translations may come in another order in another assignment.
-fn same_texts(left: &[String], right: &[String]) -> bool {
+fn same_texts(left: &[TemplateText], right: &[TemplateText]) -> bool {
     left.len() == right.len() && left.iter().all(|text| right.contains(text))
 }
 
@@ -451,16 +451,16 @@ mod tests {
             include_str!("fixtures/str_template_nstr_languages.bsl"),
             DiagnosticCode::IncorrectUseOfStrTemplate,
             expect![[r#"
-                IncorrectUseOfStrTemplate @ 11:13..11:89
+                IncorrectUseOfStrTemplate @ 13:13..13:89
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 12:13..12:74
+                IncorrectUseOfStrTemplate @ 14:13..14:74
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 13:13..13:94
+                IncorrectUseOfStrTemplate @ 15:13..15:94
                   message: Некорректное использование СтрШаблон
                   severity: Blocker
-                IncorrectUseOfStrTemplate @ 14:13..14:93
+                IncorrectUseOfStrTemplate @ 16:13..16:93
                   message: Некорректное использование СтрШаблон
                   severity: Blocker"#]],
         );
