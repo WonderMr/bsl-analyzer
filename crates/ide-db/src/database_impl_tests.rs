@@ -2868,6 +2868,162 @@ fn infer_effective_uses_changed_method_return_for_sibling_call() {
     );
 }
 
+/// A base common module `М` with `Сосед` and `Ф`, and three extensions on disk: `E`, which
+/// depends on `D`, changes `Ф` with `inserted` as its `#Вставка` code and owns the data
+/// processor `E_Обработка`; `D` owns the common module `D_Модуль`; the unrelated `F` owns
+/// `F_Обработка` and `F_Модуль`. Returns the base and the extension module of `М`; the
+/// directory must outlive the database.
+fn effective_visibility_fixture(
+    inserted: &str,
+) -> (tempfile::TempDir, RootDatabaseImpl, FileId, FileId) {
+    use crate::metadata::WorkspaceConfigsSnapshot;
+
+    const BASE: &str = "Функция Сосед() Экспорт
+    Возврат 1;
+КонецФункции
+
+Процедура Ф() Экспорт
+    Сосед();
+КонецПроцедуры
+";
+    const LIBRARY: &str = "Процедура Метод() Экспорт
+КонецПроцедуры
+";
+    const SERVER: &str = "<Global>false</Global><Server>true</Server>";
+    const ADOPTED: &str = "<ObjectBelonging>Adopted</ObjectBelonging>\
+        <ExtendedConfigurationObject>00000000-0000-0000-0000-000000000001\
+        </ExtendedConfigurationObject>";
+
+    fn write_object(root: &std::path::Path, kind: &str, number: u32, name: &str, extra: &str) {
+        let xml = [
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">"#.to_string(),
+            format!(r#"<{kind} uuid="00000000-0000-0000-0000-{number:012}">"#),
+            format!("<Properties><Name>{name}</Name>{extra}</Properties>"),
+            format!("</{kind}></MetaDataObject>"),
+        ]
+        .concat();
+        let directory = root.join(format!("{kind}s"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("{name}.xml")), xml).unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let roots = ["src/cf", "src/cfe/D", "src/cfe/E", "src/cfe/F"].map(|dir| temp.path().join(dir));
+    for root in &roots {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+    }
+    write_object(&roots[0], "CommonModule", 1, "М", SERVER);
+    write_object(&roots[1], "CommonModule", 2, "D_Модуль", SERVER);
+    write_object(&roots[2], "CommonModule", 3, "М", &format!("{ADOPTED}{SERVER}"));
+    write_object(&roots[2], "DataProcessor", 4, "E_Обработка", "");
+    write_object(&roots[3], "CommonModule", 5, "F_Модуль", SERVER);
+    write_object(&roots[3], "DataProcessor", 6, "F_Обработка", "");
+
+    let mut snapshot = WorkspaceConfigsSnapshot::from_paths(vec![
+        (None, roots[0].clone()),
+        (Some("D".to_string()), roots[1].clone()),
+        (Some("E".to_string()), roots[2].clone()),
+        (Some("F".to_string()), roots[3].clone()),
+    ]);
+    let info_base = Some(bsl_metadata::ExtensionScope::InfoBase);
+    snapshot.extension_scopes = vec![None, info_base, info_base, info_base];
+    snapshot.closures[2] = vec![1];
+    let mut db = RootDatabaseImpl::new();
+    db.set_workspace_configs_snapshot(snapshot);
+
+    let extension = format!(
+        r#"&ИзменениеИКонтроль("Ф")
+Процедура E_Ф()
+    Сосед();
+#Вставка
+{inserted}
+#КонецВставки
+КонецПроцедуры
+"#
+    );
+    let files = [
+        (roots[0].join("CommonModules/М/Ext/Module.bsl"), BASE.to_string()),
+        (roots[2].join("CommonModules/М/Ext/Module.bsl"), extension),
+        (roots[1].join("CommonModules/D_Модуль/Ext/Module.bsl"), LIBRARY.to_string()),
+        (roots[3].join("CommonModules/F_Модуль/Ext/Module.bsl"), LIBRARY.to_string()),
+    ];
+    let mut file_set = FileSet::new();
+    for (index, (path, _)) in files.iter().enumerate() {
+        file_set.insert(FileId(index as u32), VfsPath::new(path.to_string_lossy().as_ref()));
+    }
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (index, (_, text)) in files.iter().enumerate() {
+        let file = FileId(index as u32);
+        db.set_file_source_root(file, SourceRootId(0));
+        db.set_file_text(file, text);
+    }
+    (temp, db, FileId(0), FileId(1))
+}
+
+/// The inference diagnostics of the effective module of `extension`, as their debug text.
+fn effective_diagnostics(db: &RootDatabaseImpl, base: FileId, extension: FileId) -> Vec<String> {
+    let eid = hir::EffectiveModuleId::new(db, base, extension);
+    let result = hir::infer_effective(db, eid);
+    result.diagnostics.iter().map(|(_, diagnostic)| format!("{diagnostic:?}")).collect()
+}
+
+/// Code inserted into a changed method runs in the extension: it sees the extension's own
+/// objects and the modules of the extensions it depends on. A data processor nobody declares
+/// stays unresolved, which proves the inserted code is really inferred.
+#[test]
+fn infer_effective_inserted_code_sees_its_extension_and_dependencies() {
+    const INSERTED: &str = "    Обработка = Обработки.E_Обработка;
+    D_Модуль.Метод();
+    Пусто = Обработки.НетТакой;";
+
+    let (_temp, db, base, extension) = effective_visibility_fixture(INSERTED);
+    let diagnostics = effective_diagnostics(&db, base, extension);
+
+    for name in ["E_Обработка", "D_Модуль"] {
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.contains(name)),
+            "`{name}` must resolve in inserted code: {diagnostics:?}"
+        );
+    }
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.contains("НетТакой")),
+        "a data processor no configuration declares stays unresolved: {diagnostics:?}"
+    );
+}
+
+/// Inserted code sees the extensions its own extension depends on, not every extension of
+/// the workspace.
+#[test]
+fn infer_effective_inserted_code_does_not_see_unrelated_extensions() {
+    let (_temp, db, base, extension) =
+        effective_visibility_fixture("    Чужая = Обработки.F_Обработка;");
+    let diagnostics = effective_diagnostics(&db, base, extension);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.contains("F_Обработка")),
+        "the object of an extension `E` does not depend on stays unresolved: {diagnostics:?}"
+    );
+}
+
+/// The extension's visibility does not take the base module's own methods away: inserted
+/// code still calls a base sibling through the assembled module.
+#[test]
+fn infer_effective_inserted_code_still_calls_base_siblings() {
+    let (_temp, db, base, extension) = effective_visibility_fixture("    Значение = Сосед();");
+    let eid = hir::EffectiveModuleId::new(&db, base, extension);
+    let result = hir::infer_effective(&db, eid);
+
+    use bsl_types::builders::Builders;
+    use stdx::case::CaseExt;
+    assert_eq!(
+        result.var_types.get(&"Значение".fold_lower()).copied(),
+        Some(db.number(None, None)),
+        "the base sibling `Сосед()` returns 1; var_types = {:?}",
+        result.var_types.keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn test_sdbl_hir_in_file_basic() {
     let mut db = RootDatabaseImpl::new();

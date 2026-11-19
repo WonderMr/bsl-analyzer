@@ -671,15 +671,23 @@ pub struct InferenceContext<'db> {
     db: &'db dyn HirDatabase,
 
     /// File whose configuration/metadata/cross-module context governs resolution.
-    /// For an ordinary module this is the module's own file; for an effective
-    /// `&ИзменениеИКонтроль` module it stays the BASE file (the effective module *is*
-    /// the base module with the extension's edits applied). Same-module method/variable
-    /// lookups are NOT keyed on this — they go through `local_symbols`.
+    /// For an ordinary module this is the module's own file. A body of an effective
+    /// `&ИзменениеИКонтроль` module that the extension compiles runs in the extension, so
+    /// there it is the EXTENSION file: the extension's own objects and the extensions it
+    /// depends on are visible, unrelated extensions are not. The base module's top-level
+    /// code keeps the base file.
     context_file_id: FileId,
+
+    /// File of the module the inferred bodies belong to. Equal to `context_file_id` except
+    /// in an effective `&ИзменениеИКонтроль` body the extension compiles: the effective
+    /// module *is* the base module with the extension's edits applied, so its methods,
+    /// variables and bodies carry the BASE file's ids. Same-module method/variable lookups
+    /// by name are NOT keyed on this there — they go through `local_symbols`.
+    module_file_id: FileId,
 
     /// Effective module's symbol tree, present only when inferring a spliced
     /// `&ИзменениеИКонтроль` module. `None` for every ordinary module, in which case
-    /// same-module lookups go to the declarations of `ModuleId{context_file_id}` by
+    /// same-module lookups go to the declarations of `ModuleId{module_file_id}` by
     /// name, one memo per declaration.
     local_symbols: Option<Arc<ModuleInterface>>,
 
@@ -1132,6 +1140,7 @@ impl<'db> InferenceContext<'db> {
         Self {
             db,
             context_file_id: file_id,
+            module_file_id: file_id,
             local_symbols: None,
             effective_extension: None,
             local_effective_returns: None,
@@ -1206,11 +1215,13 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// Inference over an effective `&ИзменениеИКонтроль` module: local bodies/symbols come
-    /// from the spliced effective text (`local_symbols`), while configuration / metadata /
-    /// cross-module resolution keeps `context_file_id = base_file`. Identical to [`Self::new`]
-    /// apart from same-module method/variable lookups, which route to `local_symbols` and,
-    /// on a miss, to the declarations of the extension file `ext_file_id`. Pass `None` for a
-    /// body the extension does not compile: the base module's own top-level code.
+    /// from the spliced effective text (`local_symbols`) and keep the base module's identity
+    /// (`module_file_id = base_file`), while configuration / metadata / cross-module
+    /// resolution keys on the extension file `ext_file_id`, which compiles the body — as
+    /// [`Self::new_weaving`] does for an interceptor. Same-module method/variable lookups
+    /// route to `local_symbols` and, on a miss, to the declarations of `ext_file_id`. Pass
+    /// `None` for a body the extension does not compile: the base module's own top-level
+    /// code, which keeps the base file for both.
     pub fn new_effective(
         db: &'db dyn HirDatabase,
         base_file_id: FileId,
@@ -1224,6 +1235,7 @@ impl<'db> InferenceContext<'db> {
         // method rather than the one being inferred — disable availability
         // checks rather than misattribute them.
         let mut ctx = Self::new_impl(db, base_file_id, owner, Self::own_flow(owner, body), false);
+        ctx.context_file_id = ext_file_id.unwrap_or(base_file_id);
         ctx.local_symbols = Some(local_symbols);
         ctx.effective_extension = ext_file_id.map(hir_def::ModuleId::new);
         ctx
@@ -1307,7 +1319,7 @@ impl<'db> InferenceContext<'db> {
     /// (`local_effective_returns == None`), so it is safe to apply at every local-capable
     /// `MethodResolution` return site.
     fn effective_local_return(&self, method_id: hir_def::MethodId, resolved: TypeId) -> TypeId {
-        if method_id.module.file_id == self.context_file_id {
+        if method_id.module.file_id == self.module_file_id {
             if let Some(ret) = self
                 .local_effective_returns
                 .as_ref()
@@ -1417,7 +1429,7 @@ impl<'db> InferenceContext<'db> {
                         .is_some_and(|ext| self.db.interface_method_named(ext, name).is_some())
             }
             None => {
-                let module_id = hir_def::ModuleId::new(self.context_file_id);
+                let module_id = hir_def::ModuleId::new(self.module_file_id);
                 self.db.interface_method_named(module_id, name).is_some()
             }
         };
@@ -2090,7 +2102,7 @@ impl<'db> InferenceContext<'db> {
         callee_module: hir_def::ModuleId,
     ) {
         use hir_def::execution_env::{self, EnvFlags};
-        if self.body_env.is_empty() || callee_module.file_id == self.context_file_id {
+        if self.body_env.is_empty() || callee_module.file_id == self.module_file_id {
             return;
         }
         // Physical flags per callee module are cached per body: a body calling
@@ -2181,7 +2193,7 @@ impl<'db> InferenceContext<'db> {
                 let env = crate::method_environment::effective_method_env(
                     self.db,
                     hir_def::MethodId {
-                        module: hir_def::ModuleId { file_id: self.context_file_id },
+                        module: hir_def::ModuleId { file_id: self.module_file_id },
                         local_id: callee_local_id,
                     },
                     &opts,
@@ -2199,7 +2211,7 @@ impl<'db> InferenceContext<'db> {
         }
         let module_type = self
             .db
-            .module_metadata(hir_def::ModuleId { file_id: self.context_file_id })
+            .module_metadata(hir_def::ModuleId { file_id: self.module_file_id })
             .module_type;
         if hir_def::execution_env::local_server_call_is_remote(module_type) {
             missing = missing & EnvFlags::SERVER_SIDE;
@@ -2274,7 +2286,7 @@ impl<'db> InferenceContext<'db> {
     fn query_facts(&self) -> crate::query_in_loop::BodyQueryFacts {
         let bindings: FxHashMap<ExprId, &CallArgBinding> =
             self.call_arg_bindings.iter().map(|binding| (binding.call_expr, binding)).collect();
-        let module = hir_def::ModuleId::new(self.context_file_id);
+        let module = hir_def::ModuleId::new(self.module_file_id);
         let mut facts = crate::query_in_loop::BodyQueryFacts::default();
         for &(call, in_loop_body) in &self.query_call_sites {
             if self.body.is_recovered(call) {
@@ -2476,7 +2488,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn get_resolver(&self) -> Resolver {
-        let module_id = hir_def::ModuleId { file_id: self.context_file_id };
+        let module_id = hir_def::ModuleId { file_id: self.module_file_id };
         match &self.local_symbols {
             Some(symbols) => Resolver::with_builtins_and_workspace_effective(
                 module_id,
@@ -3365,13 +3377,13 @@ impl<'db> InferenceContext<'db> {
         stmt_id: StmtId,
         var_key: &str,
     ) -> Option<Vec<dataflow::reaching_defs::Definition>> {
-        let module = hir_def::ModuleId::new(self.context_file_id);
+        let module = hir_def::ModuleId::new(self.module_file_id);
         let body_defs = match self.owner {
             DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
                 MethodIdInput::new(self.db, hir_def::MethodId { module, local_id }),
             )?,
             DefWithBodyId::ModuleCode => {
-                self.db.module_code_reaching_definitions(self.context_file_id)?
+                self.db.module_code_reaching_definitions(self.module_file_id)?
             }
         };
         body_defs.defs_for_var_at_stmt(var_key, stmt_id)
@@ -3442,7 +3454,7 @@ impl<'db> InferenceContext<'db> {
         let DefWithBodyId::Method(local_id) = self.owner else {
             return false;
         };
-        let module = hir_def::ModuleId::new(self.context_file_id);
+        let module = hir_def::ModuleId::new(self.module_file_id);
         self.db.interface_method(hir_def::MethodId { module, local_id }).is_some_and(|method| {
             method.directives.iter().any(|directive| {
                 matches!(
@@ -3471,7 +3483,7 @@ impl<'db> InferenceContext<'db> {
             return;
         }
 
-        let module = hir_def::ModuleId::new(self.context_file_id);
+        let module = hir_def::ModuleId::new(self.module_file_id);
         let method_id = hir_def::MethodId { module, local_id };
         let Some(method_symbol) = self.db.interface_method(method_id) else {
             return;
@@ -3544,7 +3556,7 @@ impl<'db> InferenceContext<'db> {
             let ordinary = self.local_symbols.is_none() && self.weaving_base.is_none();
             if ordinary {
                 let resolver = self.get_resolver();
-                let module = hir_def::ModuleId::new(self.context_file_id);
+                let module = hir_def::ModuleId::new(self.module_file_id);
                 // Callee summaries come from the memoised (acyclic) query, so reading them here does
                 // not couple inference's fixpoint with a second one.
                 let summarize = |mid: hir_def::MethodId| {
@@ -3950,7 +3962,7 @@ impl<'db> InferenceContext<'db> {
             return Arc::from([]);
         }
         let Some(pkg) =
-            hir_def::sdbl_package_for(self.db, self.context_file_id, self.owner, arg_id)
+            hir_def::sdbl_package_for(self.db, self.module_file_id, self.owner, arg_id)
         else {
             return Arc::from([]);
         };
@@ -4493,7 +4505,7 @@ impl<'db> InferenceContext<'db> {
             if crate::method_lookup::receiver_needs_refinement_id(self.db, ty_id) {
                 if let Some(projections) = crate::query_text_dataflow::refine_query_at_use_site(
                     self.db,
-                    self.context_file_id,
+                    self.module_file_id,
                     self.owner,
                     expr_id,
                     name,
@@ -5101,7 +5113,7 @@ impl<'db> InferenceContext<'db> {
 
             let refine_ctx = crate::method_lookup::RefineCtx {
                 db: self.db,
-                file_id: self.context_file_id,
+                file_id: self.module_file_id,
                 owner: self.owner,
                 body: &self.body,
                 dispatch_expr_id: callee,
@@ -5939,9 +5951,9 @@ impl<'db> InferenceContext<'db> {
         let method = self.find_local_method(name)?;
 
         // Weaving-base fallbacks resolve into another file whose item tree does
-        // not match `context_file_id` — the local directive check only makes
+        // not match `module_file_id` — the local directive check only makes
         // sense for true siblings.
-        if method.id.module.file_id == self.context_file_id {
+        if method.id.module.file_id == self.module_file_id {
             let method_name = method.name.clone();
             let local_id = method.id.local_id;
             self.check_local_callee_env(callee, &method_name, local_id);
@@ -5952,7 +5964,7 @@ impl<'db> InferenceContext<'db> {
         let effective_ret = self
             .local_effective_returns
             .as_ref()
-            .filter(|_| method.id.module.file_id == self.context_file_id)
+            .filter(|_| method.id.module.file_id == self.module_file_id)
             .and_then(|m| m.get(&method.id.local_id).copied())
             .filter(|ret| !self.is_unknown(*ret));
         let sig =
@@ -6008,7 +6020,7 @@ impl<'db> InferenceContext<'db> {
                 })
             }
             None => {
-                let module_id = hir_def::ModuleId::new(self.context_file_id);
+                let module_id = hir_def::ModuleId::new(self.module_file_id);
                 self.db.interface_method_named(module_id, name)
             }
         }
@@ -6823,10 +6835,12 @@ pub fn infer_query<'db>(
 /// Inference over the *effective* module of an `&ИзменениеИКонтроль` extension/base
 /// pair. Mirrors [`infer_query`] but runs every body inline through
 /// [`InferenceContext::new_effective`] — same-module method/variable lookups resolve
-/// against the effective symbol tree (so `#Вставка` code sees base siblings), while
-/// metadata / cross-module context stays the base file. It deliberately does NOT
-/// reuse `infer_method` / `infer_module_code`: those key on `ModuleId{base_file}` and
-/// would collide with the base module's own cached inference.
+/// against the effective symbol tree (so `#Вставка` code sees base siblings), while the
+/// metadata / cross-module context of a body the extension compiles is the extension
+/// file: such a body runs in the extension and sees what the extension sees. The base
+/// module's top-level code keeps the base file. It deliberately does NOT reuse
+/// `infer_method` / `infer_module_code`: those key on `ModuleId{base_file}` and would
+/// collide with the base module's own cached inference.
 #[salsa::tracked(lru = 256, heap_size = heap_estimate::inference_result_heap, returns(clone))]
 pub fn infer_effective<'db>(
     db: &'db dyn HirDatabase,
