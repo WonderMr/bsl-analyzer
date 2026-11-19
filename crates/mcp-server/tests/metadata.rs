@@ -547,4 +547,18 @@ async fn tree_filter_searches_object_names_and_meta_type_lists_a_category() {
     .await;
     let listed = text_of(&listed);
     assert!(listed.contains("- Товары") && listed.contains("- А"), "{listed}");
+
+    // The name search prints `ОбщийМодуль.Сервер` for this workspace; `object` opens the pair.
+    let module = call(
+        &client,
+        &[
+            ("action", json!("object")),
+            ("mode", json!("source")),
+            ("object_type", json!("ОбщийМодуль")),
+            ("object_name", json!("Сервер")),
+        ],
+    )
+    .await;
+    let module = text_of(&module);
+    assert!(module.starts_with("# ОбщийМодуль.Сервер\n"), "{module}");
 }
