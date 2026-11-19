@@ -101,6 +101,8 @@ pub use hir_def::{
 
 pub use hir_def::catch_class;
 pub use hir_def::metrics;
+pub use hir_def::nstr;
+pub use hir_def::str_template;
 
 pub mod cfg {
     pub use ::cfg::{
