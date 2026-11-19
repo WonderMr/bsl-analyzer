@@ -331,13 +331,13 @@ impl ExcludedPaths {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return false;
         };
-        let canonical = match resolved.0.get(parent) {
+        let canonical = match resolved.dirs.get(parent) {
             Some(parent) => parent.join(name),
             None => {
                 let canonical_parent =
                     resolve_as_far_as_it_goes(parent).unwrap_or_else(|| parent.to_path_buf());
                 let canonical = canonical_parent.join(name);
-                resolved.0.insert(parent.to_path_buf(), canonical_parent);
+                resolved.dirs.insert(parent.to_path_buf(), canonical_parent);
                 canonical
             }
         };
@@ -450,7 +450,9 @@ impl ExcludedPaths {
     /// walk reaches under a root's spelling without passing a symlink: git's answer is
     /// the same under both spellings there, so the walk pays neither a resolution nor a
     /// record per directory. A symlink, and everything a walk reaches through one, is
-    /// still asked about under the spelling it resolves to.
+    /// still asked about under the spelling it resolves to; so is every directory a
+    /// worker of a parallel walk ([`ResolvedDirs::for_one_worker`]) reaches without
+    /// having entered its parent.
     pub fn prunes_walked_dir(
         &self,
         path: &Path,
@@ -464,16 +466,16 @@ impl ExcludedPaths {
             return true;
         }
         let from_parent = || {
-            let parent = resolved.0.get(path.parent()?)?;
+            let parent = resolved.dirs.get(path.parent()?)?;
             Some(parent.join(path.file_name()?))
         };
         let canonical = match (is_symlink, from_parent()) {
             (false, Some(canonical)) => canonical,
-            (false, None) if self.git_answers_alike(path) => return false,
+            (false, None) if !resolved.partial && self.git_answers_alike(path) => return false,
             _ => path.canonicalize().map(simplify_verbatim).unwrap_or_else(|_| path.to_path_buf()),
         };
         let excluded = canonical.as_path() != path && self.prunes(&canonical, is_symlink);
-        resolved.0.insert(path.to_path_buf(), canonical);
+        resolved.dirs.insert(path.to_path_buf(), canonical);
         excluded
     }
 
@@ -513,7 +515,7 @@ impl ExcludedPaths {
         } else {
             match (path.parent(), path.file_name()) {
                 (Some(parent), Some(name)) => {
-                    let parent = resolved.0.entry(parent.to_path_buf()).or_insert_with(|| {
+                    let parent = resolved.dirs.entry(parent.to_path_buf()).or_insert_with(|| {
                         resolve_as_far_as_it_goes(parent).unwrap_or_else(|| parent.to_path_buf())
                     });
                     Some(parent.join(name))
@@ -584,7 +586,20 @@ impl ExcludedPaths {
 /// [`ExcludedPaths::prunes_walked_dir`]. One per walk: entries are keyed by the walk's
 /// own spelling of each directory.
 #[derive(Debug, Default)]
-pub struct ResolvedDirs(std::collections::HashMap<PathBuf, PathBuf>);
+pub struct ResolvedDirs {
+    dirs: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Whether the record serves one worker of a parallel walk, which enters only some of
+    /// the walk's directories: a directory whose parent it lacks may still lie below a
+    /// symlink another worker passed.
+    partial: bool,
+}
+
+impl ResolvedDirs {
+    /// A record for one worker of a parallel walk.
+    pub fn for_one_worker() -> Self {
+        Self { dirs: std::collections::HashMap::new(), partial: true }
+    }
+}
 
 impl Patterns {
     fn respelled_under(&self, roots: &[(PathBuf, PathBuf)]) -> Self {
@@ -686,18 +701,21 @@ impl GitIgnored {
         self.roots.iter().any(|root| root.rules.is_some())
     }
 
-    /// Whether every spelling of each root reaches each root nested in it under one of
-    /// that root's own spellings. A root declared through a link while a root inside it is
-    /// declared under the resolved spelling is the case that fails: there a walked path
-    /// and its resolved spelling can have different innermost roots.
+    /// Whether every spelling of each root reaches each other root at or below it under
+    /// one of that root's own spellings. A root declared through a link while a root
+    /// inside it, or a second root for the same directory, is declared under the resolved
+    /// spelling is the case that fails: there a walked path and its resolved spelling can
+    /// have different innermost roots. Roots spelled one way each cannot fail it.
     fn spells_nested_roots_alike(&self) -> bool {
-        self.roots.iter().all(|outer| {
+        if self.roots.iter().all(|root| root.spellings.len() == 1) {
+            return true;
+        }
+        self.roots.iter().enumerate().all(|(at, outer)| {
             let Some(outer_resolved) = outer.spellings.last() else { return true };
-            self.roots.iter().all(|inner| {
+            self.roots.iter().enumerate().filter(|(other, _)| *other != at).all(|(_, inner)| {
                 let Some(inner_resolved) = inner.spellings.last() else { return true };
-                let Some(tail) = self.index.names_below(inner_resolved, outer_resolved) else {
-                    return true;
-                };
+                let tail = self.index.tail_after(inner_resolved, outer_resolved);
+                let Some(tail) = tail else { return true };
                 outer.spellings.iter().all(|spelling| {
                     let nested: Vec<&String> = spelling.iter().chain(tail).collect();
                     inner.spellings.iter().any(|other| self.index.same_names(other, &nested))
@@ -844,10 +862,10 @@ impl RootIndex {
         innermost
     }
 
-    /// The names of `path` past `prefix` when `path` lies strictly below it, both given by
+    /// The names of `path` past `prefix` when `path` lies at or below it, both given by
     /// name and compared as the index compares them.
-    fn names_below<'a>(&self, path: &'a [String], prefix: &[String]) -> Option<&'a [String]> {
-        let tail = path.get(prefix.len()..).filter(|tail| !tail.is_empty())?;
+    fn tail_after<'a>(&self, path: &'a [String], prefix: &[String]) -> Option<&'a [String]> {
+        let tail = path.get(prefix.len()..)?;
         let within = path.iter().zip(prefix).all(|(name, other)| self.same_name(name, other));
         within.then_some(tail)
     }
@@ -1782,6 +1800,8 @@ mod tests {
             let kept = under(top, "src/cf/CommonModules");
             assert!(!excluded.is_excluded(&under(&kept, "M/Ext/Module.bsl")), "{}", kept.display());
         }
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -1836,16 +1856,21 @@ mod tests {
             assert!(!excluded.prunes_walked_dir(&top.join(dir), false, &mut resolved), "{dir}");
         }
         assert!(excluded.prunes_walked_dir(&top.join(".claude"), false, &mut resolved));
-        assert!(resolved.0.is_empty(), "resolved {:?}", resolved.0.keys().collect::<Vec<_>>());
+        let kept: Vec<_> = resolved.dirs.keys().collect();
+        assert!(kept.is_empty(), "resolved {kept:?}");
 
+        // A worker of a parallel walk may lack a parent another worker entered.
+        let mut worker = ResolvedDirs::for_one_worker();
+        assert!(!excluded.prunes_walked_dir(&top.join("CommonModules"), false, &mut worker));
+        assert_eq!(worker.dirs.len(), 1);
         // Outside every root there is no root to answer alike: the walk resolves.
         assert!(!excluded.prunes_walked_dir(&absolute("git-walk-outside"), false, &mut resolved));
-        assert_eq!(resolved.0.len(), 1);
+        assert_eq!(resolved.dirs.len(), 1);
         // A literal exclusion is asked under resolved spellings too.
         let listed = ExcludedPaths::new([top.join(".tmp")]).with_git_ignored(GitIgnored::default());
         let mut resolved = ResolvedDirs::default();
         assert!(!listed.prunes_walked_dir(&top.join("CommonModules"), false, &mut resolved));
-        assert_eq!(resolved.0.len(), 1);
+        assert_eq!(resolved.dirs.len(), 1);
     }
 
     /// A set of git's rules over `roots`, each with its path relative to the top.
@@ -1875,13 +1900,35 @@ mod tests {
         let mut resolved = ResolvedDirs::default();
         let set = git_ignored_at(&rules, &apart);
         assert!(!set.prunes_walked_dir(&outer.join("inner/sub"), false, &mut resolved));
-        assert!(!resolved.0.is_empty());
+        assert!(!resolved.dirs.is_empty());
 
         let alike = [(outer.clone(), ""), (outer.join("inner"), "inner")];
         let mut resolved = ResolvedDirs::default();
         let set = git_ignored_at(&rules, &alike);
         assert!(!set.prunes_walked_dir(&outer.join("inner/sub"), false, &mut resolved));
-        assert!(resolved.0.is_empty());
+        assert!(resolved.dirs.is_empty());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_root_for_the_same_directory_keeps_a_walk_resolving() {
+        let base = absolute("git-alias-same");
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("top/build")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("alias")).unwrap();
+        let rules = Arc::new(WorkTreeRules::new(&real.join("top"), "build/\n".lines(), &[]));
+        let mut ignored = GitIgnored::default();
+        ignored.add_root(&real.join("top"), Some((rules, Path::new(""))));
+        ignored.add_root(&base.join("alias/top"), None);
+        let excluded = ExcludedPaths::default().with_git_ignored(ignored);
+
+        // The walked spelling finds the root without rules, the resolved one the root that
+        // leaves `build` out.
+        let mut resolved = ResolvedDirs::default();
+        assert!(excluded.prunes_walked_dir(&base.join("alias/top/build"), false, &mut resolved));
 
         std::fs::remove_dir_all(&base).unwrap();
     }
