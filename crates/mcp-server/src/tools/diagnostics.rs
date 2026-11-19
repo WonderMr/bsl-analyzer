@@ -194,6 +194,9 @@ pub struct DiagnosticsStateResponse {
 #[allow(dead_code)]
 pub struct DiagnosticsLoadingResponse {
     pub status: String,
+    /// `platform_help` while the server is still loading the platform help, which every
+    /// finding reads; `status` is then `loading` whatever the resident's own state.
+    pub phase: Option<String>,
 }
 
 /// Filters applied to a file's diagnostics before they become findings.

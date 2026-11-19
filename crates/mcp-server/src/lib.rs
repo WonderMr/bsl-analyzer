@@ -223,6 +223,34 @@ fn indexed_search_budget(command: &SearchCommand) -> Option<usize> {
     }
 }
 
+/// The action of `command` when it reads the platform help: the docs index is built from it
+/// and the listing is its catalog.
+fn platform_search_action(command: &SearchCommand) -> Option<&'static str> {
+    match command {
+        SearchCommand::ListPlatform(_) => Some("list_platform"),
+        SearchCommand::FindDocs { .. } => Some("find_docs"),
+        SearchCommand::SearchDocs { .. } => Some("search_docs"),
+        SearchCommand::SearchCode(_) | SearchCommand::Status => None,
+    }
+}
+
+/// The `not_ready` answer of a search action that reads the platform help, while the server
+/// is still loading it; `None` when the action can be served.
+async fn platform_search_loading(
+    server: &McpServer,
+    command: &SearchCommand,
+    budget: Option<usize>,
+    ct: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CallToolResult>, McpError> {
+    let Some(action) = platform_search_action(command) else { return Ok(None) };
+    let not_ready = || tools::search::platform_help_not_ready(action);
+    let Some(loading) = tools::platform_help::loading_answer(ct, not_ready).await? else {
+        return Ok(None);
+    };
+    let stale = server.state.graph().is_reloading();
+    finish_indexed_search(loading, server.state.reference_indexing(), budget, stale).map(Some)
+}
+
 fn finish_indexed_search(
     mut response: CallToolResult,
     indexing: indexing::Indexing,
@@ -1593,6 +1621,9 @@ impl McpServer {
         if budget.is_some() && ct.is_cancelled() {
             return Err(McpError::internal_error("request cancelled", None));
         }
+        if let Some(loading) = platform_search_loading(self, &command, budget, &ct).await? {
+            return Ok(loading);
+        }
         let reference =
             matches!(&command, SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. });
         let response = match command {
@@ -2425,6 +2456,12 @@ impl McpServer {
         // an already-cancelled request is never handed a body.
         let diag = self.state.diagnostics().clone();
         diag.ensure_loading();
+        // Types and platform members are read off the platform help, which may still be
+        // loading; a read now would hold the call, and the resident with it, until it is in.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, Some("1")).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         let sections = tools::symbol_info::sections_from(&p.include);
         let locale = tools::symbol_info::locale_from(p.locale.as_deref())?;
@@ -2644,6 +2681,13 @@ impl McpServer {
         // handed a `loading` body — the one shape the contract says a cancelled call
         // never produces. Every outcome, `loading` included, is rendered from the read.
         diag.ensure_loading();
+        // Receivers are typed off the platform help, which may still be loading; a walk now
+        // would hold the call, and the resident with it, until it is in. A cancelled call
+        // still gets no body here.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, Some("1")).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         let max_output_tokens = p.max_output_tokens.unwrap_or(tools::references::DEFAULT_BUDGET);
 
@@ -2797,9 +2841,22 @@ impl McpServer {
                 )
                 .into())
             }
-            "file" => self.diagnostics_file(p, ct, caller).await,
-            "snippet" => self.diagnostics_snippet(p, ct, caller).await,
-            "workspace" => self.diagnostics_workspace(p, ct, caller).await,
+            "file" | "snippet" | "workspace" => {
+                // Findings are computed off the platform help, which may still be loading;
+                // an analysis now would hold the call, and the resident with it, until it is
+                // in. The build is kicked first, so it runs while the help loads.
+                let diag = self.state.diagnostics().clone();
+                diag.ensure_loading();
+                let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+                if let Some(loading) = help {
+                    return Ok(loading.into());
+                }
+                match p.action.as_str() {
+                    "file" => self.diagnostics_file(p, ct, caller).await,
+                    "snippet" => self.diagnostics_snippet(p, ct, caller).await,
+                    _ => self.diagnostics_workspace(p, ct, caller).await,
+                }
+            }
             other => Err(contract::unknown_action(McpProfile::Workspace, "diagnostics", other)),
         }
     }
@@ -3190,6 +3247,9 @@ impl McpServer {
         if budget.is_some() && ct.is_cancelled() {
             return Err(McpError::internal_error("request cancelled", None));
         }
+        if let Some(loading) = platform_search_loading(self, &command, budget, &ct).await? {
+            return Ok(loading);
+        }
         let response = match command {
             SearchCommand::Status => {
                 let engine = self.state.search_engine().clone();
@@ -3335,7 +3395,14 @@ impl McpServer {
     async fn syntax_help(
         &self,
         params: Parameters<SyntaxHelpParams>,
+        ct: tokio_util::sync::CancellationToken,
     ) -> Result<CallToolResult, McpError> {
+        // Every card is read off the platform help, which may still be loading.
+        if let Some(loading) =
+            tools::platform_help::loading_answer(&ct, tools::platform::syntax_help_loading).await?
+        {
+            return Ok(loading);
+        }
         match params.0 {
             SyntaxHelpParams::ByName(p) => tools::platform::bsl_syntax_help(
                 &p.name,

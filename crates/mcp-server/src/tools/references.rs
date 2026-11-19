@@ -1287,6 +1287,9 @@ pub(crate) struct ReferencesLoading {
     attempts: Option<u64>,
     /// How long ago that failure was published.
     failed_age_ms: Option<u64>,
+    /// `platform_help` while the server is still loading the platform help, which every
+    /// walk reads; `status` is then `loading` whatever the resident's own state.
+    phase: Option<String>,
 }
 
 crate::wire_enum!(LoadingSchemaVersion { V1 => "1" });

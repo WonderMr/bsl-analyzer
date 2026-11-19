@@ -749,12 +749,42 @@ enum SyntaxHelpResponse {
         budget_exhausted: bool,
         budget_hint: String,
     },
+    /// The platform help is still being loaded: no card, and no verdict that the member is
+    /// absent either. Ask again after `retry_after_ms`.
+    Loading {
+        schema_version: SyntaxHelpSchemaVersion,
+        status: SyntaxHelpLoadingStatus,
+        phase: super::platform_help::LoadingPhase,
+        detail: String,
+        retry_after_ms: u64,
+        budget_exhausted: bool,
+    },
 }
 
 #[derive(JsonSchema, Serialize)]
 enum SyntaxHelpSchemaVersion {
     #[serde(rename = "2")]
     V2,
+}
+
+#[derive(JsonSchema, Serialize)]
+enum SyntaxHelpLoadingStatus {
+    #[serde(rename = "loading")]
+    Loading,
+}
+
+/// The answer while the platform help is still being loaded.
+pub(crate) fn syntax_help_loading() -> CallToolResult {
+    let body = SyntaxHelpResponse::Loading {
+        schema_version: SyntaxHelpSchemaVersion::V2,
+        status: SyntaxHelpLoadingStatus::Loading,
+        phase: super::platform_help::LoadingPhase::PlatformHelp,
+        detail: super::platform_help::DETAIL.to_owned(),
+        retry_after_ms: super::platform_help::RETRY_AFTER_MS,
+        budget_exhausted: false,
+    };
+    let body = serde_json::to_value(body).expect("a fixed loading body serializes");
+    structured_with_text(super::platform_help::DETAIL.to_owned(), body)
 }
 
 #[derive(JsonSchema, Serialize)]

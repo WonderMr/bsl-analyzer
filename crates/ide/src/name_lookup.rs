@@ -940,6 +940,12 @@ impl<'q> Merge<'q> {
             self.report(shape.id, self.query.workspace);
             return;
         }
+        // An application may load the platform help in the background. Until it is in, a
+        // read would hold the whole lookup, while every other source can answer now.
+        if shape.id == ProviderId::Platform && bsl_platform::platform_help_pending() {
+            self.report(shape.id, ProviderState::NotReady);
+            return;
+        }
         let provider = shape.id;
         let found = collect(self);
         // The provider's own loops carry checkpoints; this pass over what it returned

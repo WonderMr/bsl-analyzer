@@ -115,6 +115,30 @@ pub(crate) fn docs_not_ready(action: &str) -> CallToolResult {
     )
 }
 
+/// The answer of an action that reads the platform help — `find_docs`, `search_docs`,
+/// `list_platform` — while the server is still loading it: the action's `not_ready`
+/// envelope, marked with the phase that holds it back.
+pub(crate) fn platform_help_not_ready(action: &str) -> CallToolResult {
+    use crate::tools::platform_help::{DETAIL, PHASE, RETRY_AFTER_MS};
+
+    let schema_version = match action {
+        // Not an indexed action: its answers carry a version of their own.
+        "list_platform" => "1",
+        _ => super::types::search_schema_version(action),
+    };
+    crate::tools::response::structured_with_text(
+        DETAIL.to_owned(),
+        json!({
+            "action": action,
+            "schema_version": schema_version,
+            "status": "not_ready",
+            "phase": PHASE,
+            "detail": DETAIL,
+            "retry_after_ms": RETRY_AFTER_MS,
+        }),
+    )
+}
+
 /// The `not_ready` retry envelope for a query that arrived while the deferred baseline
 /// connect is still running. Distinct from the `baseline_unavailable` config errors: the
 /// agent should simply retry in a few seconds, not go fix configuration or restart.
