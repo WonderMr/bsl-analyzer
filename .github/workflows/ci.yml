@@ -832,6 +832,7 @@ jobs:
             broker::transport::
             broker::daemon::shared_tests::
             broker::daemon::idle_boundary_tests::
+            graph::build::tests::callers_in_forms_outside_the_project_are_distinct_and_addressable
           )
           run_tests -p mcp-server --lib -- "${mcp_server_filters[@]}"
       - name: MCP transports, broker and baselines
@@ -1160,7 +1161,7 @@ jobs:
             return "$missing"
           }
           run_tests -p ide-diagnostics --lib -- handlers::typo::tests:: single_pass::tests:: handlers::rewrite_method_parameter::tests:: config::tests::
-      - name: Selective baseline path security
+      - name: Selective baseline path security and graph ids outside the workspace
         shell: bash
         run: |
           set -euo pipefail
@@ -1204,7 +1205,7 @@ jobs:
             return "$missing"
           }
           run_tests -p project-model -- partitioned_baseline_path_security
-          run_tests -p ide -- selective_loader_rejects_unsafe_enabled_paths_and_links
+          run_tests -p ide -- selective_loader_rejects_unsafe_enabled_paths_and_links graph::tests::encoder_and_method_graph_id_agree_outside_the_workspace
       - name: Shared workspace host
         shell: bash
         run: |
