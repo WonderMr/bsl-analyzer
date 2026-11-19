@@ -554,6 +554,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                     };
                     let mut settings = mcp_server::SessionConfig::default();
                     native.install(&mut settings, &executor_slots)?;
+                    server.shared_state().warm_reference_indexes(&context.enable_tools);
                     for tool in context.enable_tools {
                         settings.enable_tool(tool);
                     }

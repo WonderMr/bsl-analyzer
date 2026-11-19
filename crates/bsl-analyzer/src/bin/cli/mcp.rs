@@ -1566,6 +1566,7 @@ fn build_server(
             }
             configure_named_onec_connections(&mut state)?;
             state.warm_start();
+            state.warm_reference_indexes(&enable_tools);
             state
         }
         mcp_server::McpProfile::Reference => mcp_server::SharedState::reference(source_dir),

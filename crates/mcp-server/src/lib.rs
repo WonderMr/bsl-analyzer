@@ -2671,6 +2671,12 @@ impl McpServer {
             "references",
             ct,
             move |session| {
+                // The background warm-up is building the same indexes the line below would:
+                // answering now would mean running the rest of it inside this call, minutes
+                // on a large configuration, so the call is told to come back instead.
+                if let Some(report) = session.name_warm_report() {
+                    return Ok(tools::references::loading(&report));
+                }
                 // Before the read that folds them: the name indexes' per-file halves,
                 // warmed in chunks with a trim between, so a cold index is built from
                 // memos instead of holding every workspace file's syntax tree at once.
@@ -6618,6 +6624,132 @@ mod module_members_warm_up {
             test_support::fan_out_pool_is_raised(&diag),
             "a name that missed warmed the symbol trees before folding them"
         );
+        server.shutdown();
+    }
+}
+
+/// While the background warm-up builds the name indexes, `references` answers the loading
+/// envelope instead of running the rest of the warm-up inside the call, and the other
+/// readers of the resident keep answering from it.
+#[cfg(test)]
+mod reference_name_warm_up {
+    use super::*;
+    use crate::diagnostics_state::{test_support, DiagnosticsState};
+
+    const DECLARED: &str = "Сервер.Считать";
+
+    fn stand() -> (tempfile::TempDir, McpServer, DiagnosticsState) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache).unwrap();
+        test_support::join_load(state.diagnostics());
+        let diag = state.diagnostics().clone();
+        (dir, McpServer::new(McpProfile::Workspace, state), diag)
+    }
+
+    fn token() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn inline(response: rmcp::model::CallToolResponse) -> serde_json::Value {
+        match response {
+            rmcp::model::CallToolResponse::Complete(result) => {
+                result.structured_content.expect("a structured body")
+            }
+            _ => panic!("a caller that declared no task extension is answered inline"),
+        }
+    }
+
+    fn references_params(symbol: &str) -> Parameters<ReferencesParams> {
+        Parameters(ReferencesParams {
+            symbol: Some(symbol.to_owned()),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            line_content: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            kinds: Vec::new(),
+            include_declaration: None,
+            limit: None,
+            max_files: None,
+            include_preview: None,
+            max_output_tokens: None,
+        })
+    }
+
+    fn symbol_params(symbol: &str) -> Parameters<SymbolInfoParams> {
+        Parameters(SymbolInfoParams {
+            symbol: Some(symbol.to_owned()),
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            include: Vec::new(),
+            member_kind: None,
+            member_name: None,
+            locale: None,
+            max_output_tokens: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn references_answers_the_loading_envelope_while_the_name_indexes_warm() {
+        let _walk_serial = crate::walk_probe::WALK_GATE.lock().await;
+        let (_dir, server, diag) = stand();
+        let warming = diag.begin_name_warm_for_test();
+
+        let held = inline(
+            server
+                .references(references_params(DECLARED), token(), tasks::TaskCapable(false))
+                .await
+                .expect("the loading envelope is an answer, not an error"),
+        );
+        assert_eq!(held["status"], "loading", "{held}");
+        assert_eq!(held["state"], "loading", "{held}");
+        assert!(held.get("outcome").is_none(), "no reference answer was computed: {held}");
+
+        let card = inline(
+            server
+                .symbol_info(symbol_params(DECLARED), token(), tasks::TaskCapable(false))
+                .await
+                .expect("symbol_info reads the resident while the warm-up runs"),
+        );
+        assert_eq!(card["status"], "ok", "symbol_info is not held by the warm-up: {card}");
+
+        diag.end_name_warm_for_test(warming);
+        let answered = inline(
+            server
+                .references(references_params(DECLARED), token(), tasks::TaskCapable(false))
+                .await
+                .expect("references answers once the warm-up has ended"),
+        );
+        assert_eq!(answered["outcome"], "resolved", "{answered}");
+        server.shutdown();
+    }
+
+    /// A cancelled call is never handed an envelope, the warm-up's included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_references_call_gets_no_warm_up_envelope() {
+        let _walk_serial = crate::walk_probe::WALK_GATE.lock().await;
+        let (_dir, server, diag) = stand();
+        let warming = diag.begin_name_warm_for_test();
+        let cancelled = token();
+        cancelled.cancel();
+
+        let outcome = server
+            .references(references_params(DECLARED), cancelled, tasks::TaskCapable(false))
+            .await;
+        if let Ok(rmcp::model::CallToolResponse::Complete(result)) = &outcome {
+            let body = result.structured_content.clone().unwrap_or_default();
+            assert_ne!(body["status"], "loading", "a cancelled call got the envelope: {body}");
+        }
+        diag.end_name_warm_for_test(warming);
         server.shutdown();
     }
 }
