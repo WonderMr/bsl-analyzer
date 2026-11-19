@@ -2045,7 +2045,9 @@ fn adopting_extension() -> RootDatabaseImpl {
                     unread_module_file: None,
                 },
             ],
-            roles: vec![RoleEntry { name: "ЧтениеДанных".to_string(), main: ids[4], rights: None }],
+            roles: vec![RoleEntry {
+                name: "ЧтениеДанных".to_string(), main: ids[4], rights: None
+            }],
             event_subscriptions: vec![EventSubscriptionEntry {
                 name: "ПриЗаписи".to_string(),
                 main: ids[5],
