@@ -855,7 +855,10 @@ impl GlobalState {
         if excluded.is_empty() {
             return;
         }
-        tracing::info!(count = excluded.len(), "evicting sources taken out by [source].exclude");
+        tracing::info!(
+            count = excluded.len(),
+            "evicting sources taken out by [source].exclude, exclude_globs or git's ignore rules"
+        );
         for (file_id, _) in &excluded {
             self.open_files.remove(file_id);
             if let Some(token) = self.preload_tokens.remove(file_id) {
