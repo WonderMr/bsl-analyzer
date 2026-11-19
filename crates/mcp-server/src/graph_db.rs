@@ -485,6 +485,19 @@ impl GraphDbWriter {
         Ok(())
     }
 
+    /// Persist the scopes of the modules subscriptions and jobs name as handlers' modules into
+    /// a single `meta` row (`handler_module_scopes`, newline-joined). The incremental planner
+    /// reads it to send a handler module that gains an export to the full build.
+    pub(crate) fn write_handler_module_scopes(&mut self, scopes: &[String]) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('handler_module_scopes', ?1)",
+                params![scopes.join("\n")],
+            )
+            .context("writing handler module scopes")?;
+        Ok(())
+    }
+
     /// Persist the module-located-but-unresolved qualified/manager call sites into the
     /// `unresolved_calls` reverse index. The PK dedups repeated call sites, so the
     /// content is order-independent. Used by the incremental fast path to find callers
@@ -1311,6 +1324,7 @@ pub(crate) fn build_graph_database_inner(
     let file_rows = file_rows?;
     writer.write_files(&file_rows)?;
     writer.write_casing_variants(&summary.casing_variant_objects)?;
+    writer.write_handler_module_scopes(&summary.handler_module_scopes)?;
     writer.write_unresolved_calls(&summary.unresolved_calls)?;
 
     writer.finalize(meta)?;
@@ -2638,6 +2652,8 @@ fn write_body_patch(
         casing_variant_objects: rows.casing_variant_objects.clone(),
         // The reprojected modules' unresolved refs were refreshed in the patch above.
         unresolved_calls: rows.unresolved_calls.clone(),
+        // A patch never changes which modules handlers name: those edits take a full build.
+        handler_module_scopes: Vec::new(),
     })
 }
 
@@ -2788,6 +2804,14 @@ fn plan_caller_delta(
     // where the two spellings could differ at all.
     let was_unread: std::collections::HashSet<bsl_search::FileKey> =
         read_unread_keys_strict(conn)?.into_iter().collect();
+    // The modules subscriptions and jobs name as handlers' modules. An artefact without the
+    // row predates it, so every common module counts as one there.
+    let handler_scopes: Option<std::collections::HashSet<String>> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'handler_module_scopes'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .map(|value| value.lines().filter(|line| !line.is_empty()).map(str::to_owned).collect());
 
     let mut index_callers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (file, profile) in sig_changed {
@@ -2864,6 +2888,14 @@ fn plan_caller_delta(
         let added: Vec<&String> =
             profile.exported_lower.iter().filter(|n| !old_exported.contains(*n)).collect();
         if !added.is_empty() {
+            // A handler module that gains an export may complete a subscription's or a
+            // scheduled job's handler edge. That edge has no caller in code for the reverse
+            // index to name, and only the full build projects it.
+            if let Some(folded) = ide::folded_common_scope_for_path(file) {
+                if handler_scopes.as_ref().is_none_or(|scopes| scopes.contains(&folded)) {
+                    return Ok(None);
+                }
+            }
             let Some(scope) = ide::scope_for_path(file) else {
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
@@ -3477,6 +3509,50 @@ mod tests {
                 plan.is_none(),
                 "a signature change to a `{kind}` handler module must force a full rebuild"
             );
+        }
+    }
+
+    /// A module that a subscription or a scheduled job names as its handler's module and that
+    /// gains an export may now complete the handler edge, which no caller in code points the
+    /// reverse index at: the planner must send it to the full build. The control is the same
+    /// change in a module no handler names, which stays on the caller-delta path.
+    #[test]
+    fn caller_delta_bails_when_a_handler_module_gains_an_export() {
+        for (handler_scopes, full_build) in [("common/x", true), ("common/другой", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bsl-graph.db");
+
+            let mut handler = method_node("method/common/X/Обработчик", "Обработчик");
+            handler.is_export = Some(false);
+            let mut w = GraphDbWriter::create(&path).unwrap();
+            w.write_nodes(&[handler]).unwrap();
+            w.finalize(&GraphMeta {
+                revision: 1,
+                fingerprint: GraphFp { files: 1, topology: 0 },
+                files: 1,
+                built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
+            })
+            .unwrap();
+            open(&path)
+                .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+                .unwrap();
+            open(&path)
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('handler_module_scopes', ?1)",
+                    params![handler_scopes],
+                )
+                .unwrap();
+
+            let profile = ModuleProfile {
+                sig_hash: 999,
+                exported_lower: std::iter::once("обработчик".to_owned()).collect(),
+                has_collision: false,
+                unread: false,
+            };
+            let changed = [("CommonModules/X/Ext/Module.bsl", &profile)];
+            let plan = caller_delta_plan(&path, &changed, None).unwrap();
+            assert_eq!(plan.is_none(), full_build, "handler modules {handler_scopes:?}: {plan:?}");
         }
     }
 

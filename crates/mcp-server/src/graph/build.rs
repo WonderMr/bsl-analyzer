@@ -2822,6 +2822,8 @@ fn catch_up_straddled_candidate(
                 .caller_delta_plan(&refs, project.search_roots.as_ref())
                 .map_err(LoadFailure::operation)?
             else {
+                // The plan wants a full build; resuming the candidate would only ask again.
+                pending.resumable = false;
                 return Ok(None);
             };
             reprojection.extend(callers);

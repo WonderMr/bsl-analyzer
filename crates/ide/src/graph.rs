@@ -21,12 +21,13 @@ use bsl_metadata::MdoType;
 use code_chunk::{base_chunk_name, ChunkKind, Chunker};
 use hir::call_graph::{EdgeKind, MethodDispatch};
 use hir::graph_index::{
-    display_scope, encode_scope, form_qualified_prefix, form_scope, project_batch_call_edges,
-    project_batch_form_edges, project_batch_query_edges, project_form_binding_edges,
-    project_workspace_catalog_edges, project_workspace_register_records_edges,
-    project_workspace_role_edges, project_workspace_scheduled_job_edges,
-    project_workspace_subscription_edges, project_workspace_subsystem_edges, EdgeRow,
-    GraphBuildState, GraphIndex, GraphRowEncoder, NodeRow,
+    display_scope, encode_scope, form_qualified_prefix, form_scope, metadata_handler_module_scopes,
+    project_batch_call_edges, project_batch_form_edges, project_batch_query_edges,
+    project_form_binding_edges, project_workspace_catalog_edges,
+    project_workspace_register_records_edges, project_workspace_role_edges,
+    project_workspace_scheduled_job_edges, project_workspace_subscription_edges,
+    project_workspace_subsystem_edges, EdgeRow, GraphBuildState, GraphIndex, GraphRowEncoder,
+    NodeRow,
 };
 use hir::{
     module_key_for_path, ConfigsDatabase, DefDatabase, GraphNode, MethodId, ModuleId, ModuleIndex,
@@ -569,6 +570,11 @@ pub struct GraphBuildSummary {
     /// reverse index that lets an incremental rebuild find callers that would newly
     /// resolve when a target module gains (or exports) a method.
     pub unresolved_calls: Vec<(String, String, String)>,
+    /// The folded durable scopes (`common/<module>`) of the modules that event subscriptions
+    /// and scheduled jobs name as their handlers' modules. Persisted so an incremental
+    /// rebuild takes the full build when such a module gains an export: the handler edge it
+    /// may complete is projected by the full build only.
+    pub handler_module_scopes: Vec<String>,
 }
 
 /// A per-batch persistence sink: it receives one batch's freshly-encoded node and
@@ -1363,6 +1369,7 @@ pub fn build_workspace_graph_rows(
         let edges =
             project_workspace_scheduled_job_edges(&db, first[0].file_id, &index, &mut state);
         emit(&edges, &mut summary, &mut seen_aux, sink)?;
+        summary.handler_module_scopes = metadata_handler_module_scopes(&db, first[0].file_id);
     }
 
     // Phase G — `subsystem_membership` edges: each subsystem → its member objects and

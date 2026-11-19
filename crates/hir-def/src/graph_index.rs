@@ -1735,6 +1735,29 @@ pub fn project_workspace_scheduled_job_edges<DB: ConfigsDatabase>(
     )
 }
 
+/// The common modules that event subscriptions and scheduled jobs name as their handlers'
+/// modules, as folded durable scopes (`common/<module>`), whether or not the handler
+/// resolves. An incremental rebuild reads them: such a module that gains an export may
+/// complete a handler edge, and only the full build projects handler edges.
+pub fn metadata_handler_module_scopes<DB: ConfigsDatabase>(
+    db: &DB,
+    representative: FileId,
+) -> Vec<String> {
+    let subscriptions = db
+        .enumerate_event_subscriptions(representative)
+        .into_iter()
+        .filter_map(|sub| sub.parse_handler().map(|handler| handler.module_name));
+    let jobs = db
+        .enumerate_scheduled_jobs(representative)
+        .into_iter()
+        .filter_map(|job| job.parse_handler().map(|handler| handler.module_name));
+    let mut scopes: Vec<String> =
+        subscriptions.chain(jobs).map(|module| format!("common/{}", module.fold_lower())).collect();
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
 /// Link each metadata object to the exported common-module method its configuration
 /// names as the handler: `handlers` holds `(object, module, method)` as written in the
 /// metadata, and `(mdo_type, kind)` say which node the edge leaves and how it is labelled.
