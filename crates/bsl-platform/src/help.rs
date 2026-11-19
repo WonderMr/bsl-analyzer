@@ -7,6 +7,11 @@
 //! selects is served the corpus named by [`CORPUS_ENV`], or the built-in
 //! interface facts. Switching the source afterwards requires a restart.
 //!
+//! An application that loads the source in the background announces the load
+//! first with [`begin_platform_help_load`]: until it installs, lookups wait for
+//! it rather than fix the library default, and [`platform_help_pending`] lets a
+//! caller answer "not ready" instead of waiting.
+//!
 //! The built-in facts are the structured interface of the released platform —
 //! names, signatures, parameters, types, versions, execution contexts — without
 //! any of 1C's descriptive texts (`data/PROVENANCE.md`). They are the floor
@@ -15,6 +20,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::global_catalog::PlatformVersion;
 use crate::snapshot::PlatformSnapshot;
@@ -434,6 +440,44 @@ pub fn install_platform_help(help: PlatformHelp) -> Result<InstallOutcome, Resta
 /// The source the process serves, once fixed (by installation or first access).
 pub fn active_platform_help_request() -> Option<&'static PlatformHelpRequest> {
     crate::db::installed_request()
+}
+
+/// A load of the process snapshot in flight, announced by [`begin_platform_help_load`].
+///
+/// While it lives and nothing is installed, every lookup waits for the installation
+/// instead of fixing the library default. Dropping it ends the announcement; a load that
+/// installed nothing because its thread panicked leaves the built-in facts installed with
+/// that reason.
+#[derive(Debug)]
+#[must_use = "the load is announced only while the guard lives"]
+pub struct PlatformHelpLoad {
+    _announced: (),
+}
+
+impl Drop for PlatformHelpLoad {
+    fn drop(&mut self) {
+        crate::db::end_load(std::thread::panicking());
+    }
+}
+
+/// Announces that this process is loading its snapshot, before the load starts, so the
+/// application can serve while it runs: lookups wait for the load, and
+/// [`platform_help_pending`] tells a caller that would rather not wait. The guard moves to
+/// the thread that loads and installs.
+pub fn begin_platform_help_load() -> PlatformHelpLoad {
+    crate::db::begin_load();
+    PlatformHelpLoad { _announced: () }
+}
+
+/// Whether an announced load is still running: a lookup now would wait for it.
+pub fn platform_help_pending() -> bool {
+    crate::db::load_pending()
+}
+
+/// Waits for an announced load to install its snapshot, at most `timeout` when one is
+/// given. Returns whether no load is pending any more; `false` only when the time ran out.
+pub fn wait_for_platform_help(timeout: Option<Duration>) -> bool {
+    crate::db::wait_for_load(timeout)
 }
 
 #[cfg(test)]

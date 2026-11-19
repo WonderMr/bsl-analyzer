@@ -10,10 +10,23 @@ use crate::types::{
 use once_cell::sync::OnceCell;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use stdx::case::CaseExt;
 
 static PLATFORM_DATA_SINGLETON: OnceCell<PlatformDataInner> = OnceCell::new();
+
+/// Loads of the process snapshot announced with [`begin_load`] and not yet ended. While one
+/// is in flight and nothing is installed, a reader waits for the installation: the source
+/// the application selected is on its way, and fixing the library default in its place
+/// would serve the whole process the wrong help.
+static LOADS_IN_FLIGHT: Mutex<usize> = Mutex::new(0);
+/// Woken when a snapshot is installed and when an announced load ends.
+static LOAD_SETTLED: Condvar = Condvar::new();
+
+/// Why the built-in facts serve when the thread loading the configured source panicked.
+const LOAD_PANICKED: &str =
+    "the platform help load stopped with a panic before it installed a corpus";
 
 pub const GLOBAL_CONTEXT_OWNER: &str = "Global context";
 
@@ -23,13 +36,66 @@ pub(crate) fn install(help: PlatformHelp) -> Result<InstallOutcome, RestartRequi
         return compare_active(active, help.request);
     }
     let requested = help.request.clone();
-    match PLATFORM_DATA_SINGLETON.set(PlatformDataInner::from_help(help)) {
+    let outcome = match PLATFORM_DATA_SINGLETON.set(PlatformDataInner::from_help(help)) {
         Ok(()) => Ok(InstallOutcome::Installed),
         Err(_) => compare_active(
             PLATFORM_DATA_SINGLETON.get().expect("a failed set means a value is present"),
             requested,
         ),
+    };
+    // Under the lock, so a reader that has just found nothing installed is either already
+    // waiting or sees the snapshot when it takes the lock.
+    let _loads = loads_in_flight();
+    LOAD_SETTLED.notify_all();
+    outcome
+}
+
+fn loads_in_flight() -> MutexGuard<'static, usize> {
+    // The guarded value is a counter that no code path leaves half-updated.
+    LOADS_IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub(crate) fn begin_load() {
+    *loads_in_flight() += 1;
+}
+
+/// Ends one announced load. A load whose thread panicked before installing anything would
+/// otherwise leave the next reader to fix the library default without a word, so the
+/// built-in facts are installed with the reason instead.
+pub(crate) fn end_load(panicked: bool) {
+    if panicked && PLATFORM_DATA_SINGLETON.get().is_none() {
+        let reason = Some(LOAD_PANICKED.to_owned());
+        let _ = install(PlatformHelp::bundled(PlatformHelpRequest::Unselected, reason));
     }
+    let mut loads = loads_in_flight();
+    *loads = loads.saturating_sub(1);
+    LOAD_SETTLED.notify_all();
+}
+
+/// Whether an announced load has installed nothing yet.
+pub(crate) fn load_pending() -> bool {
+    PLATFORM_DATA_SINGLETON.get().is_none() && *loads_in_flight() > 0
+}
+
+/// Waits while an announced load has installed nothing, at most `timeout` when one is given.
+/// Returns whether the wait ended because no such load is left: `false` only on timeout.
+pub(crate) fn wait_for_load(timeout: Option<Duration>) -> bool {
+    // A timeout too large to add to the clock is no limit at all.
+    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let mut loads = loads_in_flight();
+    while *loads > 0 && PLATFORM_DATA_SINGLETON.get().is_none() {
+        loads = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                LOAD_SETTLED.wait_timeout(loads, left).unwrap_or_else(PoisonError::into_inner).0
+            }
+            None => LOAD_SETTLED.wait(loads).unwrap_or_else(PoisonError::into_inner),
+        };
+    }
+    true
 }
 
 fn compare_active(
@@ -116,8 +182,15 @@ pub struct PlatformDataInner {
 
 impl PlatformDataInner {
     /// The process snapshot. Without a prior [`crate::install_platform_help`] the
-    /// first access fixes [`PlatformHelp::unselected`].
+    /// first access fixes [`PlatformHelp::unselected`] — unless a load announced with
+    /// [`crate::begin_platform_help_load`] is in flight: then the access waits for that
+    /// load to install its snapshot. A load always ends (a source that cannot serve
+    /// installs a missing selection), so the wait is as long as the load.
     pub fn instance() -> &'static Self {
+        if let Some(data) = PLATFORM_DATA_SINGLETON.get() {
+            return data;
+        }
+        wait_for_load(None);
         PLATFORM_DATA_SINGLETON.get_or_init(|| {
             let help = PlatformHelp::unselected();
             // The corpus-contract suite asserts on the texts of its pinned
