@@ -319,7 +319,7 @@ pub struct ReferencesResult {
     /// outcome other than an ambiguity the quoted line produced.
     pub anchor_sites: Vec<AnchorSite>,
     /// The owner a `NotFound` name addresses — a common module, a metadata object — when no
-    /// loaded root declares it and the project loads no main configuration that could. The
+    /// loaded root holds it as its own and the project loads no main configuration. The
     /// name may then be declared in the configuration that is not loaded, so the answer is
     /// no proof that it does not exist. `None` for every other outcome.
     pub unloaded_owner: Option<String>,

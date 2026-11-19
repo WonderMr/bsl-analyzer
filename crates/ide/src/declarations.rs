@@ -12,10 +12,13 @@
 //! object module of every metadata object, so a three-segment name could not be
 //! told apart by it.
 
+use bsl_metadata::{MdObject, ObjectBelonging};
 use hir::{
-    module_key_for_path, parse_form_module_path, DefDatabase, FormKey, ModuleId, ModuleKey, Name,
+    module_key_for_path, parse_form_module_path, DefDatabase, FormKey, MetadataReferenceKind,
+    ModuleId, ModuleKey, Name,
 };
 use ide_db::base_db::{Locale, SourceDatabase, SourceRootId, BSL_SOURCE_ROOT};
+use ide_db::metadata::{self, MetadataListingInput, WorkspaceConfigsSnapshot};
 use ide_db::RootDatabaseImpl;
 use stdx::case::CaseExt;
 use syntax::TextRange;
@@ -178,72 +181,190 @@ pub fn resolve_declarations(db: &RootDatabaseImpl, name: &str) -> Vec<Declaratio
 }
 
 /// The owner a qualified name addresses — the common module of `Модуль.Член`, the object of
-/// `Тип.Объект` and of `Тип.Объект.Член` — when no loaded root declares it and the project
-/// loads no main configuration that could.
+/// `Тип.Объект` and of `Тип.Объект.Член` — when the project loads no main configuration and
+/// no loaded root holds that owner as its own.
 ///
 /// An extension, or an external data processor, calls into the configuration it was written
 /// for. When that configuration is not part of the project, a name of it resolves to nothing,
 /// and "no declaration found" is then no evidence that the name has none: the reader would
-/// take it for "nobody declares it, so nobody calls it". `None` whenever the absence is
-/// conclusive — the main configuration is loaded, or some loaded root declares the owner — and
-/// for a name of any other shape. A project that declares no root at all says nothing about
-/// which configuration it was written for, and is left alone too.
+/// take it for "nobody declares it, so nobody calls it". An owner the extensions only adopt
+/// belongs to that configuration too: the adopted copy repeats the members it intercepts,
+/// and every other member is declared where the copy came from.
 ///
-/// The owner is looked for both as a module body and in the metadata listings, so a module
-/// declared without a readable body still counts as declared.
+/// `None` whenever the absence is conclusive — the main configuration is loaded, or a loaded
+/// root holds the owner as its own — and for a name of any other shape. A project that
+/// declares no root at all says nothing about which configuration it was written for, and is
+/// left alone too. A two-segment name is read both as `Тип.Объект` and as `Модуль.Член`; it
+/// is about an absent owner only when neither reading names an owner a loaded root holds.
 pub fn owner_outside_loaded_configurations(db: &RootDatabaseImpl, name: &str) -> Option<String> {
     let roots = db.workspace_configs_snapshot();
     if roots.paths.is_empty() || roots.has_base() {
         return None;
     }
     let segments: Vec<&str> = name.split('.').map(str::trim).filter(|s| !s.is_empty()).collect();
-    let (owner, spelled) = match segments.as_slice() {
-        // `Тип.Объект` names the object itself, `Модуль.Член` a member of the module.
-        [first, second] => match typed_owner(first, second) {
-            Some(owner) => (owner, format!("{first}.{second}")),
-            None => (Owner::Common { name: first.fold_lower() }, (*first).to_string()),
+    let readings: Vec<(Addressed, String)> = match segments.as_slice() {
+        [first, second] => {
+            let spelled = format!("{first}.{second}");
+            let typed = addressed_by_type(first, second).map(|it| (it, spelled));
+            let module = Addressed::Owner(Owner::Common { name: first.fold_lower() });
+            typed.into_iter().chain([(module, (*first).to_string())]).collect()
+        }
+        [mdo, object, _] => match addressed_by_type(mdo, object)? {
+            // A role, a subscription or a subsystem has no members to name.
+            Addressed::Family(..) => return None,
+            owner => vec![(owner, format!("{mdo}.{object}"))],
         },
-        [mdo, object, _] => (typed_owner(mdo, object)?, format!("{mdo}.{object}")),
         _ => return None,
     };
+    if readings.iter().any(|(addressed, _)| held_as_own(db, &roots, addressed)) {
+        return None;
+    }
+    readings.into_iter().next().map(|(_, spelled)| spelled)
+}
+
+/// What the leading segments of a qualified name address.
+enum Addressed {
+    /// A common module or a data object: it has module bodies and a listing entry.
+    Owner(Owner),
+    /// A role, a subscription, a scheduled job, a service or a subsystem, by folded name: each
+    /// family has a listing field of its own, and no module to declare members in.
+    Family(MetadataReferenceKind, String),
+}
+
+/// `Тип.Объект` read with the type first: the module for `ОбщийМодуль`, a listing family for
+/// the kinds kept outside the object entries, the metadata object for every other type.
+/// `None` when the first segment names no metadata type.
+fn addressed_by_type(kind: &str, object: &str) -> Option<Addressed> {
+    let name = object.fold_lower();
+    let word = kind.fold_lower();
+    let family = MetadataReferenceKind::ALL
+        .iter()
+        .copied()
+        .find(|family| {
+            word == family.russian_singular().fold_lower()
+                || word == family.english_singular().fold_lower()
+        })
+        .or_else(|| MetadataReferenceKind::from_plural(kind));
+    if let Some(family) = family {
+        return Some(Addressed::Family(family, name));
+    }
+    Some(Addressed::Owner(match parse_mdo_type(kind)? {
+        bsl_metadata::MdoType::CommonModule => Owner::Common { name },
+        mdo_type => Owner::Object { mdo_type, name },
+    }))
+}
+
+/// Whether a loaded root holds the addressed owner as its own. An owner every loaded root
+/// holds only as an adopted copy is not held: its own declaration is in the configuration the
+/// copy extends. A kind the listings cannot describe counts as held, so no reason is claimed
+/// blind.
+fn held_as_own(
+    db: &RootDatabaseImpl,
+    roots: &WorkspaceConfigsSnapshot,
+    addressed: &Addressed,
+) -> bool {
+    let owner = match addressed {
+        Addressed::Family(family, name) => {
+            return roots.paths.iter().any(|(_, root)| {
+                db.metadata_listing(&root.to_string_lossy())
+                    .is_some_and(|listing| family_lists(db, listing, *family, name))
+            });
+        }
+        Addressed::Owner(owner) => owner,
+    };
+    if let Owner::Object { mdo_type, .. } = owner {
+        if !bsl_metadata::MdoType::all().contains(mdo_type) {
+            return true;
+        }
+    }
+
+    // The roots that hold the owner only as an adopted copy: a body of it there is the
+    // extension's interceptor, not the owner's declaration.
+    let mut adopting_roots = Vec::new();
+    for (index, (_, root)) in roots.paths.iter().enumerate() {
+        let Some(listing) = db.metadata_listing(&root.to_string_lossy()) else { continue };
+        match listed_belonging(db, listing, owner) {
+            Some(ObjectBelonging::Adopted) => adopting_roots.push(index),
+            Some(_) => return true,
+            None => {}
+        }
+    }
 
     let source_root = db.source_root_input(ROOT).root(db);
     let file_set = source_root.file_set();
     for file_id in source_root.iter() {
         db.unwind_if_revision_cancelled();
         let Some(path) = file_set.path_for_file(&file_id) else { continue };
-        let path = path.as_path().to_string_lossy().replace('\\', "/");
-        if module_key_for_path(&path).is_some_and(|key| owner.rank_of(&key).is_some()) {
-            return None;
-        }
-    }
-
-    for (_, root) in &roots.paths {
-        let Some(listing) = db.metadata_listing(&root.to_string_lossy()) else { continue };
-        let declared = match &owner {
-            Owner::Common { name } => {
-                listing.common_modules(db).iter().any(|entry| entry.name.fold_lower() == *name)
-            }
-            Owner::Object { mdo_type, name } => {
-                let entries = listing.entries(db);
-                let mut of_kind = entries.iter().filter(|entry| entry.kind == *mdo_type);
-                of_kind.any(|entry| entry.name.fold_lower() == *name)
-            }
+        let path = path.as_path();
+        let Some(key) = module_key_for_path(&path.to_string_lossy().replace('\\', "/")) else {
+            continue;
         };
-        if declared {
-            return None;
+        if owner.rank_of(&key).is_none() {
+            continue;
+        }
+        // A body with no listing behind it says nothing about belonging; it counts as own.
+        if !roots.owner_of_path(path).is_some_and(|index| adopting_roots.contains(&index)) {
+            return true;
         }
     }
-    Some(spelled)
+    false
 }
 
-/// The owner a `Тип.Объект` pair names: the module for `ОбщийМодуль`, the metadata object for
-/// every other type. `None` when the first segment names no metadata type.
-fn typed_owner(mdo: &str, object: &str) -> Option<Owner> {
-    Some(match parse_mdo_type(mdo)? {
-        bsl_metadata::MdoType::CommonModule => Owner::Common { name: object.fold_lower() },
-        mdo_type => Owner::Object { mdo_type, name: object.fold_lower() },
-    })
+/// How one root's listing holds the owner, `None` when it does not list it. An object whose
+/// metadata cannot be read counts as the root's own.
+fn listed_belonging(
+    db: &RootDatabaseImpl,
+    listing: MetadataListingInput,
+    owner: &Owner,
+) -> Option<ObjectBelonging> {
+    let belonging = match owner {
+        Owner::Common { name } => {
+            let modules = listing.common_modules(db);
+            let entry = modules.iter().find(|entry| entry.name.fold_lower() == *name)?;
+            metadata::resolve_common_module(db, listing, entry.name.clone())
+                .map(|module| module.object_belonging())
+        }
+        Owner::Object { mdo_type, name } => {
+            let entries = listing.entries(db);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.kind == *mdo_type && entry.name.fold_lower() == *name)?;
+            if mdo_type.is_register() {
+                metadata::resolve_register(db, listing, *mdo_type, entry.name.clone())
+                    .map(|register| register.object_belonging())
+            } else {
+                metadata::resolve_metadata_object(db, listing, *mdo_type, entry.name.clone())
+                    .map(|object| object.object_belonging())
+            }
+        }
+    };
+    Some(belonging.unwrap_or(ObjectBelonging::Own))
+}
+
+/// Whether one root's listing names an object of `family` called `name` (folded).
+fn family_lists(
+    db: &RootDatabaseImpl,
+    listing: MetadataListingInput,
+    family: MetadataReferenceKind,
+    name: &str,
+) -> bool {
+    let named = |entry: &str| entry.fold_lower() == name;
+    match family {
+        MetadataReferenceKind::Role => listing.roles(db).iter().any(|e| named(&e.name)),
+        MetadataReferenceKind::EventSubscription => {
+            listing.event_subscriptions(db).iter().any(|e| named(&e.name))
+        }
+        MetadataReferenceKind::ScheduledJob => {
+            listing.scheduled_jobs(db).iter().any(|e| named(&e.name))
+        }
+        MetadataReferenceKind::HttpService => {
+            listing.http_services(db).iter().any(|e| named(&e.name))
+        }
+        MetadataReferenceKind::WebService => {
+            listing.web_services(db).iter().any(|e| named(&e.name))
+        }
+        MetadataReferenceKind::Subsystem => listing.subsystems(db).iter().any(|e| named(&e.name)),
+    }
 }
 
 /// Keep the best-ranked declaration per object and put them in file order — the

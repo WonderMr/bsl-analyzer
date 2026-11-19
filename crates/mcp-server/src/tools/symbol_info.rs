@@ -656,7 +656,8 @@ pub(crate) fn render_not_found(
             ReasonCode::UnreadableFiles,
             "some workspace files could not be read, so the search was not exhaustive",
         )
-        .when_owner_unloaded(unloaded_owner);
+        // Only a miss with no candidate is "nothing found here"; an ambiguous one found some.
+        .when_owner_unloaded(unloaded_owner.filter(|_| status == "not_found"));
     body.insert(
         "hint".into(),
         json!(
@@ -1580,6 +1581,22 @@ mod tests {
             .find(|reason| reason["code"] == "owning_configuration_missing")
             .expect("the unloaded configuration is a reason");
         assert!(reason["detail"].as_str().unwrap().contains("`ОбщегоНазначения`"), "{reason}");
+
+        // An ambiguous miss found candidates, so "nothing found here" is not said of it.
+        let found = ide::NameLookupResult { total: 2, ..found };
+        let answer = crate::tools::name_answer::NameAnswer::render(
+            analysis.database(),
+            Some(&roots),
+            &found,
+        );
+        let result = render_not_found("ОбщегоНазначения.Метод", answer, owner, &stamp(&roots));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["status"], "ambiguous");
+        let reasons = body["freshness"]["completeness"]["reasons"].clone();
+        assert!(
+            !reasons.to_string().contains("owning_configuration_missing"),
+            "an ambiguous miss carries no unloaded-owner reason: {reasons}"
+        );
     }
 
     /// И16 where the graph's verdict is an INPUT: a resident miss is answered by the

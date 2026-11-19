@@ -285,8 +285,8 @@ reason_code! {
     /// The configuration the subject belongs to is not part of the project: a file of an
     /// external data processor or report analyzed without the configuration it was written
     /// for, whose calls into that configuration are reported as unresolved; or a name whose
-    /// module or object no loaded root declares while the project loads no main
-    /// configuration, so finding nothing about it proves nothing.
+    /// module or object no loaded root holds as its own (absent, or only adopted) while the
+    /// project loads no main configuration, so finding nothing about it proves nothing.
     OwningConfigurationMissing => "owning_configuration_missing";
 }
 
@@ -346,7 +346,7 @@ impl Completeness {
     }
 
     /// Record that the name answered about belongs to `owner`, a module or object no loaded
-    /// configuration declares (see `ide::owner_outside_loaded_configurations`). One wording
+    /// configuration holds as its own (see `ide::owner_outside_loaded_configurations`). One wording
     /// for every tool that resolves names, so a consumer reads the same fact the same way.
     pub fn when_owner_unloaded(self, owner: Option<&str>) -> Self {
         match owner {
@@ -354,9 +354,9 @@ impl Completeness {
                 true,
                 ReasonCode::OwningConfigurationMissing,
                 format!(
-                    "`{owner}` is declared by no loaded configuration and the project loads no \
-                     main configuration; the name may be declared there, so finding nothing \
-                     here is no proof that it does not exist"
+                    "`{owner}` is not declared as its own by any loaded configuration and the \
+                     project loads no main configuration; the name may be declared there, so \
+                     finding nothing here is no proof that it does not exist"
                 ),
             ),
             None => self,
