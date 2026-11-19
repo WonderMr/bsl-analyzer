@@ -155,12 +155,18 @@ fn resolve_variable_texts(
             return None;
         };
         let def_texts = resolve_template_texts(*value, body, reaching_defs, assign_stmt_id, depth)?;
-        if texts.as_ref().is_some_and(|known| *known != def_texts) {
+        if texts.as_ref().is_some_and(|known| !same_texts(known, &def_texts)) {
             return None;
         }
         texts = Some(def_texts);
     }
     texts
+}
+
+/// Whether two lists of distinct texts hold the same texts: `?(...)` branches and `НСтр`
+/// translations may come in another order in another assignment.
+fn same_texts(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && left.iter().all(|text| right.contains(text))
 }
 
 pub fn from_hir(range: LocalRange, ctx: &AnalysisContext) -> Option<Diagnostic<LocalRange>> {
@@ -477,6 +483,9 @@ mod tests {
                   severity: Blocker
                 IncorrectUseOfStrTemplate @ 29:23..29:37
                   message: Template 'Document' requires 0 parameters but 1 provided
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 35:23..35:34
+                  message: Template 'Документ' requires 0 parameters but 1 provided
                   severity: Blocker"#]],
         );
     }
