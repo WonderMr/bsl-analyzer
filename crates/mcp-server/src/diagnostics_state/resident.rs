@@ -643,15 +643,17 @@ impl DiagnosticsResident {
     /// lock once per chunk so the readers queued behind it wait for a chunk, not for the
     /// whole workspace. The chunks are planned once ([`Self::warm_chunks`]) and the
     /// resident may change between two of them: a file the drift has removed since is
-    /// skipped, because its id no longer names a source the database can read.
-    pub(crate) fn warm_name_indexes_of(&mut self, files: &[FileId]) {
+    /// skipped, because its id no longer names a source the database can read. Reports
+    /// whether the chunk ran to its end: `false` when `cancel` stopped it.
+    pub(crate) fn warm_name_indexes_of(
+        &mut self,
+        files: &[FileId],
+        cancel: &RequestCancel,
+    ) -> bool {
         let live: std::collections::HashSet<FileId> = self.by_path.values().copied().collect();
         let files: Vec<FileId> = files.iter().copied().filter(|id| live.contains(id)).collect();
-        let _ = self.warm_chunk(
-            &RequestCancel::default(),
-            &files,
-            &|analysis: &Analysis, file_id: FileId| analysis.warm_name_indexes(&[file_id]),
-        );
+        let job = |analysis: &Analysis, file_id: FileId| analysis.warm_name_indexes(&[file_id]);
+        self.warm_chunk(cancel, &files, &job)
     }
 
     /// Warm only the symbol trees `module_members` folds — what `graph resolve` and a
@@ -3234,6 +3236,45 @@ mod trim_tests {
         assert!(state.name_warm_report().is_some(), "the replaced warm-up ended nothing");
         state.end_name_warm_for_test(current);
         assert!(state.name_warm_report().is_none(), "the current one ended its own");
+    }
+
+    /// The warm-up in flight is cancelled by the warm-up that replaces it and by the
+    /// shutdown, so its chunk stops at the next query instead of holding the resident
+    /// until the chunk ends.
+    #[test]
+    fn a_replacing_warm_up_and_the_shutdown_cancel_the_warm_up_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+        state.begin_name_warm_for_test();
+        let replaced = state.name_warm_cancel_for_test().expect("a warm-up runs");
+        state.begin_name_warm_for_test();
+        let current = state.name_warm_cancel_for_test().expect("a warm-up runs");
+        assert!(replaced.is_cancelled(), "the replaced warm-up is told to stop");
+        assert!(!current.is_cancelled(), "the control: the current one runs on");
+
+        state.shutdown();
+
+        assert!(current.is_cancelled(), "the shutdown stops the current one too");
+    }
+
+    /// A cancelled chunk reports that it did not run to its end, which is what ends the
+    /// background warm-up between two chunks.
+    #[test]
+    fn a_cancelled_chunk_reports_that_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+        let cancel = RequestCancel::default();
+        cancel.cancel_all();
+
+        let ran = ready(state.read_mut(|resident, _| {
+            let chunk = resident.warm_chunks().remove(0);
+            resident.warm_name_indexes_of(&chunk, &cancel)
+        }));
+
+        assert!(!ran, "a cancelled chunk ran to its end");
+        assert_eq!(name_index_memos(&state), (0, 0), "and memoised nothing");
     }
 
     /// The chunked warm-up never holds more than the interactive window of syntax
