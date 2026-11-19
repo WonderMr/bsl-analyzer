@@ -141,8 +141,8 @@ MCP error с `reasonCode`; `list_platform` и `syntax_help` читают вст�
 - `symbol_info`, `references` и `diagnostics` с действиями `file`, `snippet`, `workspace` —
   конверт резидентной базы со `status: "loading"`, каким бы ни было собственное состояние
   базы (`state`): типы и платформенные члены читаются из справки;
-- `graph(action=resolve)` и подсказки `symbol_info` при промахе отвечают без платформенных
-  кандидатов, а источник `platform` в `providers[]` имеет состояние `not_ready`.
+- `graph(action=resolve)` отвечает без платформенных кандидатов, а источник `platform` в
+  `providers[]` имеет состояние `not_ready`.
 
 Остальные инструменты справку не ждут: `outline`, `metadata`, `query`, `search_code`,
 действия `status`, `schema`, `catalog` отвечают как обычно, а если им нужна резидентная
