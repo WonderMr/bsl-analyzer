@@ -307,6 +307,12 @@ mod tests {
                 "&Instead(\"F\")",
             ),
             (
+                "&Around(\"F\")\nFunction Ext1_F()\nEndFunction",
+                AnnotationKind::Instead,
+                "F",
+                "&Around(\"F\")",
+            ),
+            (
                 "&ИзменениеИКонтроль(\"Ф\")\nФункция Расш1_Ф()\nВозврат 1;\nКонецФункции",
                 AnnotationKind::ChangeAndValidate,
                 "Ф",
