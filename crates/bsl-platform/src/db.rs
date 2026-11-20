@@ -61,11 +61,14 @@ pub(crate) fn begin_load() {
 
 /// Ends one announced load. A load whose thread panicked before installing anything would
 /// otherwise leave the next reader to fix the library default without a word, so the
-/// built-in facts are installed with the reason instead.
+/// built-in facts are installed with the reason instead. They are installed as the `bundled`
+/// source, not as the unselected library default: the application did select a source, it
+/// is not the one serving, and any configured source now differs from the active one, so a
+/// reload is told a restart is needed.
 pub(crate) fn end_load(panicked: bool) {
     if panicked && PLATFORM_DATA_SINGLETON.get().is_none() {
         let reason = Some(LOAD_PANICKED.to_owned());
-        let _ = install(PlatformHelp::bundled(PlatformHelpRequest::Unselected, reason));
+        let _ = install(PlatformHelp::bundled(PlatformHelpRequest::Bundled, reason));
     }
     let mut loads = loads_in_flight();
     *loads = loads.saturating_sub(1);
