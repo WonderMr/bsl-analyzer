@@ -360,7 +360,7 @@ fn issue441_graph_projection_hash(path: &Path) -> String {
     hash_table(
         &mut hasher,
         &connection,
-        "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses",
+        "SELECT from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception FROM edges ORDER BY from_id,to_id,kind,provenance,call_start,call_end,call_absent,crosses,interception",
     );
     hasher.finalize().to_hex().to_string()
 }

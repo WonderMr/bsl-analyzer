@@ -10,9 +10,13 @@
 //! later increments (`hir-ty`). Like the rest of the pure engine it is free of any
 //! database / Salsa dependency so the recognition can be unit-tested in isolation.
 
-use syntax::{SyntaxKind, SyntaxNode};
+use syntax::{
+    ast::{self, AstNode},
+    SyntaxKind, SyntaxNode, TextRange,
+};
 
-use crate::extension_merge::annotation_first_string_arg;
+use crate::extension_merge::{annotation_first_string_arg, annotation_string_param};
+use crate::item_tree::AnnotationKind;
 use crate::symbol_tree::MethodSymbol;
 
 /// Interned identity of a *weaving* extension module: the (ext, base) file pair whose
@@ -66,6 +70,41 @@ pub fn interceptor_target(method: &SyntaxNode) -> Option<Interception> {
 
     KINDS.into_iter().find_map(|(ann_kind, kind)| {
         annotation_first_string_arg(method, ann_kind).map(|target| Interception { kind, target })
+    })
+}
+
+/// The annotation through which an extension method takes over a base method, of any of
+/// the four kinds: the three weaving annotations and `&ИзменениеИКонтроль`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterceptionAnnotation {
+    /// [`AnnotationKind::Before`], [`AnnotationKind::After`], [`AnnotationKind::Instead`] or
+    /// [`AnnotationKind::ChangeAndValidate`].
+    pub kind: AnnotationKind,
+    /// Name of the base method the annotation names.
+    pub target: String,
+    /// The whole annotation with its argument: `&Вместо("M")`.
+    pub range: TextRange,
+}
+
+/// Recognize the interception annotation `method` carries and the base method it names.
+///
+/// Unlike [`interceptor_target`] it covers `&ИзменениеИКонтроль` too, and unlike
+/// [`crate::extension_merge::extract_change_and_validate`] it asks nothing of the body: a
+/// `&ИзменениеИКонтроль` whose markers do not balance still names the method it takes over.
+/// `None` when the method carries none of the four, or the annotation's first argument is
+/// not a string literal. A method carrying more than one is malformed BSL; the first in the
+/// source wins.
+pub fn interception_annotation(method: &SyntaxNode) -> Option<InterceptionAnnotation> {
+    method.children().filter_map(ast::Annotation::cast).find_map(|annotation| {
+        let kind = match annotation.kind_token()?.kind() {
+            SyntaxKind::ANN_AROUND => AnnotationKind::Instead,
+            SyntaxKind::ANN_BEFORE => AnnotationKind::Before,
+            SyntaxKind::ANN_AFTER => AnnotationKind::After,
+            SyntaxKind::ANN_CHANGE_AND_VALIDATE => AnnotationKind::ChangeAndValidate,
+            _ => return None,
+        };
+        let target = annotation_string_param(&annotation)?;
+        Some(InterceptionAnnotation { kind, target, range: annotation.syntax().text_range() })
     })
 }
 
@@ -233,6 +272,76 @@ mod tests {
     fn missing_target_string_is_rejected() {
         let m = method_node("&Вместо()\nПроцедура Расш1_М()\nКонецПроцедуры");
         assert_eq!(interceptor_target(&m), None);
+    }
+
+    fn annotation_of(code: &str) -> Option<(AnnotationKind, String, String)> {
+        let m = method_node(code);
+        interception_annotation(&m).map(|a| (a.kind, a.target, code[a.range].to_owned()))
+    }
+
+    #[test]
+    fn every_interception_annotation_names_its_target_and_its_place() {
+        for (code, kind, target, written) in [
+            (
+                "&НаСервере\n&Вместо(\"М\")\nПроцедура Расш1_М()\nКонецПроцедуры",
+                AnnotationKind::Instead,
+                "М",
+                "&Вместо(\"М\")",
+            ),
+            (
+                "&Перед(\"ПриЗаписи\")\nПроцедура Расш1_ПриЗаписи(Отказ)\nКонецПроцедуры",
+                AnnotationKind::Before,
+                "ПриЗаписи",
+                "&Перед(\"ПриЗаписи\")",
+            ),
+            (
+                "&After(\"F\")\nProcedure Ext1_F()\nEndProcedure",
+                AnnotationKind::After,
+                "F",
+                "&After(\"F\")",
+            ),
+            (
+                "&Instead(\"F\")\nFunction Ext1_F()\nEndFunction",
+                AnnotationKind::Instead,
+                "F",
+                "&Instead(\"F\")",
+            ),
+            (
+                "&Around(\"F\")\nFunction Ext1_F()\nEndFunction",
+                AnnotationKind::Instead,
+                "F",
+                "&Around(\"F\")",
+            ),
+            (
+                "&ИзменениеИКонтроль(\"Ф\")\nФункция Расш1_Ф()\nВозврат 1;\nКонецФункции",
+                AnnotationKind::ChangeAndValidate,
+                "Ф",
+                "&ИзменениеИКонтроль(\"Ф\")",
+            ),
+        ] {
+            assert_eq!(
+                annotation_of(code),
+                Some((kind, target.to_owned(), written.to_owned())),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn change_and_validate_with_unbalanced_markers_still_names_its_target() {
+        let code = "&ИзменениеИКонтроль(\"М\")\nПроцедура Расш1_М()\n#Вставка\nКонецПроцедуры";
+        assert_eq!(crate::extension_merge::extract_change_and_validate(&method_node(code)), None);
+        assert_eq!(
+            annotation_of(code).map(|(kind, target, _)| (kind, target)),
+            Some((AnnotationKind::ChangeAndValidate, "М".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_method_without_a_named_target_intercepts_nothing() {
+        assert_eq!(annotation_of("&НаСервере\nПроцедура Обычная()\nКонецПроцедуры"), None);
+        assert_eq!(annotation_of("&Вместо()\nПроцедура Расш1_М()\nКонецПроцедуры"), None);
+        assert_eq!(annotation_of("&Перед(&Ann(\"М\"))\nПроцедура Расш1_М()\nКонецПроцедуры"), None);
     }
 
     fn method(is_function: bool, params: &[(&str, bool)]) -> MethodSymbol {
