@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.5";
+pub const CONTRACT_VERSION: &str = "3.6";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -168,7 +168,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "graph",
         actions: GRAPH_ACTIONS,
         note: None,
-        output_schema_version: Some("36"),
+        output_schema_version: Some("37"),
         default_enabled: true,
     },
     ToolDecl {
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.5");
+        assert_eq!(CONTRACT_VERSION, "3.6");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -616,7 +616,7 @@ mod tests {
             assert!(!validator.is_valid(&body), "alternative branch must not bypass indexing");
         }
         let graph_schema = crate::tools::graph::schema().structured_content.unwrap();
-        assert_eq!(graph_schema["schema_version"], "36");
+        assert_eq!(graph_schema["schema_version"], "37");
         assert!(validator.is_valid(&graph_schema));
     }
 
@@ -963,7 +963,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.5",
+              "contract_version": "3.6",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -1747,7 +1747,7 @@ mod tests {
                         ],
                         "name": "graph",
                         "output_schema_fingerprint": "blake3:4d966d91520f2b5fc5b52b7a030dc11f6b0796bca427688d904199b098fa1184",
-                        "output_schema_version": "36",
+                        "output_schema_version": "37",
                         "params": [
                           {
                             "name": "action",

@@ -10,6 +10,7 @@ use crate::body::{
     Body, BodyDiagnostic, ExternalRef, MagicNumberContext, ManagerType, RedundantAccessKind,
 };
 use crate::hir::{BinaryOp, Expr, ExprIdx, Literal, UnaryOp};
+use crate::str_template::{constant_template_texts, is_str_template_name, is_wrong_str_template};
 use crate::Name;
 
 use super::diagnostics::{is_deprecated_method, is_followed_by_loop_exit};
@@ -517,7 +518,7 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
             });
         }
 
-        if is_str_template_method(&name) {
+        if is_str_template_name(&name) {
             is_str_template_call = true;
         }
 
@@ -614,13 +615,15 @@ fn lower_call_expr(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
 
     if is_str_template_call {
         if let (Some(arg_list), Some(&template_arg)) = (&arg_list_node, args.first()) {
-            if let Some(template_string) = constant_template_text(ctx, template_arg) {
+            // A template that reads a variable is checked in `ide-diagnostics`, which
+            // resolves the variable through reaching definitions.
+            if let Some(texts) = constant_template_texts(&ctx.body, template_arg) {
                 let param_count = arg_list
                     .children_with_tokens()
                     .filter(|el| el.as_token().is_some_and(|t| t.kind() == SyntaxKind::COMMA))
                     .count();
 
-                if is_wrong_str_template(&template_string, param_count) {
+                if texts.iter().any(|text| is_wrong_str_template(&text.text, param_count)) {
                     ctx.emit(BodyDiagnostic::IncorrectUseOfStrTemplate {
                         range: node.text_range(),
                     });
@@ -1702,153 +1705,6 @@ fn check_using_external_code_tools(
     {
         ctx.emit(BodyDiagnostic::UsingExternalCodeTools { range: call_node.text_range() });
     }
-}
-
-fn is_str_template_method(name: &str) -> bool {
-    let lower = name.fold_lower();
-    matches!(lower.as_str(), "стршаблон" | "strtemplate")
-}
-
-fn is_wrong_str_template(template_string: &str, used_params_count: usize) -> bool {
-    let is_wrong_call = compare_template_and_params(template_string, used_params_count);
-    if !is_wrong_call {
-        return false;
-    }
-
-    let cleaned = remove_double_percent(template_string);
-    compare_template_and_params(&cleaned, used_params_count)
-}
-
-fn remove_double_percent(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
-            i += 2;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
-}
-
-fn parse_placeholder(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
-    if pos >= bytes.len() || bytes[pos] != b'%' {
-        return None;
-    }
-
-    let start = pos + 1;
-    if start >= bytes.len() {
-        return None;
-    }
-
-    if bytes[start] == b'(' {
-        let num_start = start + 1;
-        let mut num_end = num_start;
-        while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
-            num_end += 1;
-        }
-        if num_end > num_start && num_end < bytes.len() && bytes[num_end] == b')' {
-            let num_str = std::str::from_utf8(&bytes[num_start..num_end]).ok()?;
-            let num: usize = num_str.parse().ok()?;
-            return Some((num, num_end - pos + 1));
-        }
-        return None;
-    }
-
-    let mut num_end = start;
-    while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
-        num_end += 1;
-    }
-    if num_end > start {
-        let num_str = std::str::from_utf8(&bytes[start..num_end]).ok()?;
-        let num: usize = num_str.parse().ok()?;
-        return Some((num, num_end - pos));
-    }
-
-    None
-}
-
-#[allow(clippy::nonminimal_bool)]
-fn compare_template_and_params(template_string: &str, used_params_count: usize) -> bool {
-    let bytes = template_string.as_bytes();
-    let have_params = used_params_count > 0;
-
-    let mut has_valid_placeholder = false;
-    let mut has_wrong_number = false;
-    let mut used_placeholders = [false; 11];
-
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-                i += 2;
-                continue;
-            }
-
-            if let Some((num, len)) = parse_placeholder(bytes, i) {
-                if (1..=10).contains(&num) {
-                    has_valid_placeholder = true;
-                    used_placeholders[num] = true;
-                    if num > used_params_count {
-                        return true;
-                    }
-                } else {
-                    has_wrong_number = true;
-                }
-                i += len;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    if has_wrong_number {
-        return true;
-    }
-    if has_valid_placeholder && !have_params {
-        return true;
-    }
-    if !has_valid_placeholder && have_params {
-        return true;
-    }
-
-    if has_valid_placeholder {
-        for &used in used_placeholders.iter().take(used_params_count + 1).skip(1) {
-            if !used {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// The text of a `СтрШаблон` template built from string literals alone: a literal, `НСтр`
-/// of one, or a `+` of such parts. Any other part (a variable, `Символы.ПС`, a call) may
-/// carry markers of its own, so such a template has no text to check.
-fn constant_template_text(ctx: &LoweringCtx, expr: ExprIdx) -> Option<String> {
-    match ctx.body.expr_idx(expr) {
-        Expr::Literal(Literal::String(text)) => Some(text.clone()),
-        Expr::BinaryOp { lhs, rhs, op: BinaryOp::Add } => {
-            let mut text = constant_template_text(ctx, *lhs)?;
-            text.push_str(&constant_template_text(ctx, *rhs)?);
-            Some(text)
-        }
-        Expr::Call { callee, args } if is_nstr_callee(ctx, *callee) => {
-            constant_template_text(ctx, *args.first()?)
-        }
-        _ => None,
-    }
-}
-
-fn is_nstr_callee(ctx: &LoweringCtx, callee: ExprIdx) -> bool {
-    let Expr::Path(name) = ctx.body.expr_idx(callee) else {
-        return false;
-    };
-    matches!(name.as_str().fold_lower().as_str(), "нстр" | "nstr")
 }
 
 fn check_find_element_first_arg(args: &[ExprIdx], ctx: &LoweringCtx) -> bool {

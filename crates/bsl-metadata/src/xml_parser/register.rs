@@ -73,6 +73,7 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
                 &mut attributes,
                 &object_name,
                 periodicity_str.as_deref(),
+                recorder_subordinate,
             );
         }
         MdoType::AccumulationRegister => {
