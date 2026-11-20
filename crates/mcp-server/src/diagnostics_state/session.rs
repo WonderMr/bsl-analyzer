@@ -269,6 +269,18 @@ impl ResidentSession {
         self.diag.status_report()
     }
 
+    /// The report a `references` loading envelope is rendered from while the background
+    /// name-index warm-up runs ([`DiagnosticsState::name_warm_report`]), `None` otherwise.
+    ///
+    /// A cancelled request unwinds here, as it does at a read: the envelope is an answer,
+    /// and a cancelled call is never handed one.
+    pub(crate) fn name_warm_report(&self) -> Option<super::types::StatusReport> {
+        if self.cancel.is_cancelled() {
+            std::panic::resume_unwind(Box::new(salsa::Cancelled::Local));
+        }
+        self.diag.name_warm_report()
+    }
+
     /// The answer to a read that came back `Failed`, taken from ONE lifecycle snapshot.
     ///
     /// The read and the snapshot are two moments, and the state can move on between them: a

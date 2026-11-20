@@ -1160,6 +1160,18 @@ impl SharedState {
         self.diagnostics.ensure_loading();
     }
 
+    /// When `references` is among `enabled_tools`, build the name indexes it folds in the
+    /// background after every resident publication, and start the resident build if none
+    /// is running. A cold `references` call otherwise parses every workspace file inside
+    /// the call, minutes on a large configuration; with the warm-up its calls answer the
+    /// loading envelope until the indexes are built. A serve path calls this once per
+    /// launch or session; later calls change nothing. No-op for any other tool set.
+    pub fn warm_reference_indexes(&self, enabled_tools: &[String]) {
+        if enabled_tools.iter().any(|tool| tool == "references") {
+            self.diagnostics.warm_name_indexes_after_publish();
+        }
+    }
+
     pub(crate) fn diagnostics(&self) -> &DiagnosticsState {
         &self.diagnostics
     }

@@ -609,6 +609,12 @@ pub(crate) fn build_scope(root: &Path, base: &str) -> ScopeBuild {
 const SWEEP_CHUNK: stdx::batch::BatchBudget =
     stdx::batch::BatchBudget::files(500).with_bytes(32 << 20);
 
+/// Files and source bytes the background name-index warm-up takes one hold of the resident
+/// lock for. Far below a sweep chunk: every reader queued behind the warm-up waits for the
+/// chunk in hand, and on a loaded machine a sweep chunk takes tens of seconds to parse.
+const BACKGROUND_WARM_CHUNK: stdx::batch::BatchBudget =
+    stdx::batch::BatchBudget::files(64).with_bytes(4 << 20);
+
 impl DiagnosticsResident {
     /// Evict memos beyond their interactive caps and drop the parser's thread-local
     /// green-node caches on the sweep pool. The freed pages are left to the allocator:
@@ -639,6 +645,23 @@ impl DiagnosticsResident {
         self.warm_per_file(cancel, |analysis, file_id| analysis.warm_name_indexes(&[file_id]));
     }
 
+    /// One chunk of [`Self::warm_name_indexes`], for a warm-up that takes the resident
+    /// lock once per chunk so the readers queued behind it wait for a chunk, not for the
+    /// whole workspace. The chunks are planned once ([`Self::background_warm_chunks`]) and the
+    /// resident may change between two of them: a file the drift has removed since is
+    /// skipped, because its id no longer names a source the database can read. Reports
+    /// whether the chunk ran to its end: `false` when `cancel` stopped it.
+    pub(crate) fn warm_name_indexes_of(
+        &mut self,
+        files: &[FileId],
+        cancel: &RequestCancel,
+    ) -> bool {
+        let live: std::collections::HashSet<FileId> = self.by_path.values().copied().collect();
+        let files: Vec<FileId> = files.iter().copied().filter(|id| live.contains(id)).collect();
+        let job = |analysis: &Analysis, file_id: FileId| analysis.warm_name_indexes(&[file_id]);
+        self.warm_chunk(cancel, &files, &job)
+    }
+
     /// Warm only the symbol trees `module_members` folds — what `graph resolve` and a
     /// `symbol_info` miss read through `lookup_names`. The name sets `references`
     /// also needs are left cold: they are read by nothing on these paths and hold
@@ -656,48 +679,71 @@ impl DiagnosticsResident {
         cancel: &RequestCancel,
         job: impl Fn(&Analysis, FileId) + Send + Sync,
     ) {
+        for chunk in self.chunks_within(SWEEP_CHUNK) {
+            if !self.warm_chunk(cancel, &chunk, &job) {
+                return;
+            }
+        }
+    }
+
+    /// Every resident file, in the chunks the background warm-up takes the resident lock
+    /// for, one at a time ([`Self::warm_name_indexes_of`]).
+    pub(crate) fn background_warm_chunks(&self) -> Vec<Vec<FileId>> {
+        self.chunks_within(BACKGROUND_WARM_CHUNK)
+    }
+
+    /// Every resident file, by file id, in chunks within `budget` of files and of bytes on
+    /// disk.
+    fn chunks_within(&self, budget: stdx::batch::BatchBudget) -> Vec<Vec<FileId>> {
+        let mut files: Vec<(FileId, &str)> =
+            self.by_path.iter().map(|(path, id)| (*id, path.as_str())).collect();
+        files.sort_by_key(|(id, _)| id.0);
+        stdx::batch::chunks_by_budget(
+            &files,
+            |(_, path)| std::fs::metadata(path).map_or(0, |meta| meta.len()),
+            budget,
+        )
+        .into_iter()
+        .map(|chunk| chunk.iter().map(|(id, _)| *id).collect())
+        .collect()
+    }
+
+    /// Run `job` over one chunk of files on the fan-out pool, then trim. Reports whether the
+    /// chunk ran to its end: `false` when the request was cancelled, in which case the trim
+    /// is left to the read's own.
+    fn warm_chunk<J>(&mut self, cancel: &RequestCancel, chunk: &[FileId], job: &J) -> bool
+    where
+        J: Fn(&Analysis, FileId) + Send + Sync,
+    {
         use rayon::prelude::*;
         use std::panic::AssertUnwindSafe;
 
-        // Owned paths, not borrows of the table: the trim between chunks takes the
-        // resident mutably.
-        let mut files: Vec<(FileId, String)> =
-            self.by_path.iter().map(|(path, id)| (*id, path.clone())).collect();
-        files.sort_by_key(|(id, _)| id.0);
-        let chunks = stdx::batch::chunks_by_budget(
-            &files,
-            |(_, path)| std::fs::metadata(path).map_or(0, |meta| meta.len()),
-            SWEEP_CHUNK,
-        );
-        for &chunk in &chunks {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let seed = SweepWorker::new(self.db.database().clone());
-            let job = &job;
-            let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
-                chunk.par_iter().try_for_each_with(seed, |worker, (file_id, _)| {
-                    let file_id = *file_id;
-                    let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
-                    if !worker.registered {
-                        cancel.register(salsa::Database::cancellation_token(
-                            worker.analysis.database(),
-                        ));
-                        worker.registered = true;
-                    }
-                    if cancel.is_cancelled() {
-                        return Err(salsa::Cancelled::Local);
-                    }
-                    salsa::Cancelled::catch(AssertUnwindSafe(|| job(&worker.analysis, file_id)))
-                })
-            });
-            match outcome {
-                Ok(()) => {}
-                Err(salsa::Cancelled::Local) => return,
-                Err(other) => std::panic::resume_unwind(Box::new(other)),
-            }
-            self.trim_between_chunks();
+        if cancel.is_cancelled() {
+            return false;
         }
+        let seed = SweepWorker::new(self.db.database().clone());
+        let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
+            chunk.par_iter().try_for_each_with(seed, |worker, file_id| {
+                let file_id = *file_id;
+                let _no_nesting = stdx::par_guard::enter_no_nested_parallelism();
+                if !worker.registered {
+                    cancel
+                        .register(salsa::Database::cancellation_token(worker.analysis.database()));
+                    worker.registered = true;
+                }
+                if cancel.is_cancelled() {
+                    return Err(salsa::Cancelled::Local);
+                }
+                salsa::Cancelled::catch(AssertUnwindSafe(|| job(&worker.analysis, file_id)))
+            })
+        });
+        match outcome {
+            Ok(()) => {}
+            Err(salsa::Cancelled::Local) => return false,
+            Err(other) => std::panic::resume_unwind(Box::new(other)),
+        }
+        self.trim_between_chunks();
+        true
     }
 
     /// Run `f` on a database handle this request owns: the handle is cloned here, its
@@ -3131,6 +3177,134 @@ mod trim_tests {
             (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
         }));
         assert_eq!(after, (MODULES, 0), "every file's symbol tree, no name set");
+    }
+
+    fn name_index_memos(state: &DiagnosticsState) -> (usize, usize) {
+        ready(state.read(|resident, _| {
+            (memos(resident, "SymbolTree>"), memos(resident, "FileNameUsage>"))
+        }))
+    }
+
+    fn wait_for_name_indexes(state: &DiagnosticsState, what: &str) {
+        super::super::test_support::wait_until(what, || match name_index_memos(state) {
+            (MODULES, MODULES) => Ok(()),
+            counts => Err(counts),
+        });
+        super::super::test_support::wait_until("the warm-up lowers its flag", || {
+            state.name_warm_report().map_or(Ok(()), |report| Err(report.elapsed_ms))
+        });
+    }
+
+    /// Asked for before the build, the warm-up runs after the publication without any
+    /// `references` call: every file's symbol tree and name set is memoised by the time it
+    /// lowers its flag.
+    #[test]
+    fn a_resident_published_after_the_ask_warms_its_name_indexes_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+
+        state.warm_name_indexes_after_publish();
+        wait_ready(&state);
+
+        wait_for_name_indexes(&state, "the background warm-up memoises both halves");
+    }
+
+    /// Asked for over a resident already served, the warm-up starts over that resident:
+    /// a session that attaches to a running daemon is not left waiting for a rebuild.
+    #[test]
+    fn asking_over_a_served_resident_warms_that_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+        assert_eq!(name_index_memos(&state), (0, 0), "the control: published cold");
+        assert!(state.name_warm_report().is_none(), "the control: nobody asked, nothing runs");
+
+        state.warm_name_indexes_after_publish();
+
+        wait_for_name_indexes(&state, "the warm-up over the served resident memoises both");
+    }
+
+    /// While a warm-up runs over a ready resident, `references` is told the resident is
+    /// still loading; a warm-up that a newer one replaced cannot lower the newer one's flag;
+    /// with the resident itself not ready, the resident's own state speaks.
+    #[test]
+    fn the_warm_up_report_belongs_to_the_warm_up_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let idle = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        let unbuilt = idle.begin_name_warm_for_test();
+        assert!(idle.name_warm_report().is_none(), "an idle resident reports its own state");
+        idle.end_name_warm_for_test(unbuilt);
+
+        let state = joined_state(dir.path());
+        let replaced = state.begin_name_warm_for_test();
+        let current = state.begin_name_warm_for_test();
+        let report = state.name_warm_report().expect("a warm-up runs");
+        assert_eq!(report.state, "loading");
+        assert!(report.elapsed_ms.is_some(), "the envelope says how long it has run");
+
+        state.end_name_warm_for_test(replaced);
+        assert!(state.name_warm_report().is_some(), "the replaced warm-up ended nothing");
+        state.end_name_warm_for_test(current);
+        assert!(state.name_warm_report().is_none(), "the current one ended its own");
+    }
+
+    /// The warm-up in flight is cancelled by the warm-up that replaces it and by the
+    /// shutdown, so its chunk stops at the next query instead of holding the resident
+    /// until the chunk ends.
+    #[test]
+    fn a_replacing_warm_up_and_the_shutdown_cancel_the_warm_up_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+        state.begin_name_warm_for_test();
+        let replaced = state.name_warm_cancel_for_test().expect("a warm-up runs");
+        state.begin_name_warm_for_test();
+        let current = state.name_warm_cancel_for_test().expect("a warm-up runs");
+        assert!(replaced.is_cancelled(), "the replaced warm-up is told to stop");
+        assert!(!current.is_cancelled(), "the control: the current one runs on");
+
+        state.shutdown();
+
+        assert!(current.is_cancelled(), "the shutdown stops the current one too");
+    }
+
+    /// The background warm-up holds the resident for a small chunk at a time, and its
+    /// chunks cover every resident file once.
+    #[test]
+    fn the_background_warm_up_plans_small_chunks_over_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+
+        let chunks = ready(state.read(|resident, _| resident.background_warm_chunks()));
+
+        assert!(chunks.len() > 1, "{MODULES} modules fit no single background chunk");
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 64), "a chunk over the budget");
+        let mut files: Vec<FileId> = chunks.into_iter().flatten().collect();
+        files.sort_by_key(|id| id.0);
+        files.dedup();
+        assert_eq!(files.len(), MODULES, "every file once");
+    }
+
+    /// A cancelled chunk reports that it did not run to its end, which is what ends the
+    /// background warm-up between two chunks.
+    #[test]
+    fn a_cancelled_chunk_reports_that_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+        let cancel = RequestCancel::default();
+        cancel.cancel_all();
+
+        let ran = ready(state.read_mut(|resident, _| {
+            let chunk = resident.background_warm_chunks().remove(0);
+            resident.warm_name_indexes_of(&chunk, &cancel)
+        }));
+
+        assert!(!ran, "a cancelled chunk ran to its end");
+        assert_eq!(name_index_memos(&state), (0, 0), "and memoised nothing");
     }
 
     /// The chunked warm-up never holds more than the interactive window of syntax

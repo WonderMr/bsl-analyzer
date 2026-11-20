@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use vfs::VfsPath;
 
+use crate::cancel::RequestCancel;
 use crate::change_hub::{Health, SinkCursor, WorkspaceChangeHub};
 use crate::graph::input::{db_for_files_lazy, ProjectSnapshot};
 
@@ -163,14 +164,72 @@ fn publish_build_failure(inner: &mut Inner, message: String) {
     inner.status = DiagnosticsStatus::Failed(message);
 }
 
+/// The background warm-up of the name indexes `references` folds.
+///
+/// A cold `references` call parses every workspace file to build them, which on a large
+/// configuration is minutes inside one call. The indexes are a pure function of the
+/// resident, so once a served `references` asks for them they are built after every
+/// publication instead, one chunk per hold of the resident lock: the other readers wait
+/// for a chunk, not for the workspace.
+#[derive(Default)]
+pub(super) struct NameWarm {
+    /// Raised by [`DiagnosticsState::warm_name_indexes_after_publish`], never lowered: the
+    /// tool that reads the indexes is served for the life of the state.
+    wanted: bool,
+    /// Bumped by every warm-up that starts. A warm-up clears `since` only under its own
+    /// epoch, so one that a newer publication replaced cannot end the newer one's.
+    epoch: u64,
+    /// When the warm-up in flight started; `None` when none is running.
+    since: Option<Instant>,
+    /// The cancellation of the warm-up in flight. A shutdown cancels it, and so does the
+    /// warm-up that replaces it: either way the chunk on the fan-out pool stops at its next
+    /// query instead of running to its end.
+    cancel: Option<Arc<RequestCancel>>,
+}
+
+impl NameWarm {
+    /// Open a warm-up: a new epoch, its clock and its cancellation. The warm-up this one
+    /// replaces, if any, is cancelled.
+    fn open(&mut self) -> (u64, Arc<RequestCancel>) {
+        if let Some(replaced) = self.cancel.take() {
+            replaced.cancel_all();
+        }
+        let cancel = Arc::new(RequestCancel::default());
+        self.epoch = self.epoch.wrapping_add(1);
+        self.since = Some(Instant::now());
+        self.cancel = Some(Arc::clone(&cancel));
+        (self.epoch, cancel)
+    }
+}
+
 /// What a caller still needs after [`publish_build_success`] moved the built resident into
-/// the state: the scan roots the hub is re-armed on, and the two identity values that re-arm
-/// is guarded by.
+/// the state: the scan roots the hub is re-armed on, the two identity values that re-arm
+/// is guarded by, and the name-index warm-up the publication opened, for the caller to
+/// spawn once it has let the state go.
 struct PublishTail {
     files: usize,
     scan_roots: Vec<PathBuf>,
     physical_topology: u64,
     declaration_epoch: u64,
+    name_warm: Option<OpenedNameWarm>,
+}
+
+/// A name-index warm-up opened and not yet handed to its thread. Dropped before
+/// [`DiagnosticsState::spawn_name_warm`] took it — the publishing thread unwound on the way —
+/// it ends its own epoch: a flag that no thread will lower would hold every `references` call
+/// on the envelope.
+struct OpenedNameWarm {
+    state: DiagnosticsState,
+    epoch: u64,
+    cancel: Option<Arc<RequestCancel>>,
+}
+
+impl Drop for OpenedNameWarm {
+    fn drop(&mut self) {
+        if self.cancel.is_some() {
+            self.state.finish_name_warm(self.epoch);
+        }
+    }
 }
 
 impl DiagnosticsState {
@@ -203,11 +262,16 @@ impl DiagnosticsState {
         inner.status = DiagnosticsStatus::Ready { files };
         *lock_recover(&self.last_access) = Instant::now();
         crate::workspace_handle::notify_generation(self, inner.generation);
+        // Opened together with `Ready`, under the same hold: a `references` call that reads
+        // the published resident before the worker is spawned meets the warm-up's envelope,
+        // not a cold index it would build inside the call.
+        let name_warm = self.open_name_warm();
         PublishTail {
             files,
             scan_roots: built.scan_roots,
             physical_topology: built.physical_topology,
             declaration_epoch: built.declaration_epoch,
+            name_warm,
         }
     }
 }
@@ -328,6 +392,8 @@ pub(crate) struct DiagnosticsState {
     pub(super) excluded: Vec<PathBuf>,
     pub(super) drift_interval: Duration,
     pub(super) eviction_after: Duration,
+    /// The name-index warm-up `references` asks for (see [`NameWarm`]).
+    pub(super) name_warm: Arc<Mutex<NameWarm>>,
     /// The daemon's filesystem change hub, when this profile has one. Drift is served
     /// event-driven (drain-on-read) while the hub is healthy, falling back to the
     /// throttled scan otherwise. `None` for reference/shared profiles and tests, which
@@ -532,6 +598,26 @@ impl DiagnosticsState {
     pub(crate) fn fail_for_test(&self, message: &str) {
         let mut inner = lock_inner(&self.inner);
         publish_build_failure(&mut inner, message.to_owned());
+    }
+
+    /// Raise the name-index warm-up flag the way a starting warm-up does, with no thread
+    /// behind it, so a test holds the window a `references` call meets it in for as long as
+    /// it needs. Returns the epoch [`Self::end_name_warm_for_test`] ends it under.
+    #[cfg(test)]
+    pub(crate) fn begin_name_warm_for_test(&self) -> u64 {
+        lock_recover(&self.name_warm).open().0
+    }
+
+    /// The cancellation of the warm-up in flight, for a test that asserts who cancels it.
+    #[cfg(test)]
+    pub(crate) fn name_warm_cancel_for_test(&self) -> Option<Arc<RequestCancel>> {
+        lock_recover(&self.name_warm).cancel.clone()
+    }
+
+    /// End the warm-up of `epoch` the way a finishing one does.
+    #[cfg(test)]
+    pub(crate) fn end_name_warm_for_test(&self, epoch: u64) {
+        self.finish_name_warm(epoch);
     }
 
     /// State the retry schedule this handle runs with, for a test whose subject is the
@@ -773,6 +859,7 @@ impl DiagnosticsState {
             excluded: Vec::new(),
             drift_interval: DRIFT_CHECK_INTERVAL,
             eviction_after: IDLE_EVICTION,
+            name_warm: Arc::new(Mutex::new(NameWarm::default())),
             change_hub: None,
             hub_cursor: Arc::new(Mutex::new(None)),
             force_scan: Arc::new(AtomicBool::new(false)),
@@ -892,6 +979,9 @@ impl DiagnosticsState {
     /// Stop the idle sweeper (called on server shutdown).
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(warm) = lock_recover(&self.name_warm).cancel.take() {
+            warm.cancel_all();
+        }
         let (stopped, wake) = &*self.shutdown_wake;
         *lock_recover(stopped) = true;
         wake.notify_all();
@@ -958,6 +1048,130 @@ impl DiagnosticsState {
                 }
                 None
             }
+        }
+    }
+
+    /// Warm the name indexes `references` folds in the background after every resident this
+    /// state publishes from now on, and after the one it serves now; start the build if none
+    /// has been started yet.
+    ///
+    /// The serve paths call this when `references` is among the served tools. A warm-up is
+    /// only ever ahead of the call that needs it: a `references` call that arrives while it
+    /// runs is answered with the loading envelope, and one that arrives with no warm-up
+    /// running (it ended early, say, because the resident was rebuilt under it) warms the
+    /// rest itself, as it always has.
+    ///
+    /// Only the FIRST ask starts a warm-up over a resident already served: every later
+    /// publication starts its own, and a second session attaching to a warm resident would
+    /// otherwise walk it again and hold its `references` calls on the envelope meanwhile.
+    pub(crate) fn warm_name_indexes_after_publish(&self) {
+        let first = !std::mem::replace(&mut lock_recover(&self.name_warm).wanted, true);
+        if first && matches!(self.status(), DiagnosticsStatus::Ready { .. }) {
+            self.start_name_warm();
+        }
+        self.ensure_loading();
+    }
+
+    /// While a background name-index warm-up runs over a ready resident, the snapshot a
+    /// `references` loading envelope is rendered from: the resident answers, but the answer
+    /// `references` would give now is the rest of the warm-up run inside the call. `None`
+    /// when no warm-up runs, and when the resident itself is not ready — then the read
+    /// reports the resident's own state.
+    pub(crate) fn name_warm_report(&self) -> Option<StatusReport> {
+        let since = lock_recover(&self.name_warm).since?;
+        let mut report = self.status_report();
+        if report.state != "ready" {
+            return None;
+        }
+        report.state = "loading";
+        report.elapsed_ms = Some(millis(since.elapsed()));
+        Some(report)
+    }
+
+    /// Start a background warm-up of the name indexes over the resident served now.
+    fn start_name_warm(&self) {
+        let opened = self.open_name_warm();
+        self.spawn_name_warm(opened);
+    }
+
+    /// Open a warm-up when a served `references` has asked for one: its epoch, its clock and
+    /// its cancellation. A warm-up already running is cancelled and retired by the epoch this
+    /// one takes: the resident it was warming may be the one replaced.
+    ///
+    /// Nothing opens once the state is shutting down, and the flag is read under the lock
+    /// `shutdown` takes after raising it: a shutdown either comes first and is seen here, or
+    /// comes after and cancels what this opened.
+    fn open_name_warm(&self) -> Option<OpenedNameWarm> {
+        let mut warm = lock_recover(&self.name_warm);
+        if !warm.wanted || self.shutdown.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (epoch, cancel) = warm.open();
+        Some(OpenedNameWarm { state: self.clone(), epoch, cancel: Some(cancel) })
+    }
+
+    /// Run the warm-up [`Self::open_name_warm`] opened on a thread of its own.
+    fn spawn_name_warm(&self, opened: Option<OpenedNameWarm>) {
+        let Some(mut opened) = opened else { return };
+        let Some(cancel) = opened.cancel.take() else { return };
+        let epoch = opened.epoch;
+        let state = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bsl-names-warm".to_owned())
+            .spawn(move || state.run_name_warm(epoch, &cancel));
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not spawn the name-index warm-up");
+            self.finish_name_warm(epoch);
+        }
+    }
+
+    /// Warm the name indexes chunk by chunk, each chunk under one hold of the resident lock.
+    ///
+    /// Ends early when `cancel` fires (the state shuts down, or a newer warm-up takes over;
+    /// the chunk in progress stops at its next query) and when the resident is gone or
+    /// rebuilding (a read that does not come back `Ready`); the next publication starts a
+    /// warm-up of its own. Every chunk is a read, so the warm-up counts as use: the idle
+    /// clock starts when it ends, not when the resident was published.
+    fn run_name_warm(&self, epoch: u64, cancel: &RequestCancel) {
+        // Clears the flag however the warm-up ends, a panic included: a flag left raised
+        // would answer every `references` call with the loading envelope for ever.
+        struct Finish<'a> {
+            state: &'a DiagnosticsState,
+            epoch: u64,
+        }
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.state.finish_name_warm(self.epoch);
+            }
+        }
+        let _finish = Finish { state: self, epoch };
+
+        let started = Instant::now();
+        let chunks = match self.read_mut(|resident, _| resident.background_warm_chunks()) {
+            ResidentOutcome::Ready(chunks, _) => chunks,
+            _ => return,
+        };
+        for chunk in &chunks {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let warmed = self.read_mut(|resident, _| resident.warm_name_indexes_of(chunk, cancel));
+            if !matches!(warmed, ResidentOutcome::Ready(true, _)) {
+                return;
+            }
+        }
+        tracing::info!(
+            chunks = chunks.len(),
+            elapsed_ms = millis(started.elapsed()),
+            "name indexes warmed for references"
+        );
+    }
+
+    fn finish_name_warm(&self, epoch: u64) {
+        let mut warm = lock_recover(&self.name_warm);
+        if warm.epoch == epoch {
+            warm.since = None;
+            warm.cancel = None;
         }
     }
 
@@ -1258,6 +1472,7 @@ impl DiagnosticsState {
                 if self.last_good_on_invalid {
                     self.poll_pending_drift();
                 }
+                self.spawn_name_warm(tail.name_warm);
                 if trace_markers {
                     tracing::info!(
                         target: "bsl_analyzer::shared_backend",
@@ -1429,6 +1644,9 @@ impl DiagnosticsState {
                 if self.last_good_on_invalid {
                     self.poll_pending_drift();
                 }
+                // The swapped-in resident starts cold: the indexes the old one held were
+                // built over the database this rebuild replaced.
+                self.spawn_name_warm(tail.name_warm);
                 if trace_markers {
                     tracing::info!(
                         target: "bsl_analyzer::shared_backend",
