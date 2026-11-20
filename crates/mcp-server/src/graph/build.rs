@@ -9265,6 +9265,209 @@ mod tests {
         assert_ne!(server_sig(&out), base, "renaming a method changes the signature hash");
     }
 
+    // ---- graph ids of files outside the project -----------------------------------
+
+    const OUTSIDE_HANDLER: &str =
+        "&НаСервере\nПроцедура ОбновитьНаСервере()\nОбщий.Сделать();\nКонецПроцедуры";
+
+    /// A configuration and an extension beside `dir/project`, outside it: a common method, and
+    /// a form in each whose handler of one name calls it. Returns the project directory, the
+    /// two roots and the two form modules, in the spelling they were created with.
+    fn outside_forms(dir: &Path) -> (PathBuf, PathBuf, PathBuf, [PathBuf; 2]) {
+        let project = dir.join("project");
+        let base = dir.join("base");
+        let extension = dir.join("ext").join("Расш");
+        fs::create_dir_all(&project).unwrap();
+        write(&base, "Configuration.xml", "<Configuration/>");
+        write(&extension, "Configuration.xml", "<Configuration/>");
+        let callee = "&НаСервере\nПроцедура Сделать() Экспорт\nКонецПроцедуры";
+        write_common_module(&base, "Общий", true, callee);
+        let module = "Ext/Form/Module.bsl";
+        write(&base, &format!("CommonForms/Первая/{module}"), OUTSIDE_HANDLER);
+        write(&extension, &format!("CommonForms/Вторая/{module}"), OUTSIDE_HANDLER);
+        let forms = [
+            base.join("CommonForms/Первая").join(module),
+            extension.join("CommonForms/Вторая").join(module),
+        ];
+        (project, base, extension, forms)
+    }
+
+    /// Declare the project's configuration and its extension by the given spellings.
+    fn declare_outside_roots(project: &Path, base: &str, extension: &str) {
+        let entry = format!("{{ name = \"Расш\", path = {extension:?}, scope = \"InfoBase\" }}");
+        let toml = format!("[source]\nroot = {base:?}\nextensions = [{entry}]\n");
+        fs::write(project.join("bsl-analyzer.toml"), toml).unwrap();
+    }
+
+    /// The real spelling of an existing directory, as a user writes it: long names, the real
+    /// letter case, no verbatim prefix.
+    fn real_spelling(path: &Path) -> String {
+        let real = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        real.trim_start_matches(r"\\?\").to_owned()
+    }
+
+    /// The callers of the common method in the artefact at `db`, sorted, each checked to be
+    /// addressable and accepted by `node`.
+    fn outside_callers(db: &Path) -> Vec<String> {
+        let gdb = GraphDb::open(db).expect("graph database opens and validates");
+        let params = ide::NeighborsParams {
+            id: "method/common/Общий/Сделать",
+            dir: ide::Direction::In,
+            depth: 1,
+            max_nodes: 50,
+            detail: ide::GraphDetail::Names,
+            provenance_filter: Vec::new(),
+            edge_kind_filter: Vec::new(),
+            call_sites: false,
+            max_call_sites: 0,
+        };
+        let callers = gdb.neighbors(&params, None).unwrap().expect("the callee is in the graph");
+        assert!(callers.nodes.iter().all(|node| node.addressable), "{:?}", callers.nodes);
+        let mut ids: Vec<String> = callers.nodes.iter().map(|node| node.id.clone()).collect();
+        for id in &ids {
+            let node = gdb.node(id, ide::GraphDetail::Names, None).unwrap();
+            let node = node.unwrap_or_else(|error| panic!("`node` refused {id}: {error:?}"));
+            assert_eq!(node.node.id, *id);
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Every node row of the forms' handler, so a row left behind under another spelling of
+    /// its file shows up.
+    fn handler_rows(db: &Path) -> Vec<String> {
+        let connection = Connection::open(db).unwrap();
+        let mut statement =
+            connection.prepare("SELECT id FROM nodes WHERE name = ?1 ORDER BY id").unwrap();
+        statement
+            .query_map(["ОбновитьНаСервере"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Every producer of an outside form's id names it alike: the full build, the bridge from
+    /// the form's canonical path (search hits, findings, cards), and the incremental patch of a
+    /// body edit, which leaves no row under another spelling. Returns the build's ids.
+    fn assert_outside_ids_agree(project: &Path, forms: &[PathBuf; 2]) -> Vec<String> {
+        let meta = crate::graph_db::GraphMeta {
+            revision: 1,
+            fingerprint: crate::graph_db::GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        };
+        let built = project.join(".build/built.db");
+        fs::create_dir_all(built.parent().unwrap()).unwrap();
+        build_whole_graph(project, &built, 1, &meta).expect("graph database builds");
+        let ids = outside_callers(&built);
+        assert_eq!(ids.len(), 2, "one caller per form: {ids:?}");
+        assert_eq!(handler_rows(&built), ids, "and no other row of the handler");
+
+        let strip_root = ide::StripRoot::resolve(project);
+        let mut bridged: Vec<String> = forms
+            .iter()
+            .map(|form| {
+                let path = form.canonicalize().unwrap().to_string_lossy().into_owned();
+                let id = ide::method_graph_id(&path, "ОбновитьНаСервере", Some(&strip_root));
+                id.expect("the bridge mints an id")
+            })
+            .collect();
+        bridged.sort();
+        assert_eq!(bridged, ids, "the bridge keys each form as the build did");
+
+        let edited = forms[0].canonicalize().unwrap();
+        let body = OUTSIDE_HANDLER.replace("КонецПроцедуры", "Общий.Сделать();\nКонецПроцедуры");
+        fs::write(&edited, body).unwrap();
+        let patched = project.join(".build/patched.db");
+        update_bodies_for_test(project, &built, &patched, &[edited], 1, &meta)
+            .expect("the patch applies");
+        assert_eq!(outside_callers(&patched), ids, "the patch keys the edited form alike");
+        assert_eq!(handler_rows(&patched), ids, "and leaves no row under another spelling");
+        ids
+    }
+
+    /// A project whose configuration and extension are both declared by absolute paths outside
+    /// it, as a project directory kept apart from the repositories it analyses has them. Two
+    /// forms, one in each, have a handler of the same name calling one common method: the
+    /// callers are two addressable nodes named by each form's whole path.
+    #[test]
+    fn callers_in_forms_outside_the_project_are_distinct_and_addressable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, base, extension, forms) = outside_forms(dir.path());
+        declare_outside_roots(&project, &real_spelling(&base), &real_spelling(&extension));
+
+        let ids = assert_outside_ids_agree(&project, &forms);
+        // The ids, derived without the key function: each form's real path, `/` separators.
+        let mut expected: Vec<String> = forms
+            .iter()
+            .map(|form| {
+                let real = real_spelling(form).replace('\\', "/");
+                format!("method/file/{real}::ОбновитьНаСервере")
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    /// The configuration reached through a link beside the project and the extension through
+    /// a link inside it (`path = "src"`), both leading outside: the files are keyed by where
+    /// they really are, whichever spelling the walk took.
+    #[cfg(unix)]
+    #[test]
+    fn outside_ids_agree_through_links_to_the_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, base, extension, forms) = outside_forms(dir.path());
+        let linked_base = dir.path().join("linked-base");
+        std::os::unix::fs::symlink(&base, &linked_base).unwrap();
+        std::os::unix::fs::symlink(&extension, project.join("src")).unwrap();
+        declare_outside_roots(&project, &linked_base.to_string_lossy(), "src");
+
+        assert_outside_ids_agree(&project, &forms);
+    }
+
+    /// The roots declared with a lower-case drive letter and in the spelling the temporary
+    /// directory was created with (on a CI runner it carries an 8.3 short name): still one id
+    /// per form, the same from every producer.
+    #[cfg(windows)]
+    #[test]
+    fn outside_ids_agree_under_a_lower_case_drive_letter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, base, extension, forms) = outside_forms(dir.path());
+        let lower = |path: &Path| {
+            let spelled = path.to_string_lossy().into_owned();
+            spelled[..1].to_lowercase() + &spelled[1..]
+        };
+        declare_outside_roots(&project, &lower(&base), &lower(&extension));
+
+        assert_outside_ids_agree(&project, &forms);
+    }
+
+    /// The configuration reached through a junction beside the project and the extension
+    /// through a junction inside it (`path = "src"`), both leading outside.
+    #[cfg(windows)]
+    #[test]
+    fn outside_ids_agree_through_junctions_to_the_roots() {
+        let junction = |link: &Path, target: &Path| {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J {link:?} {target:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (project, base, extension, forms) = outside_forms(dir.path());
+        let linked_base = dir.path().join("linked-base");
+        junction(&linked_base, &base);
+        junction(&project.join("src"), &extension);
+        declare_outside_roots(&project, &linked_base.to_string_lossy(), "src");
+
+        assert_outside_ids_agree(&project, &forms);
+    }
+
     // ---- call sites on edges ------------------------------------------------------
 
     /// Build the artefact for `root` and open it together with the workspace's own root

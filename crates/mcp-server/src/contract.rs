@@ -168,7 +168,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "graph",
         actions: GRAPH_ACTIONS,
         note: None,
-        output_schema_version: Some("37"),
+        output_schema_version: Some("38"),
         default_enabled: true,
     },
     ToolDecl {
@@ -616,7 +616,7 @@ mod tests {
             assert!(!validator.is_valid(&body), "alternative branch must not bypass indexing");
         }
         let graph_schema = crate::tools::graph::schema().structured_content.unwrap();
-        assert_eq!(graph_schema["schema_version"], "37");
+        assert_eq!(graph_schema["schema_version"], "38");
         assert!(validator.is_valid(&graph_schema));
     }
 
@@ -1747,7 +1747,7 @@ mod tests {
                         ],
                         "name": "graph",
                         "output_schema_fingerprint": "blake3:4d966d91520f2b5fc5b52b7a030dc11f6b0796bca427688d904199b098fa1184",
-                        "output_schema_version": "37",
+                        "output_schema_version": "38",
                         "params": [
                           {
                             "name": "action",

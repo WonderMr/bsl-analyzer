@@ -1757,8 +1757,8 @@ impl<'a> GraphCtx<'a> {
         Some(vfs_path.as_path().to_str()?.replace('\\', "/"))
     }
 
-    fn rel_path(&self, abs: &str) -> Option<String> {
-        self.strip_root.as_ref()?.rel(abs)
+    fn file_key(&self, abs: &str) -> Option<String> {
+        self.strip_root.as_ref()?.file_key(abs)
     }
 
     // ---- id encoding --------------------------------------------------------
@@ -1833,8 +1833,8 @@ impl<'a> GraphCtx<'a> {
         if let Some(key) = path.as_deref().and_then(module_key_for_path) {
             let scope = encode_scope(&key);
             (format!("method/{scope}/{method_name}"), true)
-        } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
-            (format!("method/file/{rel}::{method_name}"), true)
+        } else if let Some(file) = path.as_deref().and_then(|p| self.file_key(p)) {
+            (format!("method/file/{file}::{method_name}"), true)
         } else {
             let basename = path.as_deref().and_then(basename).unwrap_or("?");
             (format!("method/file/{basename}::{method_name}"), false)
@@ -1845,8 +1845,8 @@ impl<'a> GraphCtx<'a> {
         let path = self.path_for(module.file_id);
         if let Some(key) = path.as_deref().and_then(module_key_for_path) {
             (format!("module/{}", encode_scope(&key)), true)
-        } else if let Some(rel) = path.as_deref().and_then(|p| self.rel_path(p)) {
-            (format!("module/file/{rel}"), true)
+        } else if let Some(file) = path.as_deref().and_then(|p| self.file_key(p)) {
+            (format!("module/file/{file}"), true)
         } else {
             let basename = path.as_deref().and_then(basename).unwrap_or("?");
             (format!("module/file/{basename}"), false)
@@ -1859,11 +1859,11 @@ impl<'a> GraphCtx<'a> {
         let not_found = || GraphError::NotFound { id: id.to_string() };
         match classify_graph_id(id)? {
             GraphIdKind::MethodFile { rel, name } => {
-                let file_id = self.resolve_rel_path(&rel).ok_or_else(not_found)?;
+                let file_id = self.resolve_file_key(&rel).ok_or_else(not_found)?;
                 self.resolve_method_in(file_id, &name, id)
             }
             GraphIdKind::ModuleFile { rel } => {
-                let file_id = self.resolve_rel_path(&rel).ok_or_else(not_found)?;
+                let file_id = self.resolve_file_key(&rel).ok_or_else(not_found)?;
                 Ok(GraphNode::ModuleCode(ModuleId::new(file_id)))
             }
             GraphIdKind::Method { scope, name } => {
@@ -2064,14 +2064,16 @@ impl<'a> GraphCtx<'a> {
             .ok_or_else(|| GraphError::NotFound { id: id.to_string() })
     }
 
-    fn resolve_rel_path(&self, rel: &str) -> Option<FileId> {
+    /// The file an id's path half names: keyed the way the encoder keyed it, so an id minted for
+    /// a file inside the workspace or outside it comes back to that file.
+    fn resolve_file_key(&self, key: &str) -> Option<FileId> {
         for file_id in self.source_root.iter() {
             let abs = match self.path_for(file_id) {
                 Some(p) => p,
                 None => continue,
             };
-            match self.rel_path(&abs) {
-                Some(file_rel) if file_rel == rel => return Some(file_id),
+            match self.file_key(&abs) {
+                Some(file_key) if file_key == key => return Some(file_id),
                 _ => {}
             }
         }
@@ -2334,7 +2336,7 @@ impl<'a> GraphCtx<'a> {
         let path = self.path_for(module.file_id)?;
         match module_key_for_path(&path) {
             Some(key) => Some(display_scope(&key)),
-            None => self.rel_path(&path).or_else(|| basename(&path).map(str::to_string)),
+            None => self.file_key(&path).or_else(|| basename(&path).map(str::to_string)),
         }
     }
 
@@ -2739,9 +2741,9 @@ impl<'a> GraphCtx<'a> {
 /// against this root. So this type answers that one question, and the root it keeps is the
 /// resolved one for that reason.
 ///
-/// Resolving belongs HERE and not inside [`workspace_rel_path`], which is deliberately a
-/// string operation so a caller reproduces the encoder's exact rel rather than the real path.
-/// What was wrong was never the strip; it was the spellings handed to it.
+/// Resolving belongs HERE and not inside [`hir::graph_index::graph_file_key`], which is
+/// deliberately a string operation so a caller reproduces the encoder's exact key rather than
+/// the real path. What was wrong was never the strip; it was the spellings handed to it.
 ///
 /// **The base belongs to a GENERATION, not to the current disk.** A workspace reached through
 /// a link names one directory while that generation's files were walked and possibly another
@@ -2775,7 +2777,9 @@ impl StripRoot {
         StripRoot { resolved: resolved.to_path_buf() }
     }
 
-    /// The rel the encoder would have minted for `abs`, whichever spelling of the file `abs` is.
+    /// The file key the encoder would have minted for `abs`, whichever spelling of the file
+    /// `abs` is: its rel under the root, or its whole path when it lies outside the root (see
+    /// [`hir::graph_index::graph_file_key`]).
     ///
     /// The disk is asked FIRST, because the string strip cannot tell a wrong placement from a
     /// right one. A link INSIDE the root — what a `source.root` that is itself a link produces
@@ -2796,10 +2800,34 @@ impl StripRoot {
     /// has been respelled since. Only a caller handing a spelling of its own (a declared path
     /// through a link) still depends on where that link points now, which is what naming a file
     /// through a link means.
-    fn rel(&self, abs: &str) -> Option<String> {
+    fn file_key(&self, abs: &str) -> Option<String> {
+        let root = self.resolved.to_str()?;
         match std::fs::canonicalize(abs) {
-            Ok(canonical) => workspace_rel_path(canonical.to_str()?, &self.resolved),
-            Err(_) => workspace_rel_path(abs, &self.resolved),
+            Ok(canonical) => hir::graph_index::graph_file_key(canonical.to_str()?, root),
+            Err(_) => hir::graph_index::graph_file_key(abs, root),
+        }
+    }
+
+    /// Which of a walked file's two spellings a build keys its ids by: the walk's while both
+    /// lie under the root, as these ids have always been minted, and the canonical one
+    /// otherwise.
+    ///
+    /// Outside the root the key is the whole path, so it has to be the spelling every other
+    /// producer arrives at: [`Self::file_key`] — the bridge for search hits, findings and
+    /// cards — and the incremental patch both key the canonical path. The walk keeps the root
+    /// as it was declared, and a drive letter in another case, an 8.3 short name or a link in
+    /// that declaration would otherwise give one file one id per producer. A root declared
+    /// through a link inside the workspace that leads outside it is decided by where the file
+    /// really is, for the same reason.
+    pub fn id_spelling<'p>(&self, walked: &'p str, canonical: &'p str) -> &'p str {
+        let under = |path: &str| {
+            let root = self.resolved.to_str();
+            root.is_some_and(|root| hir::graph_index::graph_file_is_under_root(path, root))
+        };
+        if under(walked) && under(canonical) {
+            walked
+        } else {
+            canonical
         }
     }
 
@@ -2820,38 +2848,17 @@ pub fn method_id_for_path(path: &str, method_name: &str) -> Option<String> {
     Some(format!("method/{}/{method_name}", encode_scope(&key)))
 }
 
-/// Workspace-relative form of `abs` under `root`, matching the id encoder's rel
-/// ([`GraphRowEncoder::rel_path`]): `\` → `/`, leading `/` trimmed. Returns `None`
-/// when `abs` is not under `root`. STRING-level strip (no filesystem canonicalization)
-/// so a caller reproduces the encoder's exact rel rather than the real path — but with a
-/// component-boundary check so a sibling like `/ws/project` is not mistaken for being
-/// under `/ws/proj` (which would mint a garbled, non-resolving rel).
-pub(crate) fn workspace_rel_path(abs: &str, root: &Path) -> Option<String> {
-    let root_str = root.to_str()?.replace('\\', "/");
-    let abs = abs.replace('\\', "/");
-    let root_str = root_str.trim_end_matches('/');
-    let stripped = abs.strip_prefix(root_str)?;
-    // `abs` must be `root` itself or continue at a path boundary (`root/<rel>`), never a
-    // longer-named sibling that merely shares the prefix string.
-    if !stripped.is_empty() && !stripped.starts_with('/') {
-        return None;
-    }
-    let rel = stripped.trim_start_matches('/').to_string();
-    if rel.is_empty() {
-        return None;
-    }
-    Some(rel)
-}
-
 /// Durable id for `method_name` at `path`, module-keyed when possible, otherwise the
-/// `method/file/<rel>::<name>` path-fallback the graph encoder also mints (see
-/// [`GraphRowEncoder::encode_method`]) so form/command/file-module methods stay addressable.
+/// `method/file/<key>::<name>` path-fallback the graph encoder also mints (see
+/// [`GraphRowEncoder::encode`]) so form/command/file-module methods stay addressable.
 ///
-/// `workspace_root` is the root the graph was built against; it is needed only to strip an
-/// absolute `path` down to the encoder's rel. A relative `path` (already root-relative, as
-/// produced by the search overlay) is used directly and resolves even without a root. Returns
-/// `None` when neither form yields a resolvable id (e.g. an absolute path with no root, or a
-/// path not under the root) — a wrong, non-resolving id is worse than no decoration.
+/// `workspace_root` is the root the graph was built against; it is needed to key an absolute
+/// `path` the way the encoder did: its rel under the root, or its whole path when it lies
+/// outside the root (see [`hir::graph_index::graph_file_key`]). A relative `path` (already
+/// root-relative, as produced by the search overlay) is used directly and resolves even
+/// without a root. Returns `None` for an absolute path with no root — which of the two keys
+/// the graph holds depends on the root, and a wrong, non-resolving id is worse than no
+/// decoration.
 ///
 /// The root arrives ALREADY RESOLVED, as a [`StripRoot`], and it is the base of the GENERATION
 /// whose paths `path` came from — the walk that established those ids, not the disk as it
@@ -2870,7 +2877,7 @@ pub fn method_graph_id(
         return Some(format!("method/{}/{method_name}", encode_scope(&key)));
     }
     let rel = if Path::new(path).is_absolute() {
-        workspace_root?.rel(path)?
+        workspace_root?.file_key(path)?
     } else {
         path.replace('\\', "/").trim_start_matches('/').to_string()
     };
@@ -4140,7 +4147,7 @@ mod tests {
             })
             .collect();
 
-        // With a workspace root → rel_path form (addressable); without → basename
+        // With a workspace root → rel form (addressable); without → basename
         // fallback (not addressable). Both must match the serve-time encoder.
         for workspace_root in [Some(Path::new("/ws/proj")), None] {
             let no_objects = hir::graph_index::MdoFiles::default();
@@ -4251,36 +4258,120 @@ mod tests {
             method_graph_id(r"a\b\Module.bsl", "M", None).as_deref(),
             Some("method/file/a/b/Module.bsl::M"),
         );
-        // Absolute path NOT under the root → None (never emit a non-resolving id).
-        assert_eq!(
-            method_graph_id("/elsewhere/Module.bsl", "M", Some(&StripRoot::resolve(root))),
-            None
-        );
-        // A longer-named sibling that merely shares the prefix string is NOT under the root.
-        assert_eq!(
-            method_graph_id("/ws/project/a/Module.bsl", "M", Some(&StripRoot::resolve(root))),
-            None
-        );
-        // Absolute path with no root → None.
+        // Absolute path outside the root → keyed by its whole path, as the encoder keys it.
+        let strip = StripRoot::resolve(root);
+        let outside = method_graph_id("/elsewhere/Module.bsl", "M", Some(&strip));
+        assert_eq!(outside.as_deref(), Some("method/file//elsewhere/Module.bsl::M"));
+        // A longer-named sibling that merely shares the prefix string is outside the root too.
+        let sibling = method_graph_id("/ws/project/a/Module.bsl", "M", Some(&strip));
+        assert_eq!(sibling.as_deref(), Some("method/file//ws/project/a/Module.bsl::M"));
+        // Absolute path with no root → None: which key the graph holds depends on the root.
         assert_eq!(method_graph_id("/ws/proj/a/Module.bsl", "M", None), None);
     }
 
+    /// A build keeps the walk's spelling only where both spellings lie under the root; a file
+    /// that really lies outside it, however the walk reached it, is keyed by its canonical
+    /// spelling, the one the bridge canonicalizes to.
     #[test]
-    fn workspace_rel_path_strips_and_normalizes() {
+    fn a_build_keys_a_file_outside_the_root_by_its_canonical_spelling() {
         use std::path::Path;
-        assert_eq!(
-            workspace_rel_path("/ws/proj/a/b.bsl", Path::new("/ws/proj")).as_deref(),
-            Some("a/b.bsl"),
+        let root = StripRoot::pinned(Path::new("/ws/proj"));
+        assert_eq!(root.id_spelling("/ws/proj/a.bsl", "/ws/proj/b.bsl"), "/ws/proj/a.bsl");
+        assert_eq!(root.id_spelling("/ws/proj/src/a.bsl", "/real/a.bsl"), "/real/a.bsl");
+        assert_eq!(root.id_spelling("/link/a.bsl", "/real/a.bsl"), "/real/a.bsl");
+        assert_eq!(root.id_spelling("/link/a.bsl", "/ws/proj/a.bsl"), "/ws/proj/a.bsl");
+    }
+
+    /// The row encoder, the serving encoder and `method_graph_id` key a file outside the
+    /// workspace root identically, by its whole path, in the spelling the walk records (on
+    /// Windows the verbatim `\\?\C:\…` that `canonicalize` answers) — and the id resolves.
+    /// Two forms outside the root with a handler of one name get two ids, and a file inside
+    /// the root keeps the rel id it always had.
+    #[test]
+    fn encoder_and_method_graph_id_agree_outside_the_workspace() {
+        use hir::graph_index::{GraphIndex, GraphRowEncoder};
+        use hir::ConfigsDatabase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let handler = "&НаСервере\nПроцедура ОбновитьНаСервере()\nКонецПроцедуры";
+        let form = |base: &str, name: &str| {
+            let module = dir.path().join(base).join("CommonForms").join(name).join("Ext");
+            std::fs::create_dir_all(module.join("Form")).unwrap();
+            std::fs::write(module.join("Form").join("Module.bsl"), handler).unwrap();
+            module.join("Form").join("Module.bsl").canonicalize().unwrap()
+        };
+        let first = form("base", "Первая");
+        let second = form("ext", "Вторая");
+        std::fs::create_dir_all(ws.join("scripts")).unwrap();
+        std::fs::write(ws.join("scripts/loose.bsl"), handler).unwrap();
+        let inside = ws.join("scripts/loose.bsl").canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(
+            first.to_str().unwrap().starts_with(r"\\?\"),
+            "the walk's spelling is the verbatim one: {first:?}",
         );
-        assert_eq!(
-            workspace_rel_path("/ws/proj/a/b.bsl", Path::new("/ws/proj/")).as_deref(),
-            Some("a/b.bsl"),
-        );
-        assert_eq!(workspace_rel_path("/other/a.bsl", Path::new("/ws/proj")), None);
-        // Sibling sharing the prefix string but not a path component → not under the root.
-        assert_eq!(workspace_rel_path("/ws/project/a.bsl", Path::new("/ws/proj")), None);
-        // The root itself (no rel remainder) → None.
-        assert_eq!(workspace_rel_path("/ws/proj", Path::new("/ws/proj")), None);
+
+        let walked: Vec<String> =
+            [&first, &second, &inside].iter().map(|p| p.to_str().unwrap().to_owned()).collect();
+        let files: Vec<(&str, &str)> = walked.iter().map(|p| (p.as_str(), handler)).collect();
+        let a = workspace(&files);
+        let db = a.database();
+        let graph = db.workspace_call_graph(ROOT);
+        let source_root = db.source_root_input(ROOT).root(db);
+        let file_set = source_root.file_set();
+        let modules: Vec<hir::ModuleId> = source_root
+            .iter()
+            .filter(|&f| hir::is_bsl_source(file_set, f))
+            .map(hir::ModuleId::new)
+            .collect();
+        let index = GraphIndex::build(db, &modules);
+        let paths: rustc_hash::FxHashMap<FileId, String> = source_root
+            .iter()
+            .filter_map(|f| {
+                file_set
+                    .path_for_file(&f)
+                    .and_then(|p| p.as_path().to_str().map(|s| (f, s.to_string())))
+            })
+            .collect();
+
+        let no_objects = hir::graph_index::MdoFiles::default();
+        let strip_root = StripRoot::resolve(&ws);
+        let encoder =
+            GraphRowEncoder::new(&index, &paths, Some(strip_root.resolved()), &no_objects);
+        let ctx = GraphCtx::new(db, ROOT, Some(&strip_root));
+
+        // What the id must be, derived without the key function: the whole path, `/`
+        // separators, no verbatim prefix.
+        let expected = |module: &std::path::Path| {
+            let spelled = module.to_str().unwrap().replace('\\', "/");
+            format!("method/file/{}::ОбновитьНаСервере", spelled.trim_start_matches("//?/"))
+        };
+        let mut ids = Vec::new();
+        for node in graph.nodes() {
+            let GraphNode::Method(method) = &node else { continue };
+            let (build_id, build_addr) = encoder.encode(&node);
+            let (serve_id, serve_addr) = ctx.encode_node(&node);
+            assert_eq!(build_id, serve_id, "the two encoders disagree about {node:?}");
+            assert!(build_addr && serve_addr, "{build_id} must be addressable");
+            let path = &walked[method.module.file_id.0 as usize];
+            let bridged = method_graph_id(path, "ОбновитьНаСервере", Some(&strip_root));
+            assert_eq!(bridged.as_deref(), Some(build_id.as_str()), "the bridge for {path}");
+            assert!(
+                a.graph_node(ROOT, Some(&strip_root), &build_id, GraphDetail::Names).is_ok(),
+                "{build_id} must resolve",
+            );
+            ids.push(build_id);
+        }
+        ids.sort();
+        let mut want = vec![
+            expected(&first),
+            expected(&second),
+            "method/file/scripts/loose.bsl::ОбновитьНаСервере".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(ids, want);
+        assert!(ids.iter().all(|id| !id.contains('?')), "no verbatim prefix in {ids:?}");
     }
 
     /// A root reached through a link mints the id its canonical spelling mints.

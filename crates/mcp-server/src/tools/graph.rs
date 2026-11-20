@@ -422,7 +422,7 @@ pub fn loading(detail: Option<&str>, eta_seconds: Option<u64>) -> CallToolResult
 /// independent of the on-disk SQLite cache layout in [`crate::graph_db`]).
 fn schema_json() -> Value {
     json!({
-        "schema_version": "37",
+        "schema_version": "38",
         "indexing_contract": "Lifecycle status and loading responses include indexing schema_version 1 with a graph target; data/schema responses do not require indexing. States: waiting|running|ready|disabled|failed|cancelled|superseded|unknown. Phase, progress and pass_id are null for graph targets.",
         "actions": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
         "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}; for a workspace graph always `drift_watch`, see the envelope) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches: this server finishes the graph reads already running, closes the graph and serves no more of it — status is `failed + superseded` and every data action returns the reconnect error with `reason: owner_changed`, never `loading`. Open a new session to reach the current daemon. Other refusals carry their own `reason`: `graph_busy` (the graph is being handed over from a previous owner or its ownership confirmed; retry shortly — `status` then reads `loading` with the wait in `error`) and `graph_unavailable` (this process will not open the graph — e.g. another live process of the same version holds its cache directory; the message names the directory and asks for a separate `--cache-dir`). The static `schema` action remains available without a snapshot.",
@@ -516,7 +516,7 @@ fn schema_json() -> Value {
             "form": "form/<MdoEnglish>/<Object>/<Form> or form/common/<Form>",
             "form_item": "form_item/<MdoEnglish>/<Object>/<Form>/<Item> or form_item/common/<Form>/<Item>",
             "form_attribute": "form_attr/<MdoEnglish>/<Object>/<Form>/<Attr> or form_attr/common/<Form>/<Attr>",
-            "path_fallback": "method/file/<relpath>::<Method>"
+            "path_fallback": "method/file/<path>::<Method> (module: module/file/<path>) for a module no metadata name keys — a form, command or loose file. <path> is relative to the workspace root; a file outside it (a configuration root or an extension declared elsewhere on disk) is named by its real (canonical) absolute path — links resolved, real letter case and long names whatever spelling the root was declared with — with `/` separators and no Windows verbatim prefix (`C:/…`, `/srv/…`)"
         }
     })
 }
@@ -878,7 +878,7 @@ mod tests {
         // The contract version must be bumped in lockstep with any response-shape change
         // (a new action, node/edge kind, or result field). The history of what each bump
         // added lives in git, not here.
-        assert_eq!(schema["schema_version"], "37");
+        assert_eq!(schema["schema_version"], "38");
         assert!(schema["loading"].as_str().unwrap().contains("eta_seconds"));
         let output_schema = graph_output_schema();
         assert_eq!(
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn schema_and_loading_populate_structured_content() {
         assert_structured_mirrors_text(&schema());
-        assert_eq!(schema().structured_content.unwrap()["schema_version"], "37");
+        assert_eq!(schema().structured_content.unwrap()["schema_version"], "38");
 
         assert_structured_mirrors_text(&loading(Some("indexing"), None));
         let body = loading(Some("indexing"), None).structured_content.unwrap();
