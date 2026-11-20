@@ -165,6 +165,16 @@ mod tests {
                 validate(&schema, &body);
             }
         }
+
+        // Only the workspace profile serves `search_code`.
+        let mut result = crate::tools::search::platform_help_not_ready("search_code");
+        let indexing = Indexing::single(Target::new(Kind::Lexical, State::Ready, None));
+        indexing.attach(&mut result);
+        let body = result.structured_content.expect("structured");
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["phase"], PHASE);
+        assert_eq!(body["schema_version"], "8");
+        validate(&crate::tools::search::search_output_schema(), &body);
     }
 
     #[test]

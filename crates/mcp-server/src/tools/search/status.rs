@@ -115,9 +115,9 @@ pub(crate) fn docs_not_ready(action: &str) -> CallToolResult {
     )
 }
 
-/// The answer of an action that reads the platform help — `find_docs`, `search_docs`,
-/// `list_platform` — while the server is still loading it: the action's `not_ready`
-/// envelope, marked with the phase that holds it back.
+/// The answer of an action that depends on the platform help — `find_docs`, `search_docs`,
+/// `list_platform`, `search_code` — while the server is still loading it: the action's
+/// `not_ready` envelope, marked with the phase that holds it back.
 pub(crate) fn platform_help_not_ready(action: &str) -> CallToolResult {
     use crate::tools::platform_help::{DETAIL, PHASE, RETRY_AFTER_MS};
 

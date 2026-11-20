@@ -223,14 +223,17 @@ fn indexed_search_budget(command: &SearchCommand) -> Option<usize> {
     }
 }
 
-/// The action of `command` when it reads the platform help: the docs index is built from it
-/// and the listing is its catalog.
+/// The action of `command` when it depends on the platform help: the docs index is built from
+/// it and the listing is its catalog. `search_code` reads no help itself, yet once the code
+/// index exists a call waits on the workspace's own help-dependent state until the load ends,
+/// which on a first extraction is minutes, so it is answered the same way.
 fn platform_search_action(command: &SearchCommand) -> Option<&'static str> {
     match command {
         SearchCommand::ListPlatform(_) => Some("list_platform"),
         SearchCommand::FindDocs { .. } => Some("find_docs"),
         SearchCommand::SearchDocs { .. } => Some("search_docs"),
-        SearchCommand::SearchCode(_) | SearchCommand::Status => None,
+        SearchCommand::SearchCode(_) => Some("search_code"),
+        SearchCommand::Status => None,
     }
 }
 
@@ -247,8 +250,12 @@ async fn platform_search_loading(
     let Some(loading) = tools::platform_help::loading_answer(ct, not_ready).await? else {
         return Ok(None);
     };
+    let indexing = match command {
+        SearchCommand::SearchCode(_) => server.state.workspace_indexing(),
+        _ => server.state.reference_indexing(),
+    };
     let stale = server.state.graph().is_reloading();
-    finish_indexed_search(loading, server.state.reference_indexing(), budget, stale).map(Some)
+    finish_indexed_search(loading, indexing, budget, stale).map(Some)
 }
 
 fn finish_indexed_search(
@@ -2456,15 +2463,16 @@ impl McpServer {
         // an already-cancelled request is never handed a body.
         let diag = self.state.diagnostics().clone();
         diag.ensure_loading();
+
+        let sections = tools::symbol_info::sections_from(&p.include);
+        let locale = tools::symbol_info::locale_from(p.locale.as_deref())?;
         // Types and platform members are read off the platform help, which may still be
         // loading; a read now would hold the call, and the resident with it, until it is in.
+        // Asked after the parameters, so a malformed call is refused as such meanwhile.
         let help = tools::platform_help::resident_loading_answer(&ct, &diag, Some("1")).await?;
         if let Some(loading) = help {
             return Ok(loading.into());
         }
-
-        let sections = tools::symbol_info::sections_from(&p.include);
-        let locale = tools::symbol_info::locale_from(p.locale.as_deref())?;
         let max_output_tokens =
             p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
         let member_kind = p.member_kind.map(SymbolMemberKindFilter::as_str);
@@ -2841,22 +2849,9 @@ impl McpServer {
                 )
                 .into())
             }
-            "file" | "snippet" | "workspace" => {
-                // Findings are computed off the platform help, which may still be loading;
-                // an analysis now would hold the call, and the resident with it, until it is
-                // in. The build is kicked first, so it runs while the help loads.
-                let diag = self.state.diagnostics().clone();
-                diag.ensure_loading();
-                let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
-                if let Some(loading) = help {
-                    return Ok(loading.into());
-                }
-                match p.action.as_str() {
-                    "file" => self.diagnostics_file(p, ct, caller).await,
-                    "snippet" => self.diagnostics_snippet(p, ct, caller).await,
-                    _ => self.diagnostics_workspace(p, ct, caller).await,
-                }
-            }
+            "file" => self.diagnostics_file(p, ct, caller).await,
+            "snippet" => self.diagnostics_snippet(p, ct, caller).await,
+            "workspace" => self.diagnostics_workspace(p, ct, caller).await,
             other => Err(contract::unknown_action(McpProfile::Workspace, "diagnostics", other)),
         }
     }
@@ -2899,6 +2894,13 @@ impl McpServer {
             max_output_tokens: p.max_output_tokens,
             detailed,
         };
+        // Findings are computed off the platform help, which may still be loading: an analysis
+        // now would hold the call, and the resident with it, until the help is in. Asked after
+        // the parameters, so a malformed call is refused as such whatever the help's state.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         let retry_diag = diag.clone();
         let response_graph = graph.clone();
@@ -2987,6 +2989,12 @@ impl McpServer {
         let diag = self.state.diagnostics().clone();
         let graph = self.state.graph().clone();
         diag.ensure_loading();
+        // The snippet is typed off the platform help, which may still be loading; asked after
+        // the parameters, so a malformed call is refused as such meanwhile.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
         let retry_diag = diag.clone();
         tasks::resident_response(
             self,
@@ -3081,6 +3089,12 @@ impl McpServer {
             // config surfaces as `truncated` with the true `files_total`.
             max_files: p.max_files.unwrap_or(DEFAULT_MAX_SWEEP_FILES).min(MAX_SWEEP_FILES_CEILING),
         };
+        // Findings are computed off the platform help, which may still be loading; asked after
+        // the parameters, so a malformed call is refused as such meanwhile.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         // The sweep fans out to rayon, and each worker queries its OWN db clone with its
         // own salsa token. Those tokens register in the request's registry — the same one
