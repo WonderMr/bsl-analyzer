@@ -1719,6 +1719,34 @@ mod tests {
         assert_value_ty(price, number());
     }
 
+    /// The platform facts list `Активность`, `НомерСтроки` and `Регистратор` on every
+    /// information register record, but the platform has them only on a register subordinate
+    /// to a recorder: they are left to the register's own attributes, which the metadata reader
+    /// gives such a register alone. An accumulation register always has a recorder, so its
+    /// record keeps them.
+    #[test]
+    fn an_independent_information_register_record_has_no_recorder_fields() {
+        let empty = |name: &str, mdo_type| register_with(name, mdo_type, vec![], vec![], vec![]);
+        let mut config = Configuration::new("Test");
+        config.add_register(empty("Независимый", MdoType::InformationRegister));
+        config.add_register(empty("Остатки", MdoType::AccumulationRegister));
+        let configs = wrap(config);
+        let names = |kind: MetadataKind, name: &str| -> Vec<String> {
+            let receiver = metadata_ref(kind, name);
+            enumerate_fields(&configs, &receiver)
+                .iter()
+                .map(|f| f.name.as_str().to_owned())
+                .collect()
+        };
+
+        let record = names(MetadataKind::InformationRegisterRecord, "Независимый");
+        for field in ["Активность", "НомерСтроки", "Регистратор"] {
+            assert!(!record.iter().any(|name| name == field), "{field}: {record:?}");
+        }
+        let record = names(MetadataKind::AccumulationRegisterRecord, "Остатки");
+        assert!(record.iter().any(|name| name == "Активность"), "{record:?}");
+    }
+
     #[test]
     fn enumerate_filter_fields_value_ty_for_accumulation_register() {
         let mut config = Configuration::new("Test");

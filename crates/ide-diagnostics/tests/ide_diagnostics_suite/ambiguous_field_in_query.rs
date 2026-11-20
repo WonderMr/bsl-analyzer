@@ -131,11 +131,11 @@ fn distinct_aliases_over_the_same_tables_stay_quiet() {
     );
 }
 
-/// Fields that exist only under settings the metadata model does not read.
+/// Fields the query layer lists although the register may not have them.
 ///
 /// An information register is listed with `Активность`/`НомерСтроки`/`Регистратор` whether or
-/// not it is subordinate to a recorder — twice over, in fact: the XML reader injects them as
-/// attributes and the query layer adds them again as standard fields. Over-listing is
+/// not it is subordinate to a recorder: the XML reader lists them for a subordinate register,
+/// and the query layer adds them, provisionally, for an independent one. Over-listing is
 /// deliberate and safe for a rule that reports a MISSING field. It is the opposite of safe
 /// here: counting such a field as an occurrence invents a collision the platform never sees,
 /// and this rule is a Blocker.
