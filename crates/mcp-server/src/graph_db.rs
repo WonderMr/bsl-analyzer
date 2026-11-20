@@ -88,13 +88,13 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
-// 26: a file outside the workspace root (a `[source] root` or an extension declared by an
+// 27: a file outside the workspace root (a `[source] root` or an extension declared by an
 // absolute path elsewhere) is keyed by its canonical path, `method/file/<absolute path>::<name>`,
-// where version 25 minted `method/file/<basename>::<name>` in a full build and merged namesakes
-// of every such form module into one row. Nothing about the workspace changed, so no
+// where earlier versions minted `method/file/<basename>::<name>` in a full build and merged
+// namesakes of every such form module into one row. Nothing about the workspace changed, so no
 // fingerprint moves: a reused artefact would answer `not_found` for the ids this binary hands
 // out.
-pub(crate) const SCHEMA_VERSION: u32 = 26;
+pub(crate) const SCHEMA_VERSION: u32 = 27;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
