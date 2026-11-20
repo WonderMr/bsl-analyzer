@@ -2898,6 +2898,47 @@ mod tests {
             "a genuinely unknown type must not be classified resolvable (no wasted force-scan)",
         );
     }
+
+    /// The card of an information register lists the standard attributes its write mode gives
+    /// it. An independent register has no recorder, so a query written from a card that listed
+    /// `Регистратор`, `НомерСтроки` or `Активность` for it would select fields that do not
+    /// exist; a register subordinate to a recorder still lists them.
+    #[test]
+    fn a_register_card_lists_the_standard_attributes_of_its_write_mode() {
+        let register = |name: &str, uuid: &str, write_mode: &str| {
+            let xml = format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<InformationRegister uuid="00000000-0000-0000-0000-0000000000{uuid}">
+<Properties><Name>{name}</Name><InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity><WriteMode>{write_mode}</WriteMode></Properties>
+<ChildObjects>
+<Attribute uuid="00000000-0000-0000-0000-0000000001{uuid}"><Properties><Name>Комментарий</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+</ChildObjects>
+</InformationRegister></MetaDataObject>"#
+            );
+            bsl_metadata::xml_parser::parse_information_register_xml(&xml).unwrap()
+        };
+        let mut config = Configuration::new("Тест");
+        config.add_register(register("ТестовыйРегистр", "a1", "Independent"));
+        config.add_register(register("Движения", "a2", "RecorderSubordinate"));
+
+        let independent =
+            get_object_structure(&config, "РегистрСведений", "ТестовыйРегистр").unwrap();
+        let independent = extract_text(&independent);
+        assert!(independent.contains("## Реквизиты (1)"), "{independent}");
+        assert!(independent.contains("| Комментарий |"), "{independent}");
+        for standard in ["Регистратор", "НомерСтроки", "Активность"]
+        {
+            assert!(!independent.contains(&format!("| {standard} |")), "{independent}");
+        }
+
+        let subordinate = get_object_structure(&config, "РегистрСведений", "Движения").unwrap();
+        let subordinate = extract_text(&subordinate);
+        assert!(subordinate.contains("## Реквизиты (4)"), "{subordinate}");
+        for standard in ["Регистратор", "НомерСтроки", "Активность"]
+        {
+            assert!(subordinate.contains(&format!("| {standard} |")), "{subordinate}");
+        }
+    }
 }
 
 #[cfg(test)]

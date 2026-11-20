@@ -94,6 +94,7 @@ fn temp_designer_config_with_register_recorders() -> PathBuf {
         <Properties>
             <Name>РегистрСведенийE2E</Name>
             <InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity>
+            <WriteMode>RecorderSubordinate</WriteMode>
         </Properties>
     </InformationRegister>
 </MetaDataObject>"#,
@@ -238,6 +239,7 @@ fn record_standard_period_resolves() {
 #[test]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 fn record_standard_active_resolves() {
+    let config_path = temp_designer_config_with_register_recorders();
     let text = r#"
 Процедура Тест()
     Для Каждого З Из ЭтотОбъект Цикл
@@ -245,7 +247,8 @@ fn record_standard_active_resolves() {
     КонецЦикла;
 КонецПроцедуры
 "#;
-    let (db, file_id) = setup_at(register_recordset_module_path(), text);
+    let (db, file_id) =
+        setup_at_with_config(temp_register_recordset_module_path(&config_path), config_path, text);
     assert_eq!(var_ty(&db, file_id, "а"), Some(db.boolean()));
 }
 
