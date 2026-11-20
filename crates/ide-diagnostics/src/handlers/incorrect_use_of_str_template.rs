@@ -2,9 +2,14 @@ use crate::define_metadata;
 use crate::metadata::*;
 use crate::AnalysisContext;
 use crate::{BodyContext, Diagnostic, DiagnosticCode};
+use hir::dataflow::reaching_defs::{DefSite, ReachingDefsResult};
+use hir::str_template::{
+    constant_template_texts, count_required_params, is_str_template_name, is_wrong_str_template,
+    template_texts, TemplateText,
+};
 use hir::LocalRange;
-use hir::{Expr, ExprId, IdConversion, Literal, Stmt, StmtId};
-use stdx::case::{contains_ignore_case, eq_ignore_case};
+use hir::{Expr, ExprId, ExprIdx, IdConversion, Name, Stmt, StmtId};
+use stdx::case::contains_ignore_case;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -24,10 +29,6 @@ fn has_str_template_calls(text: &str) -> bool {
     contains_ignore_case(text, "стршаблон") || contains_ignore_case(text, "strtemplate")
 }
 
-fn is_str_template_call_name(name: &str) -> bool {
-    eq_ignore_case(name, "стршаблон") || eq_ignore_case(name, "strtemplate")
-}
-
 pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
     let code = DiagnosticCode::IncorrectUseOfStrTemplate;
 
@@ -41,7 +42,7 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
 
     let body = ctx.body();
     let source_map = ctx.source_map();
-    let mut candidates: Vec<(StmtId, ExprId, usize)> = Vec::new();
+    let mut candidates: Vec<(StmtId, ExprIdx, usize)> = Vec::new();
 
     for (stmt_id, stmt) in body.stmts_iter() {
         let expr_id = match stmt {
@@ -65,7 +66,7 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
                 _ => continue,
             };
 
-            if !is_str_template_call_name(method_name) {
+            if !is_str_template_name(method_name) {
                 continue;
             }
 
@@ -73,14 +74,15 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
                 continue;
             }
 
-            let template_expr_id = ExprId::from_idx(args[0]);
+            let template = args[0];
             let param_count = args.len() - 1;
 
-            if matches!(body.expr(template_expr_id), Expr::Literal(Literal::String(_))) {
+            // A template whose texts follow from the call alone is checked in lowering.
+            if constant_template_texts(body, template).is_some() {
                 continue;
             }
 
-            candidates.push((stmt_id, template_expr_id, param_count));
+            candidates.push((stmt_id, template, param_count));
         }
     }
 
@@ -90,252 +92,81 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
 
     let Some(reaching_defs) = ctx.reaching_definitions() else { return };
 
-    for (stmt_id, template_expr_id, param_count) in candidates {
-        if let Some(template_string) =
-            resolve_expr_to_string(template_expr_id, body, &reaching_defs, stmt_id)
-        {
-            if is_wrong_str_template(&template_string, param_count) {
-                if let Some(range) = source_map.expr_range(template_expr_id) {
-                    acc.push(Diagnostic {
-                        code,
-                        message: format!(
-                            "Template '{}' requires {} parameters but {} provided",
-                            template_string.chars().take(50).collect::<String>(),
-                            count_required_params(&template_string),
-                            param_count
-                        ),
-                        severity: ctx.severity(code),
-                        range,
-                        tags: ctx.tags(code),
-                        fixes: vec![],
-                    });
-                }
+    for (stmt_id, template, param_count) in candidates {
+        let texts = resolve_template_texts(template, body, &reaching_defs, stmt_id, 0);
+        let wrong = texts.iter().flatten().find(|t| is_wrong_str_template(&t.text, param_count));
+        if let Some(wrong_text) = wrong {
+            if let Some(range) = source_map.expr_range(ExprId::from_idx(template)) {
+                acc.push(Diagnostic {
+                    code,
+                    message: format!(
+                        "Template '{}' requires {} parameters but {} provided",
+                        wrong_text.text.chars().take(50).collect::<String>(),
+                        count_required_params(&wrong_text.text),
+                        param_count
+                    ),
+                    severity: ctx.severity(code),
+                    range,
+                    tags: ctx.tags(code),
+                    fixes: vec![],
+                });
             }
         }
     }
 }
 
-fn resolve_expr_to_string(
-    expr_id: ExprId,
+/// The texts of the template `expr` of the statement `stmt_id`, each variable in it read
+/// through the definitions that reach the statement.
+fn resolve_template_texts(
+    expr: ExprIdx,
     body: &hir::Body,
-    reaching_defs: &hir::dataflow::reaching_defs::ReachingDefsResult,
-    stmt_id: StmtId,
-) -> Option<String> {
-    resolve_expr_to_string_impl(expr_id, body, reaching_defs, stmt_id, 0)
-}
-
-fn resolve_expr_to_string_impl(
-    expr_id: ExprId,
-    body: &hir::Body,
-    reaching_defs: &hir::dataflow::reaching_defs::ReachingDefsResult,
+    reaching_defs: &ReachingDefsResult,
     stmt_id: StmtId,
     depth: u32,
-) -> Option<String> {
+) -> Option<Vec<TemplateText>> {
     const MAX_DEPTH: u32 = 10;
 
     if depth > MAX_DEPTH {
         return None;
     }
 
-    match body.expr(expr_id) {
-        Expr::Literal(Literal::String(s)) => Some(s.to_string()),
-
-        Expr::Path(var_name) => {
-            let defs = reaching_defs.defs_for_var_at_stmt(var_name.as_str(), stmt_id)?;
-
-            let mut resolved_values = std::collections::HashSet::new();
-
-            for def in defs {
-                if let Some(value) =
-                    resolve_definition(&def, body, reaching_defs, stmt_id, depth + 1)
-                {
-                    resolved_values.insert(value);
-                }
-            }
-
-            if resolved_values.len() == 1 {
-                resolved_values.into_iter().next()
-            } else {
-                None
-            }
-        }
-
-        _ => None,
-    }
+    template_texts(body, expr, &mut |name: &Name| {
+        resolve_variable_texts(name, body, reaching_defs, stmt_id, depth + 1)
+    })
 }
 
-fn resolve_definition(
-    def: &hir::dataflow::reaching_defs::Definition,
+/// The texts of the variable `name` at `stmt_id`: known when every definition reaching the
+/// statement is an assignment and all of them give the same texts. A parameter, a loop
+/// variable or a second value leaves the variable unknown.
+fn resolve_variable_texts(
+    name: &Name,
     body: &hir::Body,
-    reaching_defs: &hir::dataflow::reaching_defs::ReachingDefsResult,
-    _current_stmt: StmtId,
+    reaching_defs: &ReachingDefsResult,
+    stmt_id: StmtId,
     depth: u32,
-) -> Option<String> {
-    match def.def_site {
-        hir::dataflow::reaching_defs::DefSite::Assignment(assign_raw_idx) => {
-            let assign_stmt_id = StmtId::from_raw(assign_raw_idx);
-
-            if let Stmt::Assign { value, .. } = body.stmt(assign_stmt_id) {
-                resolve_expr_to_string_impl(
-                    ExprId::from_idx(*value),
-                    body,
-                    reaching_defs,
-                    assign_stmt_id,
-                    depth,
-                )
-            } else {
-                None
-            }
+) -> Option<Vec<TemplateText>> {
+    let mut texts: Option<Vec<TemplateText>> = None;
+    for def in reaching_defs.defs_for_var_at_stmt(name.as_str(), stmt_id)? {
+        let DefSite::Assignment(assign_raw_idx) = def.def_site else {
+            return None;
+        };
+        let assign_stmt_id = StmtId::from_raw(assign_raw_idx);
+        let Stmt::Assign { value, .. } = body.stmt(assign_stmt_id) else {
+            return None;
+        };
+        let def_texts = resolve_template_texts(*value, body, reaching_defs, assign_stmt_id, depth)?;
+        if texts.as_ref().is_some_and(|known| !same_texts(known, &def_texts)) {
+            return None;
         }
-        _ => None,
+        texts = Some(def_texts);
     }
+    texts
 }
 
-fn is_wrong_str_template(template_string: &str, used_params_count: usize) -> bool {
-    let is_wrong_call = compare_template_and_params(template_string, used_params_count);
-    if !is_wrong_call {
-        return false;
-    }
-
-    let cleaned = remove_double_percent(template_string);
-    compare_template_and_params(&cleaned, used_params_count)
-}
-
-fn remove_double_percent(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
-            i += 2;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
-}
-
-fn parse_placeholder(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
-    if pos >= bytes.len() || bytes[pos] != b'%' {
-        return None;
-    }
-
-    let start = pos + 1;
-    if start >= bytes.len() {
-        return None;
-    }
-
-    if bytes[start] == b'(' {
-        let num_start = start + 1;
-        let mut num_end = num_start;
-        while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
-            num_end += 1;
-        }
-        if num_end > num_start && num_end < bytes.len() && bytes[num_end] == b')' {
-            let num_str = std::str::from_utf8(&bytes[num_start..num_end]).ok()?;
-            let num: usize = num_str.parse().ok()?;
-            return Some((num, num_end - pos + 1));
-        }
-        return None;
-    }
-
-    let mut num_end = start;
-    while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
-        num_end += 1;
-    }
-    if num_end > start {
-        let num_str = std::str::from_utf8(&bytes[start..num_end]).ok()?;
-        let num: usize = num_str.parse().ok()?;
-        return Some((num, num_end - pos));
-    }
-
-    None
-}
-
-fn is_valid_placeholder(num: usize) -> bool {
-    (1..=10).contains(&num)
-}
-
-#[allow(clippy::nonminimal_bool)]
-fn compare_template_and_params(template_string: &str, used_params_count: usize) -> bool {
-    let bytes = template_string.as_bytes();
-    let have_params = used_params_count > 0;
-
-    let mut has_valid_placeholder = false;
-    let mut has_wrong_number = false;
-    let mut used_placeholders = [false; 11];
-
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-                i += 2;
-                continue;
-            }
-
-            if let Some((num, len)) = parse_placeholder(bytes, i) {
-                if is_valid_placeholder(num) {
-                    has_valid_placeholder = true;
-                    used_placeholders[num] = true;
-                    if num > used_params_count {
-                        return true;
-                    }
-                } else {
-                    has_wrong_number = true;
-                }
-                i += len;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    if has_wrong_number {
-        return true;
-    }
-    if has_valid_placeholder && !have_params {
-        return true;
-    }
-    if !has_valid_placeholder && have_params {
-        return true;
-    }
-
-    if has_valid_placeholder {
-        for &used in used_placeholders.iter().take(used_params_count + 1).skip(1) {
-            if !used {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn count_required_params(template_string: &str) -> usize {
-    let bytes = template_string.as_bytes();
-    let mut max_param = 0;
-
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-                i += 2;
-                continue;
-            }
-
-            if let Some((num, len)) = parse_placeholder(bytes, i) {
-                if is_valid_placeholder(num) {
-                    max_param = max_param.max(num);
-                }
-                i += len;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    max_param
+/// Whether two lists of distinct texts hold the same texts: `?(...)` branches and `НСтр`
+/// translations may come in another order in another assignment.
+fn same_texts(left: &[TemplateText], right: &[TemplateText]) -> bool {
+    left.len() == right.len() && left.iter().all(|text| right.contains(text))
 }
 
 pub fn from_hir(range: LocalRange, ctx: &AnalysisContext) -> Option<Diagnostic<LocalRange>> {
@@ -574,6 +405,87 @@ mod tests {
                   severity: Blocker
                 IncorrectUseOfStrTemplate @ 37:13..37:57
                   message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn chars_parts_of_a_template_are_text_without_markers() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_chars_parts.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 11:13..11:63
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 12:13..12:55
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 13:13..13:79
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn each_constant_branch_of_a_conditional_template_is_checked() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_conditional_branches.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 11:13..11:78
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 12:13..12:69
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 13:13..13:72
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn each_translation_of_a_multilingual_template_is_checked() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_nstr_languages.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 13:13..13:89
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 14:13..14:74
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 15:13..15:94
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 16:13..16:93
+                  message: Некорректное использование СтрШаблон
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn template_variable_assigned_from_parts_is_checked() {
+        check_diagnostics_snapshot_for(
+            include_str!("fixtures/str_template_through_variable.bsl"),
+            DiagnosticCode::IncorrectUseOfStrTemplate,
+            expect![[r#"
+                IncorrectUseOfStrTemplate @ 22:23..22:29
+                  message: Template 'Документ %1 от %2' requires 2 parameters but 1 provided
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 24:23..24:36
+                  message: Template 'Документ %1 без даты' requires 1 parameters but 2 provided
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 27:23..27:43
+                  message: Template 'Документ %1 от %2.' requires 2 parameters but 1 provided
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 29:23..29:37
+                  message: Template 'Document' requires 0 parameters but 1 provided
+                  severity: Blocker
+                IncorrectUseOfStrTemplate @ 35:23..35:34
+                  message: Template 'Документ' requires 0 parameters but 1 provided
                   severity: Blocker"#]],
         );
     }

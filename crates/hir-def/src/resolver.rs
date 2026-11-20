@@ -93,12 +93,16 @@ impl Resolver {
 
     /// Like [`Self::with_builtins_and_workspace`], but same-module method/variable
     /// lookups resolve against `local_symbols` (the effective module's symbol tree)
-    /// instead of the module's declarations by name. Cross-module / metadata resolution still
-    /// keys on `module_id.file_id`, which is the base file — correct, because the
-    /// effective module *is* the base module with the extension's edits applied.
+    /// instead of the module's declarations by name. `module_id` is the base module, the
+    /// identity the effective module carries: its own form and object are the base's.
     /// A name that misses in `local_symbols` retries against `extension_module`, the
     /// extension the effective module was spliced from (base shadows extension); `None`
     /// for a body the extension does not compile.
+    ///
+    /// A body the extension compiles runs in the extension, so metadata and cross-module
+    /// lookups take the extension's visibility ([`Self::visibility_file_id`]): its own
+    /// objects and the extensions it depends on are there, unrelated extensions are not.
+    /// The base module's top-level code keeps the base's visibility.
     pub fn with_builtins_and_workspace_effective(
         module_id: ModuleId,
         local_symbols: Arc<ModuleInterface>,
@@ -182,6 +186,13 @@ impl Resolver {
             }
         }
         None
+    }
+
+    /// The file whose configuration visibility answers metadata and cross-module lookups:
+    /// the extension an effective module was spliced from, for a body the extension
+    /// compiles, and the module's own file otherwise.
+    pub fn visibility_file_id(&self) -> Option<vfs::FileId> {
+        self.module_extension_fallback().or_else(|| self.module_id()).map(|module| module.file_id)
     }
 
     /// The effective module's symbol tree, when this resolver was built with one
@@ -270,8 +281,7 @@ impl Resolver {
         if !self.scopes.iter().any(|s| matches!(s, Scope::WorkspaceScope)) {
             return false;
         }
-        let Some(module_id) = self.module_id() else { return false };
-        let file_id = module_id.file_id;
+        let Some(file_id) = self.visibility_file_id() else { return false };
 
         // The configuration's declaration is the module: one shipped without
         // `Module.bsl` (only `Ext/Module.bin`, or no text at all) never reaches the
@@ -297,8 +307,8 @@ impl Resolver {
         if !self.scopes.iter().any(|s| matches!(s, Scope::WorkspaceScope)) {
             return None;
         }
-        let module_id = self.module_id()?;
-        db.resolve_register_by_name(module_id.file_id, register_name.as_str())
+        let file_id = self.visibility_file_id()?;
+        db.resolve_register_by_name(file_id, register_name.as_str())
             .map(|reg| (reg.mdo_type(), Name::new(reg.name())))
     }
 
@@ -319,10 +329,10 @@ impl Resolver {
         if !self.scopes.iter().any(|s| matches!(s, Scope::WorkspaceScope)) {
             return Vec::new();
         }
-        let Some(module_id) = self.module_id() else { return Vec::new() };
+        let Some(file_id) = self.visibility_file_id() else { return Vec::new() };
         let mut names = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
-        for cfg in db.configurations(module_id.file_id).iter() {
+        for cfg in db.configurations(file_id).iter() {
             for cm in cfg.configuration.common_modules() {
                 if cm.is_global() && seen.insert(intern::NormName::intern(cm.name())) {
                     names.push(Name::new(cm.name()));
@@ -350,14 +360,14 @@ impl Resolver {
     /// occurrence (a name exported by two global modules is a configuration-level ambiguity
     /// 1C itself forbids; we pick deterministically rather than guess).
     pub fn global_common_module_exports(&self, db: &dyn ConfigsDatabase) -> GlobalExports {
-        let Some(self_module) = self.module_id() else {
+        let Some(file_id) = self.visibility_file_id() else {
             return GlobalExports::default();
         };
         let mut exports = Vec::new();
         let mut gaps = Vec::new();
         for module_name in self.global_common_module_names(db) {
             let effective_is_global = db
-                .resolve_common_module(self_module.file_id, module_name.as_str())
+                .resolve_common_module(file_id, module_name.as_str())
                 .is_some_and(|cm| cm.is_global());
             if !effective_is_global {
                 continue;
@@ -411,15 +421,13 @@ impl Resolver {
     /// connection module variables are legal and extend their respective global
     /// contexts.
     pub fn application_module_exports(&self, db: &dyn ConfigsDatabase) -> GlobalExports {
-        let Some(self_module) = self.module_id() else {
+        let Some(file_id) = self.visibility_file_id() else {
             return GlobalExports::default();
         };
         let mut exports = Vec::new();
         let mut gaps = Vec::new();
         for kind in crate::ApplicationModuleKind::ALL {
-            let Some(bodies) =
-                db.resolve_application_module_file_candidates(self_module.file_id, kind)
-            else {
+            let Some(bodies) = db.resolve_application_module_file_candidates(file_id, kind) else {
                 gaps.push(GlobalSurfaceGap::UnindexedApplicationModules { kind });
                 continue;
             };
@@ -481,8 +489,8 @@ impl Resolver {
         if let Some(var_id) = self.resolve_module_variable(db, name) {
             return AssignmentResolution::ModuleVariable(var_id);
         }
-        if let Some(module_id) = self.module_id() {
-            if db.resolve_common_module(module_id.file_id, name.as_str()).is_some() {
+        if let Some(file_id) = self.visibility_file_id() {
+            if db.resolve_common_module(file_id, name.as_str()).is_some() {
                 return AssignmentResolution::CommonModule(name.clone());
             }
         }
@@ -581,12 +589,11 @@ impl Resolver {
             return Err(QualifiedMethodError::NotFound);
         }
 
-        let module_id = self.module_id().ok_or_else(|| {
+        let file_id = self.visibility_file_id().ok_or_else(|| {
             tracing::warn!("locate_common_module_candidates called without module scope");
             QualifiedMethodError::NotFound
         })?;
 
-        let file_id = module_id.file_id;
         let declared_by_configs = db.has_config_root(file_id);
 
         if declared_by_configs {
@@ -741,11 +748,10 @@ impl Resolver {
         mdo_type: bsl_metadata::MdoType,
         mdo_name: &Name,
     ) -> Result<CommonModuleCandidates, QualifiedMethodError> {
-        let current_module_id = self.module_id().ok_or_else(|| {
+        let current_file_id = self.visibility_file_id().ok_or_else(|| {
             tracing::warn!("locate_mdo_module called without module scope");
             QualifiedMethodError::NotFound
         })?;
-        let current_file_id = current_module_id.file_id;
 
         if db.file_has_visible_config(current_file_id)
             && !Self::mdo_visible(db, current_file_id, mdo_type, mdo_name)

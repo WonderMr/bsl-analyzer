@@ -113,7 +113,8 @@ pub(crate) fn resolve_form_attribute_value(
     let module_id = resolver.module_id()?;
     let metadata = db.module_metadata(module_id);
     let attr = metadata.form.as_ref()?.find_attribute(name)?;
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let obj_resolver =
+        crate::object_resolver::DbObjectResolver::new(db, resolver.visibility_file_id()?);
     form_attribute_value_typeid(db, attr, &obj_resolver)
 }
 
@@ -131,7 +132,8 @@ pub(crate) fn resolve_form_attribute(
     let form = metadata.form.as_ref()?;
     let attr = form.find_attribute(name.as_str())?;
 
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let obj_resolver =
+        crate::object_resolver::DbObjectResolver::new(db, resolver.visibility_file_id()?);
     Some(lower_form_attribute_to_typeid(db, attr, &obj_resolver))
 }
 
@@ -176,7 +178,8 @@ pub(crate) fn lookup_form_additional_column(
         .flat_map(|group| group.columns.iter())
         .find(|column| stdx::case::eq_ignore_case(&column.name, field.as_str()))?;
 
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let obj_resolver =
+        crate::object_resolver::DbObjectResolver::new(db, resolver.visibility_file_id()?);
     Some(FieldInfo {
         name: Name::new(&column.name),
         name_en: None,

@@ -6,6 +6,7 @@ use ide_db::base_db::{RootQueryDb, SourceDatabase};
 use ide_db::{RootDatabase, RootDatabaseImpl};
 use rustc_hash::FxHashSet;
 use salsa::Database;
+use std::cell::OnceCell;
 use syntax::{SyntaxKind, TextRange, TextSize};
 use vfs::FileId;
 
@@ -101,6 +102,7 @@ pub(crate) fn find_references_in_file<DB: RootDatabase>(
     let parse = db.parse(file_id);
     let root = parse.syntax_node();
     let sema = Semantics::new(db);
+    let inserted = OnceCell::new();
 
     let mut references = Vec::new();
 
@@ -115,7 +117,10 @@ pub(crate) fn find_references_in_file<DB: RootDatabase>(
             continue;
         }
 
-        let Some(candidate_symbol) = sema.symbol_for_token(file_id, &token) else {
+        let Some(candidate_symbol) = assembled_token(&inserted, db, file_id, &token)
+            .and_then(|assembled| sema.symbol_for_inserted_token(file_id, &assembled))
+            .or_else(|| sema.symbol_for_token(file_id, &token))
+        else {
             continue;
         };
 
@@ -132,6 +137,50 @@ pub(crate) fn find_references_in_file<DB: RootDatabase>(
     );
 
     references
+}
+
+/// Code an extension inserts with `#Вставка` into a method it changes with
+/// `&ИзменениеИКонтроль`. The extension's own parse keeps that code as raw tokens; the
+/// assembled module — the base module with the change applied — parses it as code.
+struct InsertedCode {
+    segments: Vec<hir::Segment>,
+    root: syntax::SyntaxNode,
+}
+
+impl InsertedCode {
+    fn of(db: &dyn RootDatabase, file_id: FileId) -> Option<Self> {
+        let eid = ide_db::effective_target(db, file_id)?;
+        let segments = hir::effective_module_text(db, eid)?.segments.clone();
+        let root = hir::parse_effective(db, eid).syntax_node();
+        Some(Self { segments, root })
+    }
+
+    /// The assembled module's token for `token`, a token of the extension's parse.
+    fn token_for(&self, token: &syntax::SyntaxToken) -> Option<syntax::SyntaxToken> {
+        let range = token.text_range();
+        let segment = self.segments.iter().find(|segment| {
+            segment.origin == hir::Origin::Inserted && segment.ext.contains_range(range)
+        })?;
+        let start = segment.effective.start() + (range.start() - segment.ext.start());
+        self.root
+            .token_at_offset(start)
+            .right_biased()
+            .filter(|assembled| assembled.text() == token.text())
+    }
+}
+
+/// The assembled module's token for `token` when it lies in code inserted with `#Вставка`.
+/// The assembled module is built on first need: most files hold no such code.
+fn assembled_token(
+    inserted: &OnceCell<Option<InsertedCode>>,
+    db: &dyn RootDatabase,
+    file_id: FileId,
+    token: &syntax::SyntaxToken,
+) -> Option<syntax::SyntaxToken> {
+    if !token.parent_ancestors().any(|node| node.kind() == SyntaxKind::PRE_INSERT_DIR) {
+        return None;
+    }
+    inserted.get_or_init(|| InsertedCode::of(db, file_id)).as_ref()?.token_for(token)
 }
 
 // --- reference search by name -----------------------------------------------------------
@@ -983,12 +1032,16 @@ pub fn walk_reference_file(
     }
     let parse = db.parse(file_id);
     let root = parse.syntax_node();
+    let inserted = OnceCell::new();
     let mut hits = Vec::new();
     for location in locations {
         let Some(token) = root.token_at_offset(location.range.start()).right_biased() else {
             continue;
         };
-        let kind = classify_reference_token(&token);
+        // What an occurrence in inserted code does is read off the assembled module: the
+        // extension's parse holds only raw tokens there.
+        let assembled = assembled_token(&inserted, db, file_id, &token);
+        let kind = classify_reference_token(assembled.as_ref().unwrap_or(&token));
         if let Some(wanted) = &req.kinds {
             if !wanted.contains(&kind) {
                 continue;

@@ -24,8 +24,8 @@ pub(crate) fn resolve_this_object_member(
             crate::this_object::resolve_this_value_manager_owner(db, resolver)?,
         ),
     };
-    let module_id = resolver.module_id()?;
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let file_id = resolver.visibility_file_id()?;
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, file_id);
     let receiver_id = db.metadata_ref(kind, mdo_name.as_str().to_string(), &RootConfigCtx);
     crate::field_lookup::lookup_field(db, &obj_resolver, receiver_id, name).map(|info| info.ty)
 }
@@ -37,8 +37,8 @@ pub(crate) fn resolve_this_record_set_member(
 ) -> Option<TypeId> {
     let (mdo_type, mdo_name) = crate::this_object::resolve_this_record_set_owner(db, resolver)?;
     let kind = hir_def::ty::MetadataKind::record_set_kind_for(mdo_type)?;
-    let module_id = resolver.module_id()?;
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let file_id = resolver.visibility_file_id()?;
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, file_id);
     let receiver_id = db.metadata_ref(kind, mdo_name.as_str().to_string(), &RootConfigCtx);
     crate::field_lookup::lookup_field(db, &obj_resolver, receiver_id, name).map(|info| info.ty)
 }
