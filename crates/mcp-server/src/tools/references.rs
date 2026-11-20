@@ -1311,10 +1311,8 @@ pub(crate) fn references_output_schema(
 
 /// The envelope itself, carrying the version its schema publishes.
 pub(crate) fn loading(report: &crate::diagnostics_state::StatusReport) -> CallToolResult {
-    let mut body = crate::tools::resident::loading_body(
-        report,
-        "резидентная база ссылок ещё строится, повторите запрос через несколько секунд",
-    );
+    let detail = crate::tools::resident::not_ready_detail(report, "`metadata` status");
+    let mut body = crate::tools::resident::loading_body(report, &detail);
     body["schema_version"] = json!("1");
     structured(body)
 }

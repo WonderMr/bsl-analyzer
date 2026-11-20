@@ -17,6 +17,11 @@ pub const REFERENCE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 const BUDGET_NOTE: &str = "\n-- карточка усечена под max_output_tokens; повысьте бюджет или \
                            запросите один метод: name=\"ИмяМетода\", type_name=\"ИмяТипа\" --\n";
 
+/// A member, a global function or a keyword already is the one-entity lookup, so the note only
+/// says that a larger budget brings the rest of it.
+const MEMBER_BUDGET_NOTE: &str =
+    "\n-- карточка усечена под max_output_tokens; повысьте бюджет, чтобы получить её целиком --\n";
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, JsonSchema, Serialize,
 )]
@@ -968,37 +973,136 @@ pub(crate) fn bsl_syntax_help_by_reference_id(
 }
 
 fn syntax_help_result(
-    mut text: String,
+    markdown: String,
     item: SyntaxHelpItem,
     max_output_tokens: usize,
 ) -> Result<CallToolResult, McpError> {
-    let mut body = serde_json::to_value(SyntaxHelpResponse::Card {
+    let note = budget_note(&item);
+    let body = serde_json::to_value(SyntaxHelpResponse::Card {
         schema_version: SyntaxHelpSchemaVersion::V2,
         item,
         text_truncated: false,
         budget_exhausted: false,
     })
     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let full = fit_answer(&markdown, body.clone(), max_output_tokens, note);
+    // The card's documentation repeats the Markdown served beside it, and for one function or
+    // method it is most of the card: a few hundred tokens cannot hold both. Whenever the
+    // Markdown has to be cut, the card without that prose is tried too, and the answer keeps
+    // whichever leaves more of the Markdown, so a larger budget never buys less text.
+    let whole =
+        full.as_ref().is_some_and(|(_, body)| body["text_truncated"].as_bool() == Some(false));
+    let mut lean = body;
+    let lean = if !whole && drop_prose(&mut lean) {
+        fit_answer(&markdown, lean, max_output_tokens, note)
+    } else {
+        None
+    };
+    let kept = |answer: &(String, Value)| kept_markdown(&markdown, &answer.0);
+    let answer = match (full, lean) {
+        (Some(full), Some(mut lean)) if kept(&lean) > kept(&full) => {
+            lean.1["budget_exhausted"] = json!(true);
+            Some(lean)
+        }
+        (Some(full), _) => Some(full),
+        (None, Some(mut lean)) => {
+            lean.1["budget_exhausted"] = json!(true);
+            Some(lean)
+        }
+        (None, None) => None,
+    };
+    if let Some((text, body)) = answer {
+        return Ok(structured_with_text(text, body));
+    }
+
+    // Not even the card without its prose fits. The minimal envelope says so, and the start of
+    // the Markdown that fits beside it still goes out: an empty answer reads as "no such member".
+    let body = serde_json::to_value(SyntaxHelpResponse::BudgetExhausted {
+        schema_version: SyntaxHelpSchemaVersion::V2,
+        status: SyntaxHelpBudgetStatus::BudgetExhausted,
+        budget_exhausted: true,
+        budget_hint: "increase max_output_tokens or request one exact reference_id".to_owned(),
+    })
+    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let mut text = markdown;
+    let text_budget = max_output_tokens.saturating_sub(serialized_bytes(&body).div_ceil(4));
+    truncate_text_to_budget(&mut text, text_budget, note);
+    if text.len() + serialized_bytes(&body) > max_output_tokens.saturating_mul(4) {
+        text.clear();
+    }
+    Ok(structured_with_text(text, body))
+}
+
+/// The note a cut card ends with. A whole type is cheaper read one member at a time; a member,
+/// a global function or a keyword already is the narrowest lookup, so only a larger budget
+/// brings more of it.
+fn budget_note(item: &SyntaxHelpItem) -> &'static str {
+    match item {
+        SyntaxHelpItem::Type { .. } => BUDGET_NOTE,
+        _ => MEMBER_BUDGET_NOTE,
+    }
+}
+
+/// How many leading bytes of `markdown` the answer `text` carries.
+fn kept_markdown(markdown: &str, text: &str) -> usize {
+    markdown.bytes().zip(text.bytes()).take_while(|(left, right)| left == right).count()
+}
+
+/// The Markdown cut to what the card leaves of `max_output_tokens`, and the card fitted to the
+/// rest, or `None` when even the card's identity and the truncation note exceed the budget.
+fn fit_answer(
+    text: &str,
+    mut body: Value,
+    max_output_tokens: usize,
+    note: &str,
+) -> Option<(String, Value)> {
     // The Markdown is served first, but not out of the card identity's pocket: charging it the
     // whole ceiling leaves nothing for the kind and the names, and the pair then trips the
     // over-ceiling check below — an answer with a truncated rendering and a naming card becomes
     // an empty envelope. What the identity needs is reserved before the text is cut.
+    let mut text = text.to_owned();
     let text_budget = max_output_tokens.saturating_sub(identity_bytes(&body).div_ceil(4));
-    let text_truncated = truncate_text_to_budget(&mut text, text_budget, BUDGET_NOTE);
+    let text_truncated = truncate_text_to_budget(&mut text, text_budget, note);
     body["text_truncated"] = json!(text_truncated);
     let budget_exhausted = fit_card_to_budget(&mut body, max_output_tokens, text.len());
     body["budget_exhausted"] = json!(budget_exhausted);
-    if text.len() + serialized_bytes(&body) > max_output_tokens.saturating_mul(4) {
-        text.clear();
-        body = serde_json::to_value(SyntaxHelpResponse::BudgetExhausted {
-            schema_version: SyntaxHelpSchemaVersion::V2,
-            status: SyntaxHelpBudgetStatus::BudgetExhausted,
-            budget_exhausted: true,
-            budget_hint: "increase max_output_tokens or request one exact reference_id".to_owned(),
-        })
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let fits = text.len() + serialized_bytes(&body) <= max_output_tokens.saturating_mul(4);
+    fits.then_some((text, body))
+}
+
+/// Strip from the card the prose its Markdown also carries — each callable's `documentation`, a
+/// property's description and notes, a keyword's description and parameters — reporting
+/// whether there was any.
+fn drop_prose(body: &mut Value) -> bool {
+    let mut dropped = false;
+    for key in ["function", "constructor"] {
+        if let Some(callable) = body.get_mut(key) {
+            dropped |= blank_out(callable.get_mut("documentation"), Value::Null);
+        }
     }
-    Ok(structured_with_text(text, body))
+    for key in ["matches", "constructors"] {
+        if let Some(callables) = body.get_mut(key).and_then(Value::as_array_mut) {
+            for callable in callables {
+                dropped |= blank_out(callable.get_mut("documentation"), Value::Null);
+            }
+        }
+    }
+    if body["kind"] == "property" {
+        dropped |= blank_out(body.get_mut("description"), Value::Null);
+        dropped |= blank_out(body.get_mut("notes"), Value::Null);
+    }
+    // A keyword's description is a required string in the published schema, so it is emptied
+    // rather than nulled.
+    if body["kind"] == "keyword" {
+        dropped |= blank_out(body.get_mut("description"), json!(""));
+        dropped |= blank_out(body.get_mut("parameters"), json!([]));
+    }
+    dropped
+}
+
+/// Replace the value in `slot` with `blank`, reporting whether it held anything else.
+fn blank_out(slot: Option<&mut Value>, blank: Value) -> bool {
+    slot.is_some_and(|value| std::mem::replace(value, blank.clone()) != blank)
 }
 
 fn syntax_help_not_found(
@@ -1019,13 +1123,13 @@ fn syntax_help_not_found(
     Ok(structured_with_text(format!("Сущность платформы не найдена: {target}"), body))
 }
 
-/// The card's own size with every listing emptied — the kind, the names, the flags, which no
-/// budget may drop.
+/// The card's own size with every listing cut to what it keeps at any budget — the kind, the
+/// names, the flags and the one match a lookup answers with, which no budget may drop.
 fn identity_bytes(body: &Value) -> usize {
     let mut identity = body.clone();
-    for (key, _) in LISTINGS {
+    for (key, keep_one) in LISTINGS {
         if let Some(array) = identity.get_mut(key).and_then(Value::as_array_mut) {
-            array.clear();
+            array.truncate(usize::from(keep_one));
         }
     }
     serialized_bytes(&identity)
@@ -2258,6 +2362,345 @@ mod tests {
 
         assert_eq!(card["budget_exhausted"], true);
         assert_eq!(card["status"], "budget_exhausted");
+    }
+
+    /// Forty lines of prose: more than a few hundred tokens hold, twice over with the card's copy.
+    fn long_prose() -> String {
+        (1..=40)
+            .map(|line| format!("Строка {line} описания: подставляет параметры в шаблон."))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A callable documented at more length than a few hundred tokens hold, and the Markdown
+    /// that renders it, as `syntax_help_card` pairs them: the card's `documentation` repeats
+    /// the Markdown's description.
+    fn documented_callable(name: &str, owner_type: Option<&str>) -> (String, SyntaxCallable) {
+        let description = long_prose();
+        let markdown = format!(
+            "# {name} / StrTemplate\n\n```bsl\n{name}(Шаблон: Строка): Строка\n```\n\n\
+             ## Описание\n\n{description}\n"
+        );
+        let callable = SyntaxCallable {
+            name: name.to_owned(),
+            english_name: Some("StrTemplate".to_owned()),
+            owner_type: owner_type.map(str::to_owned),
+            variant_name: None,
+            return_type: Some("Строка".to_owned()),
+            parameters: vec![SyntaxParameter {
+                name: "Шаблон".to_owned(),
+                parameter_type: Some("Строка".to_owned()),
+                optional: false,
+                variadic: false,
+            }],
+            variants: Vec::new(),
+            min_version: None,
+            contexts: vec![SyntaxContext::Server],
+            documentation: Some(SyntaxDocumentation {
+                syntax: format!("{name}(<Шаблон>)"),
+                description,
+                parameters: Vec::new(),
+                examples: Vec::new(),
+                notes: None,
+                see_also: Vec::new(),
+            }),
+        };
+        (markdown, callable)
+    }
+
+    /// A documented property, a documented keyword and a documented constructor, each with
+    /// the Markdown that renders it and the JSON pointer of the prose its card repeats.
+    fn documented_cards() -> Vec<(&'static str, String, SyntaxHelpItem, &'static str)> {
+        let prose = long_prose();
+        let property = SyntaxHelpItem::Property {
+            name: "Свойство".to_owned(),
+            english_name: "Property".to_owned(),
+            owner_type: Some("ТестовыйТип".to_owned()),
+            property_types: vec!["Строка".to_owned()],
+            read_only: false,
+            min_version: None,
+            contexts: Vec::new(),
+            description: Some(prose.clone()),
+            notes: Some(prose.clone()),
+            see_also: Vec::new(),
+        };
+        let property_markdown = format!(
+            "# ТестовыйТип.Свойство / ТестовыйТип.Property\n\nТип: Строка\n\n\
+             ## Описание\n\n{prose}\n\n## Примечания\n\n{prose}\n"
+        );
+        let keyword = SyntaxHelpItem::Keyword {
+            name: "Пока".to_owned(),
+            english_name: "While".to_owned(),
+            syntax: "Пока <Условие> Цикл".to_owned(),
+            description: prose.clone(),
+            parameters: vec![SyntaxDocParameter {
+                name: "Условие".to_owned(),
+                description: prose.clone(),
+                default_value: None,
+            }],
+            min_version: None,
+        };
+        let keyword_markdown = format!(
+            "# Пока / While\n\n## Синтаксис\n\n```bsl\nПока <Условие> Цикл\n```\n\n\
+             ## Описание\n\n{prose}\n\n## Параметры\n\n- **Условие**: {prose}\n"
+        );
+        let (constructor_markdown, constructor) = documented_callable("Новый", Some("ТестовыйТип"));
+        vec![
+            ("property", property_markdown, property, "/description"),
+            ("keyword", keyword_markdown, keyword, "/description"),
+            (
+                "constructor",
+                constructor_markdown,
+                SyntaxHelpItem::Constructor { constructor },
+                "/constructor/documentation",
+            ),
+        ]
+    }
+
+    fn is_blank(value: &Value) -> bool {
+        value.is_null() || *value == "" || *value == json!([])
+    }
+
+    /// How many leading bytes of the Markdown an answer carries.
+    fn kept(markdown: &str, result: &CallToolResult) -> usize {
+        kept_markdown(markdown, extract_text(result))
+    }
+
+    /// A few hundred tokens cannot hold a documented function's Markdown and its card's
+    /// documentation together. The answer is still the card, with the Markdown cut at a line
+    /// boundary and the note after it: the card gives up the prose the Markdown repeats, not
+    /// the answer. Only a budget below the card's identity gets the minimal envelope, and a
+    /// budget that holds everything gets everything.
+    #[test]
+    fn a_modest_budget_cuts_the_markdown_and_keeps_the_card() {
+        for budget in [300, 600] {
+            let (markdown, function) = documented_callable("СтрШаблон", None);
+            let item = SyntaxHelpItem::GlobalFunction { function };
+            let result = syntax_help_result(markdown.clone(), item, budget).unwrap();
+            let card = structured(&result);
+            let text = extract_text(&result);
+
+            assert_eq!(card["kind"], "global_function", "{budget}: {card}");
+            assert_eq!(card["function"]["name"], "СтрШаблон", "{budget}: {card}");
+            assert!(card["function"]["documentation"].is_null(), "{budget}: {card}");
+            assert_eq!(card["text_truncated"], true, "{budget}: {card}");
+            assert_eq!(card["budget_exhausted"], true, "{budget}: {card}");
+            let kept = text.strip_suffix(MEMBER_BUDGET_NOTE).expect("cut cards end in a note");
+            assert!(kept.starts_with("# СтрШаблон / StrTemplate\n"), "{budget}: {kept}");
+            assert!(markdown.starts_with(kept) && kept.ends_with('\n'), "{budget}: {kept:?}");
+            assert!(pair_bytes(&result) <= budget * 4, "{budget}: {} bytes", pair_bytes(&result));
+        }
+
+        let (markdown, function) = documented_callable("СтрШаблон", None);
+        let item = SyntaxHelpItem::GlobalFunction { function };
+        let full = syntax_help_result(markdown.clone(), item, 6000).unwrap();
+        assert_eq!(extract_text(&full), markdown);
+        assert!(structured(&full)["function"]["documentation"]["description"].is_string());
+        assert_eq!(structured(&full)["budget_exhausted"], false);
+
+        let (markdown, function) = documented_callable("СтрШаблон", None);
+        let item = SyntaxHelpItem::GlobalFunction { function };
+        let tiny = syntax_help_result(markdown, item, 1).unwrap();
+        assert_eq!(structured(&tiny)["status"], "budget_exhausted");
+        assert!(extract_text(&tiny).is_empty());
+    }
+
+    /// The one match a member lookup answers with is reserved before the Markdown is cut: a
+    /// Markdown that took the whole budget left the match over it, and the pair went out as the
+    /// minimal envelope.
+    #[test]
+    fn a_modest_budget_keeps_the_one_match_of_a_member_lookup() {
+        let (markdown, method) =
+            documented_callable("ОтправитьДляОбработки", Some("HTTPСоединение"));
+        let item = SyntaxHelpItem::Method { matches: vec![method] };
+        let result = syntax_help_result(markdown, item, 600).unwrap();
+        let card = structured(&result);
+
+        assert_eq!(card["kind"], "method", "{card}");
+        assert_eq!(card["matches"].as_array().map(Vec::len), Some(1), "{card}");
+        assert_eq!(card["matches"][0]["owner_type"], "HTTPСоединение", "{card}");
+        assert!(card["matches"][0]["documentation"].is_null(), "{card}");
+        assert_eq!(card["budget_exhausted"], true, "{card}");
+        let text = extract_text(&result);
+        assert!(text.ends_with(MEMBER_BUDGET_NOTE), "a member is not told to ask for one: {text}");
+        assert!(pair_bytes(&result) <= 600 * 4, "{} bytes", pair_bytes(&result));
+    }
+
+    /// Just above the budget at which the documented card fits, it would leave the Markdown
+    /// less room than the card without its prose did one step below: the answer takes the card
+    /// that leaves more Markdown, so a client reading the text never gets less for more budget.
+    /// The minimal envelope below the card's own size is its own range: the text it carries is
+    /// sized against the envelope, not the card.
+    #[test]
+    fn the_kept_markdown_never_shrinks_as_the_budget_grows() {
+        for owner_type in [None, Some("HTTPСоединение")] {
+            let mut card_kept = 0;
+            let mut envelope_kept = 0;
+            for budget in (1..=2400).step_by(5) {
+                let (markdown, callable) = documented_callable("СтрШаблон", owner_type);
+                let item = match owner_type {
+                    None => SyntaxHelpItem::GlobalFunction { function: callable },
+                    Some(_) => SyntaxHelpItem::Method { matches: vec![callable] },
+                };
+                let result = syntax_help_result(markdown.clone(), item, budget).unwrap();
+                let kept = kept(&markdown, &result);
+                let envelope = structured(&result).get("status").is_some();
+                let previous = if envelope { &mut envelope_kept } else { &mut card_kept };
+                assert!(kept >= *previous, "{owner_type:?} at {budget}: {kept} < {previous}");
+                *previous = kept;
+                // The minimal envelope alone may exceed a budget of a few dozen tokens; anything
+                // sent beside it has to fit.
+                if !envelope || kept > 0 {
+                    assert!(pair_bytes(&result) <= budget * 4, "{owner_type:?} at {budget}");
+                }
+            }
+            assert!(card_kept > 0 && envelope_kept > 0, "{owner_type:?}: both ranges were met");
+        }
+    }
+
+    /// A member whose card is large even without its documentation — a parameter that takes
+    /// dozens of types, rendered as one signature line longer than the budget — still answers
+    /// with text: below the card's size the minimal envelope carries the start of the Markdown,
+    /// and the signature line is cut inside rather than dropped for the line break before it.
+    #[test]
+    fn an_oversized_signature_still_answers_with_the_start_of_the_markdown() {
+        let types: Vec<String> =
+            (1..=40).map(|n| format!("ОбъектМетаданных: ТипОбъектаМетаданных{n}")).collect();
+        let signature =
+            format!("ЗаписьЖурналаРегистрации(ИмяСобытия: Строка, [Объект: {}])", types.join(", "));
+        let markdown = format!(
+            "# ЗаписьЖурналаРегистрации / WriteLogEvent\n\n```bsl\n{signature}\n```\n\n\
+             ## Описание\n\n{}\n",
+            long_prose()
+        );
+        let callable = || SyntaxCallable {
+            name: "ЗаписьЖурналаРегистрации".to_owned(),
+            english_name: Some("WriteLogEvent".to_owned()),
+            owner_type: None,
+            variant_name: None,
+            return_type: None,
+            parameters: types
+                .iter()
+                .map(|parameter_type| SyntaxParameter {
+                    name: "Объект".to_owned(),
+                    parameter_type: Some(parameter_type.clone()),
+                    optional: true,
+                    variadic: false,
+                })
+                .collect(),
+            variants: Vec::new(),
+            min_version: None,
+            contexts: Vec::new(),
+            documentation: None,
+        };
+        for (budget, envelope) in [(300, true), (600, true), (2000, false)] {
+            let item = SyntaxHelpItem::GlobalFunction { function: callable() };
+            let result = syntax_help_result(markdown.clone(), item, budget).unwrap();
+            let text = extract_text(&result);
+
+            assert_eq!(structured(&result).get("status").is_some(), envelope, "{budget}");
+            assert!(
+                text.starts_with(
+                    "# ЗаписьЖурналаРегистрации / WriteLogEvent\n\n```bsl\n\
+                     ЗаписьЖурналаРегистрации(ИмяСобытия: Строка, [Объект: ОбъектМетаданных",
+                ),
+                "{budget}: the signature is cut inside, not dropped: {text}"
+            );
+            let fences = text.lines().filter(|line| line.starts_with("```")).count();
+            assert!(fences.is_multiple_of(2), "{budget}: the fence is closed: {text}");
+            assert!(text.ends_with(MEMBER_BUDGET_NOTE), "{budget}: {text}");
+            assert!(pair_bytes(&result) <= budget * 4, "{budget}: {} bytes", pair_bytes(&result));
+        }
+    }
+
+    /// Every kind of card that repeats prose gives it up: a constructor's documentation, a
+    /// type's documented constructors, a property's description and notes, a keyword's
+    /// description and parameters.
+    #[test]
+    fn drop_prose_blanks_the_prose_of_every_card_kind() {
+        let card = |item| {
+            serde_json::to_value(SyntaxHelpResponse::Card {
+                schema_version: SyntaxHelpSchemaVersion::V2,
+                item,
+                text_truncated: false,
+                budget_exhausted: false,
+            })
+            .unwrap()
+        };
+        let (_, constructor) = documented_callable("Новый", Some("ТестовыйТип"));
+        let documented_type = SyntaxHelpItem::Type {
+            name: "ТестовыйТип".to_owned(),
+            english_name: "TestType".to_owned(),
+            min_version: None,
+            contexts: Vec::new(),
+            iterable_element_types: Vec::new(),
+            xdto_name: None,
+            constructors: vec![constructor],
+            methods: Vec::new(),
+            properties: Vec::new(),
+        };
+        let mut cases = vec![(card(documented_type), vec!["/constructors/0/documentation"])];
+        for (kind, _, item, _) in documented_cards() {
+            let pointers = match kind {
+                "property" => vec!["/description", "/notes"],
+                "keyword" => vec!["/description", "/parameters"],
+                _ => vec!["/constructor/documentation"],
+            };
+            cases.push((card(item), pointers));
+        }
+
+        for (mut body, pointers) in cases {
+            for pointer in &pointers {
+                assert!(body.pointer(pointer).is_some_and(|value| !is_blank(value)), "{pointer}");
+            }
+            assert!(drop_prose(&mut body), "{body}");
+            for pointer in &pointers {
+                assert!(body.pointer(pointer).is_some_and(is_blank), "{pointer}: {body}");
+            }
+            assert!(!drop_prose(&mut body), "nothing is left to drop: {body}");
+        }
+    }
+
+    /// The same at the tool's level: a property, a keyword and a constructor documented at
+    /// length answer a few hundred tokens with their card and the cut Markdown.
+    #[test]
+    fn documented_properties_keywords_and_constructors_answer_a_modest_budget() {
+        for budget in [300, 600] {
+            for (kind, markdown, item, prose) in documented_cards() {
+                let result = syntax_help_result(markdown.clone(), item, budget).unwrap();
+                let card = structured(&result);
+                let text = extract_text(&result);
+
+                assert_eq!(card["kind"], kind, "{budget}: {card}");
+                assert!(card.pointer(prose).is_some_and(is_blank), "{kind} at {budget}: {card}");
+                assert_eq!(card["budget_exhausted"], true, "{kind} at {budget}: {card}");
+                assert!(text.ends_with(MEMBER_BUDGET_NOTE), "{kind} at {budget}: {text}");
+                assert!(kept(&markdown, &result) > 0, "{kind} at {budget}");
+                assert!(pair_bytes(&result) <= budget * 4, "{kind} at {budget}");
+            }
+        }
+    }
+
+    /// The lookups that came back as an empty text and the minimal envelope under a few hundred
+    /// tokens: a global function and a method of a type, each documented at length, and a
+    /// function whose signature alone outgrows such a budget.
+    #[test]
+    #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
+    fn documented_members_answer_a_modest_budget_with_text() {
+        for (name, type_name) in [
+            ("СтрШаблон", None),
+            ("ОтправитьДляОбработки", Some("HTTPСоединение")),
+            ("ЗаписьЖурналаРегистрации", None),
+        ] {
+            for budget in [300, 600, 2000] {
+                let result = bsl_syntax_help(name, type_name, budget).unwrap();
+                let text = extract_text(&result);
+
+                assert!(text.starts_with(&format!("# {name}")), "{name} at {budget}: {text}");
+                assert!(text.len() > name.len() * 4, "{name} at {budget}: {text}");
+                assert!(pair_bytes(&result) <= budget * 4, "{name} at {budget}");
+            }
+        }
     }
 
     /// The syntax helper marks availability only where the platform limits it, so an unmarked
