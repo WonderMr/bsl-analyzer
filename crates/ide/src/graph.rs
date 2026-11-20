@@ -2781,6 +2781,29 @@ impl StripRoot {
         }
     }
 
+    /// Which of a walked file's two spellings a build keys its ids by: the walk's while both
+    /// lie under the root, as these ids have always been minted, and the canonical one
+    /// otherwise.
+    ///
+    /// Outside the root the key is the whole path, so it has to be the spelling every other
+    /// producer arrives at: [`Self::file_key`] — the bridge for search hits, findings and
+    /// cards — and the incremental patch both key the canonical path. The walk keeps the root
+    /// as it was declared, and a drive letter in another case, an 8.3 short name or a link in
+    /// that declaration would otherwise give one file one id per producer. A root declared
+    /// through a link inside the workspace that leads outside it is decided by where the file
+    /// really is, for the same reason.
+    pub fn id_spelling<'p>(&self, walked: &'p str, canonical: &'p str) -> &'p str {
+        let under = |path: &str| {
+            let root = self.resolved.to_str();
+            root.is_some_and(|root| hir::graph_index::graph_file_is_under_root(path, root))
+        };
+        if under(walked) && under(canonical) {
+            walked
+        } else {
+            canonical
+        }
+    }
+
     /// The single spelling to hand a consumer that takes one — the row encoder, whose strip
     /// lives in another crate and stays a plain string operation.
     fn resolved(&self) -> &Path {
@@ -4216,6 +4239,19 @@ mod tests {
         assert_eq!(sibling.as_deref(), Some("method/file//ws/project/a/Module.bsl::M"));
         // Absolute path with no root → None: which key the graph holds depends on the root.
         assert_eq!(method_graph_id("/ws/proj/a/Module.bsl", "M", None), None);
+    }
+
+    /// A build keeps the walk's spelling only where both spellings lie under the root; a file
+    /// that really lies outside it, however the walk reached it, is keyed by its canonical
+    /// spelling, the one the bridge canonicalizes to.
+    #[test]
+    fn a_build_keys_a_file_outside_the_root_by_its_canonical_spelling() {
+        use std::path::Path;
+        let root = StripRoot::pinned(Path::new("/ws/proj"));
+        assert_eq!(root.id_spelling("/ws/proj/a.bsl", "/ws/proj/b.bsl"), "/ws/proj/a.bsl");
+        assert_eq!(root.id_spelling("/ws/proj/src/a.bsl", "/real/a.bsl"), "/real/a.bsl");
+        assert_eq!(root.id_spelling("/link/a.bsl", "/real/a.bsl"), "/real/a.bsl");
+        assert_eq!(root.id_spelling("/link/a.bsl", "/ws/proj/a.bsl"), "/ws/proj/a.bsl");
     }
 
     /// The row encoder, the serving encoder and `method_graph_id` key a file outside the

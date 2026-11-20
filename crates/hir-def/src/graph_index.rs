@@ -2197,8 +2197,24 @@ pub fn display_scope(key: &ModuleKey) -> String {
 /// Every place that mints or resolves these ids keys a file through this one function, which
 /// is what lets an id the build stored resolve when it is handed back. `None` only for an
 /// empty path.
+///
+/// The key is a string operation on the spelling it is handed, so outside the root it is only
+/// as stable as that spelling: every producer hands it the canonical path of a file outside
+/// the root, which is what keeps a drive letter's case, an 8.3 short name or a link in the
+/// declared root from splitting one file's ids.
 pub fn graph_file_key(abs: &str, workspace_root: &str) -> Option<String> {
     file_key(abs, workspace_root, cfg!(windows))
+}
+
+/// Whether [`graph_file_key`] keys `abs` relative to `workspace_root` rather than by its whole
+/// path — the same rule, asked without minting the key.
+pub fn graph_file_is_under_root(abs: &str, workspace_root: &str) -> bool {
+    is_under_root(abs, workspace_root, cfg!(windows))
+}
+
+fn is_under_root(abs: &str, workspace_root: &str, windows: bool) -> bool {
+    let (abs, root) = (abs.replace('\\', "/"), workspace_root.replace('\\', "/"));
+    rel_under_root(&abs, root.trim_end_matches('/'), windows).is_some()
 }
 
 /// [`graph_file_key`] under the path rules of Windows (`windows`) or of every other system,
@@ -2962,6 +2978,17 @@ mod module_layout_hash_tests {
         // A volume path has no plainer spelling to fall back to.
         let key = file_key("//?/Volume{0}/a/M.bsl", "C:/ws", true);
         assert_eq!(key.as_deref(), Some("//?/Volume{0}/a/M.bsl"));
+    }
+
+    /// The question a build asks before choosing which spelling of a file to key has the
+    /// key's own answer.
+    #[test]
+    fn a_file_is_under_the_root_exactly_where_its_key_is_relative() {
+        assert!(is_under_root("/ws/proj/a/b.bsl", "/ws/proj/", false));
+        assert!(!is_under_root("/ws/project/a.bsl", "/ws/proj", false));
+        assert!(!is_under_root("/ws/proj", "/ws/proj", false));
+        assert!(is_under_root(r"\\?\C:\ws\a\M.bsl", "c:/WS", true));
+        assert!(!is_under_root(r"\\?\C:\base\a\M.bsl", r"\\?\C:\ws", true));
     }
 
     /// One graph index over the given modules, each a `(path, source)` pair, and the paths
