@@ -554,7 +554,13 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                     };
                     let mut settings = mcp_server::SessionConfig::default();
                     native.install(&mut settings, &executor_slots)?;
-                    server.shared_state().warm_reference_indexes(&context.enable_tools);
+                    // Off the session's worker: asking reads the resident's lifecycle, and a
+                    // warm-up chunk in progress holds it.
+                    let warm_state = server.shared_state().clone();
+                    let warm_tools = context.enable_tools.clone();
+                    tokio::task::spawn_blocking(move || {
+                        warm_state.warm_reference_indexes(&warm_tools);
+                    });
                     for tool in context.enable_tools {
                         settings.enable_tool(tool);
                     }

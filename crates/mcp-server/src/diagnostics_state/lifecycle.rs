@@ -203,13 +203,33 @@ impl NameWarm {
 }
 
 /// What a caller still needs after [`publish_build_success`] moved the built resident into
-/// the state: the scan roots the hub is re-armed on, and the two identity values that re-arm
-/// is guarded by.
+/// the state: the scan roots the hub is re-armed on, the two identity values that re-arm
+/// is guarded by, and the name-index warm-up the publication opened, for the caller to
+/// spawn once it has let the state go.
 struct PublishTail {
     files: usize,
     scan_roots: Vec<PathBuf>,
     physical_topology: u64,
     declaration_epoch: u64,
+    name_warm: Option<OpenedNameWarm>,
+}
+
+/// A name-index warm-up opened and not yet handed to its thread. Dropped before
+/// [`DiagnosticsState::spawn_name_warm`] took it — the publishing thread unwound on the way —
+/// it ends its own epoch: a flag that no thread will lower would hold every `references` call
+/// on the envelope.
+struct OpenedNameWarm {
+    state: DiagnosticsState,
+    epoch: u64,
+    cancel: Option<Arc<RequestCancel>>,
+}
+
+impl Drop for OpenedNameWarm {
+    fn drop(&mut self) {
+        if self.cancel.is_some() {
+            self.state.finish_name_warm(self.epoch);
+        }
+    }
 }
 
 impl DiagnosticsState {
@@ -242,11 +262,16 @@ impl DiagnosticsState {
         inner.status = DiagnosticsStatus::Ready { files };
         *lock_recover(&self.last_access) = Instant::now();
         crate::workspace_handle::notify_generation(self, inner.generation);
+        // Opened together with `Ready`, under the same hold: a `references` call that reads
+        // the published resident before the worker is spawned meets the warm-up's envelope,
+        // not a cold index it would build inside the call.
+        let name_warm = self.open_name_warm();
         PublishTail {
             files,
             scan_roots: built.scan_roots,
             physical_topology: built.physical_topology,
             declaration_epoch: built.declaration_epoch,
+            name_warm,
         }
     }
 }
@@ -1063,21 +1088,33 @@ impl DiagnosticsState {
         Some(report)
     }
 
-    /// Start a background warm-up of the name indexes over the resident just published,
-    /// when a served `references` has asked for one. A warm-up already running is cancelled
-    /// and retired by the epoch this one takes: the resident it was warming may be the one
-    /// replaced. Nothing starts once the state is shutting down.
+    /// Start a background warm-up of the name indexes over the resident served now.
     fn start_name_warm(&self) {
-        if self.shutdown.load(Ordering::SeqCst) {
-            return;
+        let opened = self.open_name_warm();
+        self.spawn_name_warm(opened);
+    }
+
+    /// Open a warm-up when a served `references` has asked for one: its epoch, its clock and
+    /// its cancellation. A warm-up already running is cancelled and retired by the epoch this
+    /// one takes: the resident it was warming may be the one replaced.
+    ///
+    /// Nothing opens once the state is shutting down, and the flag is read under the lock
+    /// `shutdown` takes after raising it: a shutdown either comes first and is seen here, or
+    /// comes after and cancels what this opened.
+    fn open_name_warm(&self) -> Option<OpenedNameWarm> {
+        let mut warm = lock_recover(&self.name_warm);
+        if !warm.wanted || self.shutdown.load(Ordering::SeqCst) {
+            return None;
         }
-        let (epoch, cancel) = {
-            let mut warm = lock_recover(&self.name_warm);
-            if !warm.wanted {
-                return;
-            }
-            warm.open()
-        };
+        let (epoch, cancel) = warm.open();
+        Some(OpenedNameWarm { state: self.clone(), epoch, cancel: Some(cancel) })
+    }
+
+    /// Run the warm-up [`Self::open_name_warm`] opened on a thread of its own.
+    fn spawn_name_warm(&self, opened: Option<OpenedNameWarm>) {
+        let Some(mut opened) = opened else { return };
+        let Some(cancel) = opened.cancel.take() else { return };
+        let epoch = opened.epoch;
         let state = self.clone();
         let spawned = std::thread::Builder::new()
             .name("bsl-names-warm".to_owned())
@@ -1435,7 +1472,7 @@ impl DiagnosticsState {
                 if self.last_good_on_invalid {
                     self.poll_pending_drift();
                 }
-                self.start_name_warm();
+                self.spawn_name_warm(tail.name_warm);
                 if trace_markers {
                     tracing::info!(
                         target: "bsl_analyzer::shared_backend",
@@ -1609,7 +1646,7 @@ impl DiagnosticsState {
                 }
                 // The swapped-in resident starts cold: the indexes the old one held were
                 // built over the database this rebuild replaced.
-                self.start_name_warm();
+                self.spawn_name_warm(tail.name_warm);
                 if trace_markers {
                     tracing::info!(
                         target: "bsl_analyzer::shared_backend",
