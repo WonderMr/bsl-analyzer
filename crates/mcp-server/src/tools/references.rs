@@ -1317,6 +1317,21 @@ pub(crate) fn loading(report: &crate::diagnostics_state::StatusReport) -> CallTo
     structured(body)
 }
 
+/// The `detail` of [`warming`]. The resident is ready while the name indexes build, so
+/// `metadata` status already says `ready` there: pointing at it would send the caller to a
+/// probe that cannot tell it when to come back.
+pub(crate) const WARMING_DETAIL: &str =
+    "the name indexes `references` reads are building in the background after the resident; \
+     `metadata` status already says ready, so retry `references` itself";
+
+/// The envelope `references` answers while the background warm-up builds its name indexes:
+/// the same shape as [`loading`], with the advice that fits this wait.
+pub(crate) fn warming(report: &crate::diagnostics_state::StatusReport) -> CallToolResult {
+    let mut body = crate::tools::resident::loading_body(report, WARMING_DETAIL);
+    body["schema_version"] = json!("1");
+    structured(body)
+}
+
 #[derive(Deserialize, JsonSchema, Serialize)]
 #[allow(
     dead_code,

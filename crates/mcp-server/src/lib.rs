@@ -2675,7 +2675,7 @@ impl McpServer {
                 // answering now would mean running the rest of it inside this call, minutes
                 // on a large configuration, so the call is told to come back instead.
                 if let Some(report) = session.name_warm_report() {
-                    return Ok(tools::references::loading(&report));
+                    return Ok(tools::references::warming(&report));
                 }
                 // Before the read that folds them: the name indexes' per-file halves,
                 // warmed in chunks with a trim between, so a cold index is built from
@@ -6712,6 +6712,7 @@ mod reference_name_warm_up {
         );
         assert_eq!(held["status"], "loading", "{held}");
         assert_eq!(held["state"], "loading", "{held}");
+        assert_eq!(held["detail"], tools::references::WARMING_DETAIL, "{held}");
         assert!(held.get("outcome").is_none(), "no reference answer was computed: {held}");
 
         let card = inline(
