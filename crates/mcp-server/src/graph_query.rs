@@ -459,6 +459,13 @@ impl GraphDb {
                 "graph database schema_version {version} != expected {SCHEMA_VERSION}"
             ),
         }
+        // The number alone does not prove the layout: another build of the program may have
+        // written the same number over an edges table without this column, and every edge read
+        // would then fail instead of the database being rebuilt.
+        anyhow::ensure!(
+            self.conn.prepare("SELECT interception FROM edges LIMIT 0").is_ok(),
+            "graph database edges have no interception column (written by another build)"
+        );
         anyhow::ensure!(
             self.meta("publication_id")?.is_some_and(|id| !id.is_empty()),
             "graph database has no publication_id (incomplete publication)"

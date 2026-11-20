@@ -13025,6 +13025,22 @@ mod cache_refusal_tests {
     }
 
     #[test]
+    fn a_current_number_over_an_older_edges_layout_is_named_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = seeded(root);
+        edit_meta(&db, "ALTER TABLE edges DROP COLUMN interception");
+
+        let (graph, lines) = load(root);
+
+        let refusal = refusal(&lines);
+        assert!(refusal.contains("edges have no interception column"), "{refusal}");
+        assert_eq!(served_generation(&graph), Some(1), "the older layout was not rebuilt");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert!(conn.prepare("SELECT interception FROM edges LIMIT 0").is_ok(), "not rebuilt");
+    }
+
+    #[test]
     fn each_missing_publication_marker_is_named() {
         for (key, named) in [
             ("schema_version", "has no schema_version (incomplete build)"),
