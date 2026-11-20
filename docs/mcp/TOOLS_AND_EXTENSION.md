@@ -136,18 +136,23 @@ MCP error с `reasonCode`; `list_platform` и `syntax_help` читают вст�
 
 - `syntax_help` — `status: "loading"`, `retry_after_ms` и `detail`, без карточки и без
   вердикта `not_found`;
-- `search` с действиями `list_platform`, `find_docs`, `search_docs` — `status: "not_ready"`
-  с `retry_after_ms`, как во время сборки справочного индекса;
+- `search` с действиями `list_platform`, `find_docs`, `search_docs` и `search_code` —
+  `status: "not_ready"` с `retry_after_ms`, как во время сборки индекса. Сам `search_code`
+  справку не читает, но, как только индекс кода готов, вызов ждёт окончания её загрузки,
+  поэтому до её загрузки он отвечает так же;
 - `symbol_info`, `references` и `diagnostics` с действиями `file`, `snippet`, `workspace` —
   конверт резидентной базы со `status: "loading"`, каким бы ни было собственное состояние
   базы (`state`): типы и платформенные члены читаются из справки;
 - `graph(action=resolve)` отвечает без платформенных кандидатов, а источник `platform` в
   `providers[]` имеет состояние `not_ready`.
 
-Остальные инструменты справку не ждут: `outline`, `metadata`, `query`, `search_code`,
-действия `status`, `schema`, `catalog` отвечают как обычно, а если им нужна резидентная
-база или граф, которые ещё строятся, — своим обычным конвертом `loading`. Отменённый
-вызов конверта не получает.
+Параметры проверяются до ожидания справки: вызов с ошибкой в параметрах получает
+`invalid_params`, а не конверт повтора. Остальные инструменты справку не ждут: `outline`,
+`metadata`, `query`, действия `status`, `schema`, `catalog` отвечают как обычно, а если им
+нужна резидентная база или граф, которые ещё строятся, — своим обычным конвертом `loading`.
+Резидентная база начинает сборку после загрузки справки, и срок сборки
+(`BSL_MCP_DIAG_BUILD_TIMEOUT_SECS`) отсчитывается с этого момента, а не со старта сервера.
+Отменённый вызов конверта не получает.
 
 ```json tool=syntax_help
 {
