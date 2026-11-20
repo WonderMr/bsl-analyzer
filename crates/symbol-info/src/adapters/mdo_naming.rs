@@ -25,6 +25,7 @@ pub(super) fn russian_plural(mdo_type: MdoType) -> &'static str {
         | CommonModule
         | EventSubscription
         | Subsystem
-        | Role => "",
+        | Role
+        | ScheduledJob => "",
     }
 }

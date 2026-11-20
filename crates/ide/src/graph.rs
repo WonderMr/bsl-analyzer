@@ -21,10 +21,11 @@ use bsl_metadata::MdoType;
 use code_chunk::{base_chunk_name, ChunkKind, Chunker};
 use hir::call_graph::{EdgeKind, MethodDispatch};
 use hir::graph_index::{
-    display_scope, encode_scope, form_qualified_prefix, form_scope, project_batch_call_edges,
-    project_batch_form_edges, project_batch_query_edges, project_form_binding_edges,
-    project_workspace_catalog_edges, project_workspace_register_records_edges,
-    project_workspace_role_edges, project_workspace_subscription_edges,
+    display_scope, encode_scope, form_qualified_prefix, form_scope, metadata_handler_module_scopes,
+    project_batch_call_edges, project_batch_form_edges, project_batch_query_edges,
+    project_form_binding_edges, project_workspace_catalog_edges,
+    project_workspace_register_records_edges, project_workspace_role_edges,
+    project_workspace_scheduled_job_edges, project_workspace_subscription_edges,
     project_workspace_subsystem_edges, EdgeRow, GraphBuildState, GraphIndex, GraphRowEncoder,
     NodeRow,
 };
@@ -569,6 +570,11 @@ pub struct GraphBuildSummary {
     /// reverse index that lets an incremental rebuild find callers that would newly
     /// resolve when a target module gains (or exports) a method.
     pub unresolved_calls: Vec<(String, String, String)>,
+    /// The folded durable scopes (`common/<module>`) of the modules that event subscriptions
+    /// and scheduled jobs name as their handlers' modules. Persisted so an incremental
+    /// rebuild takes the full build when such a module gains an export: the handler edge it
+    /// may complete is projected by the full build only.
+    pub handler_module_scopes: Vec<String>,
 }
 
 /// A per-batch persistence sink: it receives one batch's freshly-encoded node and
@@ -1352,6 +1358,18 @@ pub fn build_workspace_graph_rows(
         let db = open_batch(first);
         let edges = project_workspace_subscription_edges(&db, first[0].file_id, &index, &mut state);
         emit(&edges, &mut summary, &mut seen_aux, sink)?;
+    }
+
+    // Phase F2 — `scheduled_job` edges: each `РегламентноеЗадание` → its exported handler
+    // method, the scheduler's dispatch that no code call shows. Same lifecycle as Phase F:
+    // config-level, sharing `state`, full-build only.
+    if let Some(&first) = batches.first() {
+        mark("scheduled_job_edges");
+        let db = open_batch(first);
+        let edges =
+            project_workspace_scheduled_job_edges(&db, first[0].file_id, &index, &mut state);
+        emit(&edges, &mut summary, &mut seen_aux, sink)?;
+        summary.handler_module_scopes = metadata_handler_module_scopes(&db, first[0].file_id);
     }
 
     // Phase G — `subsystem_membership` edges: each subsystem → its member objects and
@@ -3289,6 +3307,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::NotifyRef => "notify_ref",
         EdgeKind::IdleHandler => "idle_handler",
         EdgeKind::EventSubscriptionRef => "event_subscription",
+        EdgeKind::ScheduledJobRef => "scheduled_job",
         EdgeKind::RegisterMovement => "register_movement",
         EdgeKind::SubsystemMembership => "subsystem_membership",
         EdgeKind::RoleReference => "role_reference",

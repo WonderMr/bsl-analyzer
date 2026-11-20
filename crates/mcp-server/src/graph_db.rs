@@ -88,7 +88,10 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
-pub(crate) const SCHEMA_VERSION: u32 = 25;
+// 26: `scheduled_job` edges link each scheduled job to its handler method. A version-25
+// artefact has none, and nothing about the workspace changed, so no fingerprint moves: it
+// would keep answering that a handler only the scheduler calls has no caller.
+pub(crate) const SCHEMA_VERSION: u32 = 26;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -479,6 +482,19 @@ impl GraphDbWriter {
                 params![keys.join("\n")],
             )
             .context("writing casing variants")?;
+        Ok(())
+    }
+
+    /// Persist the scopes of the modules subscriptions and jobs name as handlers' modules into
+    /// a single `meta` row (`handler_module_scopes`, newline-joined). The incremental planner
+    /// reads it to send a handler module that gains an export to the full build.
+    pub(crate) fn write_handler_module_scopes(&mut self, scopes: &[String]) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('handler_module_scopes', ?1)",
+                params![scopes.join("\n")],
+            )
+            .context("writing handler module scopes")?;
         Ok(())
     }
 
@@ -1200,10 +1216,14 @@ pub(crate) fn build_graph_database_inner(
     // chunking): kept alive until after `finalize`, so a wedge anywhere in the
     // pipeline gets reported rather than freezing silently.
     let ticker = ticker.unwrap_or_else(|| Arc::new(GraphBuildTicker::default()));
+    // One interval per note after the first: four per batch (index, call, query and form
+    // edges), then the seven whole-config passes, `done`, `validation` and `published`.
+    // A pass added without counting it here ends the estimate one note early, and a
+    // build still running reports no remaining time.
     ticker.set_eta_total_intervals(if batches.is_empty() {
         0
     } else {
-        batches.len().saturating_mul(4).saturating_add(8)
+        batches.len().saturating_mul(4).saturating_add(9)
     });
     let _watchdog =
         spawn_build_watchdog(Arc::clone(&ticker), out_path.parent().map(Path::to_path_buf));
@@ -1304,6 +1324,7 @@ pub(crate) fn build_graph_database_inner(
     let file_rows = file_rows?;
     writer.write_files(&file_rows)?;
     writer.write_casing_variants(&summary.casing_variant_objects)?;
+    writer.write_handler_module_scopes(&summary.handler_module_scopes)?;
     writer.write_unresolved_calls(&summary.unresolved_calls)?;
 
     writer.finalize(meta)?;
@@ -1635,6 +1656,18 @@ pub(crate) fn local_metadata_delta(
             {
                 return Ok(None);
             }
+        }
+        // An event subscription's or a scheduled job's edge leads into its handler method,
+        // and the metadata-only projection has no method index to derive it again: replacing
+        // such an owner would delete the edge and never write it back. Their XML edits stay
+        // on the full-build path.
+        let handler_owner = |owner: &String| {
+            [bsl_metadata::MdoType::EventSubscription, bsl_metadata::MdoType::ScheduledJob]
+                .iter()
+                .any(|kind| owner.starts_with(&format!("mdo/{}/", kind.english_name())))
+        };
+        if current_owner.into_iter().chain(&previous_mdo_owners).any(handler_owner) {
+            return Ok(None);
         }
         // An MDO's forms can bind directly to its attributes. Reproject every form
         // module owned by that object together with the catalog rows so data_binding
@@ -2314,7 +2347,10 @@ fn write_body_patch(
             // references from unchanged BSL and neighboring forms when their target node
             // still exists in the new projection; those consumers are outside this patch
             // and cannot be reconstructed by the metadata-only projector. Drop incoming
-            // edges only when the referenced owner node disappeared.
+            // edges when the referenced owner node disappeared, and the incoming metadata
+            // references (a subsystem's member, a role's object, a document's declared
+            // register) the projector writes again for the owner: kept, they would be
+            // stored twice.
             tx.execute(
                 "INSERT OR IGNORE INTO affected_degree (id)
                  SELECT DISTINCT edges.to_id FROM edges
@@ -2326,7 +2362,8 @@ fn write_body_patch(
                     WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
                       AND (
                         NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
-                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding',
+                                          'subsystem_membership','role_reference','register_records')
                       )
                  )",
                 [],
@@ -2340,7 +2377,8 @@ fn write_body_patch(
                     WHERE (edges.to_id = p.prefix OR substr(edges.to_id, 1, length(p.prefix) + 1) = p.prefix || '/')
                       AND (
                         NOT EXISTS (SELECT 1 FROM metadata_current_nodes n WHERE n.id = edges.to_id)
-                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding')
+                        OR edges.kind IN ('contains','query_ref','manager_access','manager_creates','data_binding',
+                                          'subsystem_membership','role_reference','register_records')
                       )
                  )",
                 [],
@@ -2614,6 +2652,8 @@ fn write_body_patch(
         casing_variant_objects: rows.casing_variant_objects.clone(),
         // The reprojected modules' unresolved refs were refreshed in the patch above.
         unresolved_calls: rows.unresolved_calls.clone(),
+        // A patch never changes which modules handlers name: those edits take a full build.
+        handler_module_scopes: Vec::new(),
     })
 }
 
@@ -2764,6 +2804,14 @@ fn plan_caller_delta(
     // where the two spellings could differ at all.
     let was_unread: std::collections::HashSet<bsl_search::FileKey> =
         read_unread_keys_strict(conn)?.into_iter().collect();
+    // The modules subscriptions and jobs name as handlers' modules. An artefact without the
+    // row predates it, so every common module counts as one there.
+    let handler_scopes: Option<std::collections::HashSet<String>> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'handler_module_scopes'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?
+        .map(|value| value.lines().filter(|line| !line.is_empty()).map(str::to_owned).collect());
 
     let mut index_callers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (file, profile) in sig_changed {
@@ -2840,6 +2888,14 @@ fn plan_caller_delta(
         let added: Vec<&String> =
             profile.exported_lower.iter().filter(|n| !old_exported.contains(*n)).collect();
         if !added.is_empty() {
+            // A handler module that gains an export may complete a subscription's or a
+            // scheduled job's handler edge. That edge has no caller in code for the reverse
+            // index to name, and only the full build projects it.
+            if let Some(folded) = ide::folded_common_scope_for_path(file) {
+                if handler_scopes.as_ref().is_none_or(|scopes| scopes.contains(&folded)) {
+                    return Ok(None);
+                }
+            }
             let Some(scope) = ide::scope_for_path(file) else {
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
@@ -2868,18 +2924,19 @@ fn plan_caller_delta(
     let changed_files: std::collections::BTreeSet<&str> =
         sig_changed.iter().map(|(f, _)| *f).collect();
 
-    // A signature change in an event-subscription handler module can invalidate its
-    // config-level `mdo -> method` subscription edge — but that edge's source is an
-    // `mdo` node, which the resolved-caller fan-out below never selects (it asks for
-    // BSL source by kind), and the body-only reproject never re-derives Phase F.
+    // A signature change in an event-subscription or scheduled-job handler module can
+    // invalidate its config-level `mdo -> method` handler edge — but that edge's source is
+    // an `mdo` node, which the resolved-caller fan-out below never selects (it asks for
+    // BSL source by kind), and the body-only reproject never re-derives Phases F and F2.
     // Bail to a full rebuild so a removed/unexported/renamed handler cannot leave a
-    // dangling subscription edge.
+    // dangling handler edge.
     {
         let mut stmt = conn.prepare(
             "SELECT 1 FROM edges e JOIN nodes n1 ON e.to_id = n1.id \
              JOIN changed_file_keys changed ON changed.root_id = n1.file_root_id \
                  AND changed.path = n1.file_path \
-             WHERE n1.kind = 'method' AND e.kind = 'event_subscription' LIMIT 1",
+             WHERE n1.kind = 'method' AND e.kind IN ('event_subscription', 'scheduled_job') \
+             LIMIT 1",
         )?;
         if stmt.exists([])? {
             return Ok(None);
@@ -3403,51 +3460,100 @@ mod tests {
     }
 
     #[test]
-    fn caller_delta_bails_to_full_rebuild_for_subscription_handler() {
-        // A signature change in a module that handles an event subscription must NOT take
-        // the body-only caller-delta path: the subscription's `mdo -> method` edge has a
-        // fileless source the delta never revisits, so it would go stale. The planner must
-        // return None (force a full rebuild).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bsl-graph.db");
+    fn caller_delta_bails_to_full_rebuild_for_handler_modules() {
+        // A signature change in a module that handles an event subscription or a scheduled
+        // job must NOT take the body-only caller-delta path: the `mdo -> method` handler
+        // edge has a fileless source the delta never revisits, so it would go stale. The
+        // planner must return None (force a full rebuild) for either kind.
+        for (source, kind) in [
+            ("mdo/EventSubscription/ПриЗаписи", "event_subscription"),
+            ("mdo/ScheduledJob/ОбменДанными", "scheduled_job"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bsl-graph.db");
 
-        let handler = method_node("method/common/X/Обработчик", "Обработчик");
-        let mut subscription = method_node("mdo/EventSubscription/ПриЗаписи", "ПриЗаписи");
-        subscription.kind = "mdo";
-        subscription.module = None;
-        subscription.file = None; // config-level node: no owning file
-        subscription.is_export = None;
+            let handler = method_node("method/common/X/Обработчик", "Обработчик");
+            let mut object = method_node(source, "Объект");
+            object.kind = "mdo";
+            object.module = None;
+            object.file = None; // config-level node: no owning file
+            object.is_export = None;
 
-        let mut w = GraphDbWriter::create(&path).unwrap();
-        w.write_nodes(&[handler, subscription]).unwrap();
-        let mut sub_edge = edge("mdo/EventSubscription/ПриЗаписи", "method/common/X/Обработчик");
-        sub_edge.kind = "event_subscription";
-        sub_edge.provenance = "string_resolved";
-        w.write_edges(&[sub_edge]).unwrap();
-        w.finalize(&GraphMeta {
-            revision: 1,
-            fingerprint: GraphFp { files: 1, topology: 0 },
-            files: 1,
-            built_at: "t".to_string(),
-            publication_id: "test-1".to_owned(),
-        })
-        .unwrap();
-        open(&path)
-            .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+            let mut w = GraphDbWriter::create(&path).unwrap();
+            w.write_nodes(&[handler, object]).unwrap();
+            let mut handler_edge = edge(source, "method/common/X/Обработчик");
+            handler_edge.kind = kind;
+            handler_edge.provenance = "string_resolved";
+            w.write_edges(&[handler_edge]).unwrap();
+            w.finalize(&GraphMeta {
+                revision: 1,
+                fingerprint: GraphFp { files: 1, topology: 0 },
+                files: 1,
+                built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
+            })
             .unwrap();
+            open(&path)
+                .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+                .unwrap();
 
-        let profile = ModuleProfile {
-            sig_hash: 999,
-            exported_lower: std::collections::BTreeSet::new(),
-            has_collision: false,
-            unread: false,
-        };
-        let plan = caller_delta_plan(&path, &[("CommonModules/X/Ext/Module.bsl", &profile)], None)
+            let profile = ModuleProfile {
+                sig_hash: 999,
+                exported_lower: std::collections::BTreeSet::new(),
+                has_collision: false,
+                unread: false,
+            };
+            let changed = [("CommonModules/X/Ext/Module.bsl", &profile)];
+            let plan = caller_delta_plan(&path, &changed, None).unwrap();
+            assert!(
+                plan.is_none(),
+                "a signature change to a `{kind}` handler module must force a full rebuild"
+            );
+        }
+    }
+
+    /// A module that a subscription or a scheduled job names as its handler's module and that
+    /// gains an export may now complete the handler edge, which no caller in code points the
+    /// reverse index at: the planner must send it to the full build. The control is the same
+    /// change in a module no handler names, which stays on the caller-delta path.
+    #[test]
+    fn caller_delta_bails_when_a_handler_module_gains_an_export() {
+        for (handler_scopes, full_build) in [("common/x", true), ("common/другой", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bsl-graph.db");
+
+            let mut handler = method_node("method/common/X/Обработчик", "Обработчик");
+            handler.is_export = Some(false);
+            let mut w = GraphDbWriter::create(&path).unwrap();
+            w.write_nodes(&[handler]).unwrap();
+            w.finalize(&GraphMeta {
+                revision: 1,
+                fingerprint: GraphFp { files: 1, topology: 0 },
+                files: 1,
+                built_at: "t".to_string(),
+                publication_id: "test-1".to_owned(),
+            })
             .unwrap();
-        assert!(
-            plan.is_none(),
-            "a signature change to a subscription handler module must force a full rebuild"
-        );
+            open(&path)
+                .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+                .unwrap();
+            open(&path)
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('handler_module_scopes', ?1)",
+                    params![handler_scopes],
+                )
+                .unwrap();
+
+            let profile = ModuleProfile {
+                sig_hash: 999,
+                exported_lower: std::iter::once("обработчик".to_owned()).collect(),
+                has_collision: false,
+                unread: false,
+            };
+            let changed = [("CommonModules/X/Ext/Module.bsl", &profile)];
+            let plan = caller_delta_plan(&path, &changed, None).unwrap();
+            assert_eq!(plan.is_none(), full_build, "handler modules {handler_scopes:?}: {plan:?}");
+        }
     }
 
     /// Everything a build needs to see one catalog and one module.

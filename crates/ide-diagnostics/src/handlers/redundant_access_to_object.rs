@@ -149,7 +149,8 @@ fn get_plural_collection_name(
         | MdoType::CommonModule
         | MdoType::EventSubscription
         | MdoType::Subsystem
-        | MdoType::Role => None,
+        | MdoType::Role
+        | MdoType::ScheduledJob => None,
     }
 }
 

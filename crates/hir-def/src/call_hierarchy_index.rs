@@ -48,6 +48,7 @@ impl MethodCallPair {
             | EdgeKind::Contains
             | EdgeKind::DataBinding
             | EdgeKind::EventSubscriptionRef
+            | EdgeKind::ScheduledJobRef
             | EdgeKind::RegisterMovement
             | EdgeKind::SubsystemMembership
             | EdgeKind::RoleReference

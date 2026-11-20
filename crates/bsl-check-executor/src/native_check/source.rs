@@ -532,7 +532,8 @@ fn metadata_collection_directory(kind: bsl_metadata::MdoType) -> Option<&'static
         | Kind::CommonModule
         | Kind::EventSubscription
         | Kind::Subsystem
-        | Kind::Role => return None,
+        | Kind::Role
+        | Kind::ScheduledJob => return None,
     })
 }
 

@@ -56,6 +56,12 @@ pub enum MdoType {
     /// mapping yields `None`. It exists so the call graph can carry role → object reference
     /// edges to a role node.
     Role,
+    /// A scheduled job (`РегламентноеЗадание`): binds a schedule to a handler method named
+    /// in its `MethodName`. Like [`MdoType::EventSubscription`] it has no manager, ref type
+    /// or attributes of its own, is excluded from [`MdoType::all`], and every type-facing
+    /// mapping yields `None`. It exists so the call graph can carry the job → handler edge
+    /// that makes a method dispatched only by the platform scheduler visible as used.
+    ScheduledJob,
 }
 
 impl FromStr for MdoType {
@@ -104,6 +110,7 @@ impl FromStr for MdoType {
             }
             "подсистема" | "subsystem" => Ok(Self::Subsystem),
             "роль" | "role" => Ok(Self::Role),
+            "регламентноезадание" | "scheduledjob" => Ok(Self::ScheduledJob),
             _ => Err(format!("Unknown MDO type: {}", s)),
         }
     }
@@ -148,6 +155,7 @@ impl MdoType {
             Self::EventSubscription => "ПодпискаНаСобытие",
             Self::Subsystem => "Подсистема",
             Self::Role => "Роль",
+            Self::ScheduledJob => "РегламентноеЗадание",
         }
     }
 
@@ -176,6 +184,7 @@ impl MdoType {
             Self::EventSubscription => "EventSubscription",
             Self::Subsystem => "Subsystem",
             Self::Role => "Role",
+            Self::ScheduledJob => "ScheduledJob",
         }
     }
 
@@ -210,7 +219,8 @@ impl MdoType {
             | Self::CommonModule
             | Self::EventSubscription
             | Self::Subsystem
-            | Self::Role => return None,
+            | Self::Role
+            | Self::ScheduledJob => return None,
         })
     }
 
@@ -329,7 +339,8 @@ impl MdoType {
             | Self::CommonModule
             | Self::EventSubscription
             | Self::Subsystem
-            | Self::Role => None,
+            | Self::Role
+            | Self::ScheduledJob => None,
         }
     }
 
@@ -357,7 +368,8 @@ impl MdoType {
             | Self::CommonModule
             | Self::EventSubscription
             | Self::Subsystem
-            | Self::Role => None,
+            | Self::Role
+            | Self::ScheduledJob => None,
         }
     }
 
@@ -1314,6 +1326,20 @@ mod tests {
         assert_eq!(MdoType::EventSubscription.manager_type_prefix(), None);
         // Excluded from the enumerated set so it never surfaces in MDO completion.
         assert!(!MdoType::all().contains(&MdoType::EventSubscription));
+    }
+
+    #[test]
+    fn test_scheduled_job_parses_and_names_but_is_typeless() {
+        assert_eq!("РегламентноеЗадание".parse::<MdoType>().ok(), Some(MdoType::ScheduledJob));
+        assert_eq!("ScheduledJob".parse::<MdoType>().ok(), Some(MdoType::ScheduledJob));
+        assert_eq!(MdoType::ScheduledJob.russian_name(), "РегламентноеЗадание");
+        assert_eq!(MdoType::ScheduledJob.english_name(), "ScheduledJob");
+        // `РегламентныеЗадания` is the platform's own manager, not a collection of
+        // named objects, so the kind has no plural and no manager type.
+        assert_eq!(MdoType::ScheduledJob.russian_plural(), None);
+        assert_eq!(MdoType::from_plural("РегламентныеЗадания"), None);
+        assert_eq!(MdoType::ScheduledJob.manager_type_prefix(), None);
+        assert!(!MdoType::all().contains(&MdoType::ScheduledJob));
     }
 
     #[test]

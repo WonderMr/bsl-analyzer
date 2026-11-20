@@ -1733,6 +1733,27 @@ impl RootDatabaseImpl {
         &self,
         file_id: FileId,
     ) -> Vec<Arc<bsl_metadata::EventSubscription>> {
+        self.enumerate_flat_family_for_file(
+            file_id,
+            |listing| {
+                listing.event_subscriptions(self).iter().map(|sub| sub.name.clone()).collect()
+            },
+            |listing, name| metadata::resolve_event_subscription(self, listing, name),
+            |config| config.event_subscriptions(),
+        )
+    }
+
+    /// Every object of one flat metadata family (one XML per object, no extension overlay)
+    /// in every configured root, base and extensions alike: `names` lists a root's objects,
+    /// `resolve` reads one of them, and `in_config` is the family in a whole configuration,
+    /// for the single-file mode that configures no roots.
+    fn enumerate_flat_family_for_file<T: Clone>(
+        &self,
+        file_id: FileId,
+        names: impl Fn(metadata::MetadataListingInput) -> Vec<String>,
+        resolve: impl Fn(metadata::MetadataListingInput, String) -> Option<Arc<T>>,
+        in_config: impl Fn(&bsl_metadata::Configuration) -> &[T],
+    ) -> Vec<Arc<T>> {
         let paths = RootDatabaseImpl::all_config_paths(self);
         if !paths.is_empty() {
             let mut listings = Vec::with_capacity(paths.len());
@@ -1746,16 +1767,9 @@ impl RootDatabaseImpl {
             if !listings.is_empty() {
                 let mut out = Vec::new();
                 for listing in listings {
-                    let names: Vec<String> = listing
-                        .event_subscriptions(self)
-                        .iter()
-                        .map(|entry| entry.name.clone())
-                        .collect();
-                    for name in names {
-                        if let Some(subscription) =
-                            metadata::resolve_event_subscription(self, listing, name)
-                        {
-                            out.push(subscription);
+                    for name in names(listing) {
+                        if let Some(object) = resolve(listing, name) {
+                            out.push(object);
                         }
                     }
                 }
@@ -1763,9 +1777,8 @@ impl RootDatabaseImpl {
             }
         }
 
-        // With no configured roots (single-file mode) the inventory is empty;
-        // fall back to the file's own discovered configuration like the per-file
-        // resolvers do.
+        // With no configured roots (single-file mode) the inventory is empty; fall back
+        // to the file's own discovered configuration like the per-file resolvers do.
         let inventory = RootDatabase::all_configurations_inventory(self);
         let configs: Vec<Arc<bsl_metadata::Configuration>> = if inventory.is_empty() {
             self.get_configuration(file_id).into_iter().collect()
@@ -1773,10 +1786,8 @@ impl RootDatabaseImpl {
             inventory.into_iter().map(|(_, config)| config).collect()
         };
         configs
-            .into_iter()
-            .flat_map(|config| {
-                config.event_subscriptions().iter().cloned().map(Arc::new).collect::<Vec<_>>()
-            })
+            .iter()
+            .flat_map(|config| in_config(config.as_ref()).iter().cloned().map(Arc::new))
             .collect()
     }
 
@@ -1834,6 +1845,22 @@ impl RootDatabaseImpl {
                         .collect::<Vec<_>>()
                 },
             ),
+        )
+    }
+
+    /// Every scheduled job of every configured root, base and extensions alike. The
+    /// scheduled-job counterpart of [`Self::enumerate_event_subscriptions_for_file`]: the graph
+    /// needs a job an extension declares itself, which the main-listing lookups above do
+    /// not see.
+    pub fn enumerate_scheduled_jobs_for_file(
+        &self,
+        file_id: FileId,
+    ) -> Vec<Arc<bsl_metadata::ScheduledJob>> {
+        self.enumerate_flat_family_for_file(
+            file_id,
+            |listing| listing.scheduled_jobs(self).iter().map(|job| job.name.clone()).collect(),
+            |listing, name| metadata::resolve_scheduled_job(self, listing, name),
+            |config| config.scheduled_jobs(),
         )
     }
 
@@ -3499,6 +3526,10 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
 
     fn scheduled_job_names(&self, file_id: FileId) -> Vec<String> {
         RootDatabaseImpl::scheduled_job_names_for_file(self, file_id)
+    }
+
+    fn enumerate_scheduled_jobs(&self, file_id: FileId) -> Vec<Arc<bsl_metadata::ScheduledJob>> {
+        RootDatabaseImpl::enumerate_scheduled_jobs_for_file(self, file_id)
     }
 
     fn resolve_http_service(

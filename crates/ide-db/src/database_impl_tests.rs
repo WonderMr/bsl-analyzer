@@ -5304,6 +5304,78 @@ fn event_subscription_links_to_its_exported_handler() {
 }
 
 #[test]
+fn scheduled_job_links_to_its_exported_handler() {
+    use bsl_metadata::MdoType;
+    use hir::call_graph::{EdgeKind, EdgeProvenance, GraphNode};
+    use hir::graph_index::{project_workspace_scheduled_job_edges, GraphBuildState, GraphIndex};
+
+    fn job_xml(name: &str, method_name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <ScheduledJob uuid="00000000-0000-0000-0000-000000000073">
+        <Properties>
+            <Name>{name}</Name>
+            <MethodName>{method_name}</MethodName>
+            <Use>true</Use>
+            <Predefined>false</Predefined>
+        </Properties>
+    </ScheduledJob>
+</MetaDataObject>"#
+        )
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("src/cf");
+    std::fs::create_dir_all(root.join("ScheduledJobs")).unwrap();
+    std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+    std::fs::write(
+        root.join("ScheduledJobs/Выгрузка.xml"),
+        job_xml("Выгрузка", "CommonModule.ОбщийМодуль.Выгрузить"),
+    )
+    .unwrap();
+    // A handler that is not exported resolves to no edge, like every unresolved target.
+    std::fs::write(
+        root.join("ScheduledJobs/Служебное.xml"),
+        job_xml("Служебное", "CommonModule.ОбщийМодуль.Служебная"),
+    )
+    .unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    db.set_all_config_paths(vec![(None, root.clone())], None);
+
+    let file_id = FileId(0);
+    let file_path = root.join("CommonModules/ОбщийМодуль/Ext/Module.bsl");
+    let mut file_set = FileSet::new();
+    file_set.insert(file_id, VfsPath::new(file_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(
+        file_id,
+        "Процедура Выгрузить() Экспорт\nКонецПроцедуры\nПроцедура Служебная()\nКонецПроцедуры",
+    );
+
+    let modules = [ModuleId::new(file_id)];
+    let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+    let mut index = GraphIndex::new();
+    index.add_batch(&pool, &db, &modules);
+
+    let mut state = GraphBuildState::new();
+    let edges = project_workspace_scheduled_job_edges(&db, file_id, &index, &mut state);
+
+    assert_eq!(edges.len(), 1, "only the exported handler is linked: {edges:?}");
+    let job = &edges[0];
+    assert_eq!(job.kind, EdgeKind::ScheduledJobRef);
+    assert_eq!(job.provenance, EdgeProvenance::StringResolved);
+    assert!(
+        matches!(&job.from, GraphNode::Mdo { mdo_type, object_name }
+            if *mdo_type == MdoType::ScheduledJob && object_name.as_str() == "Выгрузка"),
+        "edge source is the job's Mdo node"
+    );
+    assert!(matches!(&job.to, GraphNode::Method(_)), "edge target is the handler method");
+}
+
+#[test]
 fn subsystem_membership_links_to_member_objects() {
     use bsl_metadata::MdoType;
     use hir::call_graph::{EdgeKind, EdgeProvenance, GraphNode};
