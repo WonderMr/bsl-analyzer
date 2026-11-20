@@ -189,6 +189,22 @@ pub(crate) fn loading(report: &StatusReport, detail: &str) -> CallToolResult {
     structured(loading_body(report, detail))
 }
 
+/// The `detail` of a not-ready answer from a tool that reads the resident. The resident is a
+/// build of its own, so a ready `graph` says nothing about it; `status_action` is the probe
+/// that does (`metadata` and `diagnostics` status render the same snapshot). A failed build
+/// is named as one, so the advice does not read as progress.
+pub(crate) fn not_ready_detail(report: &StatusReport, status_action: &str) -> String {
+    match readiness_status(report.state) {
+        "failed" => format!(
+            "resident analysis database build failed and is retried on its schedule; poll \
+             {status_action}"
+        ),
+        _ => format!(
+            "resident analysis database is building, apart from the graph; poll {status_action}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
