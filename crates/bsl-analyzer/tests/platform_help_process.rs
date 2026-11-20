@@ -513,7 +513,9 @@ fn call_until(
 #[test]
 fn mcp_answers_while_the_platform_help_is_still_loading() {
     let mut held = HeldHelpLoad::new();
-    let mut mcp = McpSession::start(held.server());
+    let mut server = held.server();
+    server.args(["--enable-tool", "references"]);
+    let mut mcp = McpSession::start(server);
     handshake(&mut mcp);
 
     let outline = mcp.call("outline", json!({"path": "Module.bsl"}));
@@ -521,9 +523,12 @@ fn mcp_answers_while_the_platform_help_is_still_loading() {
 
     // Parameters are checked before the help is waited for: a malformed call is refused as
     // such while the help loads, not told to come back later.
-    let malformed = json!({"name": "diagnostics", "arguments": {"action": "snippet"}});
-    let refused = mcp.request("tools/call", malformed, MCP_RESPONSE_GUARD);
-    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    let both = json!({"symbol": "Тест", "path": "Module.bsl", "line": 0});
+    for (name, call) in [("diagnostics", json!({"action": "snippet"})), ("references", both)] {
+        let malformed = json!({"name": name, "arguments": call});
+        let refused = mcp.request("tools/call", malformed, MCP_RESPONSE_GUARD);
+        assert_eq!(refused["error"]["code"], -32602, "{name}: {refused}");
+    }
 
     let request = json!({"name": "Добавить", "type_name": "Массив"});
     let loading = mcp.call("syntax_help", request.clone());

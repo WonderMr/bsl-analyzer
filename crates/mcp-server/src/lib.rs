@@ -958,6 +958,28 @@ struct ReferencesParams {
     max_output_tokens: Option<usize>,
 }
 
+impl ReferencesParams {
+    /// The parameters as the walk reads them.
+    fn walk(&self) -> tools::references::Params<'_> {
+        tools::references::Params {
+            symbol: self.symbol.as_deref(),
+            anchor_root_id: self.anchor_root_id.as_deref(),
+            root_id: self.root_id.as_deref(),
+            path: self.path.as_deref(),
+            line: self.line,
+            column: self.column,
+            line_content: self.line_content.as_deref(),
+            area_root_id: self.area_root_id.as_deref(),
+            area_path_prefix: self.area_path_prefix.as_deref(),
+            kinds: &self.kinds,
+            include_declaration: self.include_declaration,
+            limit: self.limit,
+            max_files: self.max_files,
+            include_preview: self.include_preview,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiagnosticsParams {
@@ -2689,6 +2711,9 @@ impl McpServer {
         // handed a `loading` body — the one shape the contract says a cancelled call
         // never produces. Every outcome, `loading` included, is rendered from the read.
         diag.ensure_loading();
+        // Parameters that contradict each other are refused as such, whatever the state of
+        // the resident or of the platform help.
+        tools::references::check_params(&p.walk())?;
         // Receivers are typed off the platform help, which may still be loading; a walk now
         // would hold the call, and the resident with it, until it is in. A cancelled call
         // still gets no body here.
@@ -2722,22 +2747,7 @@ impl McpServer {
                     // its chunks, and takes a request handle of its own for each phase.
                     let read = || {
                         session.read_fanout(|resident, _generation| {
-                            let params = tools::references::Params {
-                                symbol: p.symbol.as_deref(),
-                                anchor_root_id: p.anchor_root_id.as_deref(),
-                                root_id: p.root_id.as_deref(),
-                                path: p.path.as_deref(),
-                                line: p.line,
-                                column: p.column,
-                                line_content: p.line_content.as_deref(),
-                                area_root_id: p.area_root_id.as_deref(),
-                                area_path_prefix: p.area_path_prefix.as_deref(),
-                                kinds: &p.kinds,
-                                include_declaration: p.include_declaration,
-                                limit: p.limit,
-                                max_files: p.max_files,
-                                include_preview: p.include_preview,
-                            };
+                            let params = p.walk();
                             tools::references::answer(
                                 resident,
                                 &cancel,
