@@ -88,6 +88,10 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 25: the row encoder strips the workspace root whichever way Windows spells it, so a full build
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
+// 26: `intercepts` edges link each extension interceptor to the base method it takes over, and
+// carry the annotation in a new `interception` column. A version-25 artefact has neither, and
+// nothing about the workspace changed, so no fingerprint moves: it would keep answering that
+// a patched vendor method is patched by nobody.
 // 27: a file outside the workspace root (a `[source] root` or an extension declared by an
 // absolute path elsewhere) is keyed by its canonical path, `method/file/<absolute path>::<name>`,
 // where earlier versions minted `method/file/<basename>::<name>` in a full build and merged
@@ -314,7 +318,8 @@ impl GraphDbWriter {
                 call_start INTEGER,
                 call_end   INTEGER,
                 call_absent TEXT,
-                crosses    INTEGER NOT NULL
+                crosses    INTEGER NOT NULL,
+                interception TEXT
             );
 
             CREATE TABLE in_degree (
@@ -424,9 +429,8 @@ impl GraphDbWriter {
         let tx = self.conn.transaction().context("begin edge batch")?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO edges \
-                 (from_id, to_id, kind, provenance, call_start, call_end, call_absent, crosses) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO edges (from_id, to_id, kind, provenance, call_start, call_end, \
+                 call_absent, crosses, interception) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for row in rows {
                 stmt.execute(params![
@@ -438,6 +442,7 @@ impl GraphDbWriter {
                     row.call_end,
                     row.call_site_absent,
                     row.crosses as i64,
+                    row.interception,
                 ])?;
             }
         }
@@ -1730,6 +1735,35 @@ pub(crate) fn compute_body_patch(
     )
 }
 
+/// The scanned extension modules that adopt a base module at one of `changed`, spelled as the
+/// scan spelled them. Matched regardless of case: an extension mirrors the base's layout, but
+/// nothing makes it repeat the base's casing of every directory.
+fn extension_counterparts(
+    configs: &ide::WorkspaceConfigsSnapshot,
+    files: &[(FileId, PathBuf)],
+    changed: &[PathBuf],
+) -> Vec<PathBuf> {
+    let roots: Vec<(Option<String>, PathBuf)> =
+        configs.designer_order().map(|idx| configs.paths[idx].clone()).collect();
+    let candidates: Vec<String> = changed
+        .iter()
+        .flat_map(|path| ide::pair_extension_module_paths(&roots, path))
+        .map(|candidate| candidate.to_string_lossy().to_lowercase())
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let scanned: FxHashMap<String, &PathBuf> =
+        files.iter().map(|(_, path)| (path.to_string_lossy().to_lowercase(), path)).collect();
+    let mut counterparts = Vec::new();
+    for candidate in candidates {
+        if let Some(&path) = scanned.get(&candidate) {
+            counterparts.push(path.clone());
+        }
+    }
+    counterparts
+}
+
 /// As [`compute_body_patch`], with a proved local XML owner delta. Metadata rows and
 /// their old owner prefixes are carried to the same SQL transaction as BSL rows.
 #[allow(
@@ -1797,6 +1831,15 @@ pub(crate) fn compute_body_patch_with_metadata(
                     effective_changed_paths.push(path);
                 }
             }
+        }
+    }
+    // An interceptor's `intercepts` edge leads into the base module its extension adopts, and
+    // while the method it names is missing nothing stored for that base module leads back to
+    // it. Project the extension counterparts of every changed base module again, so a base
+    // method that is removed, renamed or added back moves their edges with it.
+    for counterpart in extension_counterparts(&project.configs, files, &effective_changed_paths) {
+        if !effective_changed_paths.contains(&counterpart) {
+            effective_changed_paths.push(counterpart);
         }
     }
     let changed_set: std::collections::HashSet<&Path> =
@@ -2381,9 +2424,8 @@ fn write_body_patch(
             let to_id = canonicalize_aux_id(&existing_mdo, &edge.to_id);
             tx.execute("INSERT OR IGNORE INTO affected_degree (id) VALUES (?1)", params![to_id])?;
             tx.prepare_cached(
-                "INSERT INTO edges \
-                 (from_id, to_id, kind, provenance, call_start, call_end, call_absent, crosses) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO edges (from_id, to_id, kind, provenance, call_start, call_end, \
+                 call_absent, crosses, interception) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?
             .execute(params![
                 edge.from_id,
@@ -2393,7 +2435,8 @@ fn write_body_patch(
                 edge.call_start,
                 edge.call_end,
                 edge.call_site_absent,
-                edge.crosses as i64
+                edge.crosses as i64,
+                edge.interception
             ])?;
         }
 
@@ -2981,6 +3024,7 @@ mod tests {
             call_end: None,
             call_site_absent: Some(ide::NO_CALL_SITE),
             crosses: false,
+            interception: None,
         }
     }
 
@@ -4663,6 +4707,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
                 EdgeRow {
                     from_id: "method/common/Caller/Ожидание".to_string(),
@@ -4673,6 +4718,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
                 EdgeRow {
                     from_id: "mdo/EventSubscription/ПриЗаписи".to_string(),
@@ -4683,6 +4729,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
                 EdgeRow {
                     from_id: "method/common/Caller/Прямой".to_string(),
@@ -4693,6 +4740,7 @@ mod tests {
                     call_end: None,
                     call_site_absent: Some(ide::NO_CALL_SITE),
                     crosses: false,
+                    interception: None,
                 },
             ])
             .unwrap();

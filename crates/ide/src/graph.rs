@@ -23,10 +23,10 @@ use hir::call_graph::{EdgeKind, MethodDispatch};
 use hir::graph_index::{
     display_scope, encode_scope, form_qualified_prefix, form_scope, project_batch_call_edges,
     project_batch_form_edges, project_batch_query_edges, project_form_binding_edges,
-    project_workspace_catalog_edges, project_workspace_register_records_edges,
-    project_workspace_role_edges, project_workspace_subscription_edges,
-    project_workspace_subsystem_edges, EdgeRow, GraphBuildState, GraphIndex, GraphRowEncoder,
-    NodeRow,
+    project_module_intercept_edges, project_workspace_catalog_edges,
+    project_workspace_register_records_edges, project_workspace_role_edges,
+    project_workspace_subscription_edges, project_workspace_subsystem_edges, EdgeRow,
+    GraphBuildState, GraphIndex, GraphRowEncoder, NodeRow,
 };
 use hir::{
     module_key_for_path, ConfigsDatabase, DefDatabase, GraphNode, MethodId, ModuleId, ModuleIndex,
@@ -181,6 +181,11 @@ pub struct EdgeRef {
     pub call_sites_unavailable: Option<&'static str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub crosses_client_to_server: bool,
+    /// The annotation an `intercepts` edge stands for — `before`, `after`, `instead` or
+    /// `change_and_validate` — so a caller asking who patches a method can tell a
+    /// replacement from a hook without reading the extension. Absent on every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interception: Option<&'static str>,
 }
 
 /// The location contract's code for an edge that stands for no call in code at all.
@@ -829,6 +834,24 @@ struct MethodEdgeFacts {
     reads: Vec<String>,
 }
 
+/// The `intercepts` edges of `batch`'s extension modules, each paired with the base module
+/// it adopts. A module of an extension's own object, or of the base, pairs with nothing and
+/// gives none. The edges belong to the extension module's own rows: projected with its call
+/// edges, they are projected again whenever the module is.
+fn project_batch_intercept_edges(
+    db: &RootDatabaseImpl,
+    batch: &[ModuleId],
+    index: &GraphIndex,
+) -> Vec<WorkspaceCallEdge> {
+    let mut edges = Vec::new();
+    for &module in batch {
+        let Some(weaving) = ide_db::weaving_target(db, module.file_id) else { continue };
+        let base = ModuleId::new(weaving.base_file(db));
+        edges.extend(project_module_intercept_edges(db, module, base, index));
+    }
+    edges
+}
+
 /// Fold a batch's projected edges into the per-method context accumulator, mirroring
 /// `GraphDb::graph_context`'s edge-kind filtering exactly: `call` edges contribute
 /// callee names, metadata-touch edges (`manager_*` / `query_ref`) to an `Mdo` or
@@ -1264,6 +1287,8 @@ pub fn build_workspace_graph_rows(
             accumulate_method_edges(&proj.edges, &mut method_edge_facts, &index);
         }
         emit(&proj.edges, &mut summary, &mut seen_aux, sink)?;
+        let intercepts = project_batch_intercept_edges(&db, batch, &index);
+        emit(&intercepts, &mut summary, &mut seen_aux, sink)?;
         for (caller, target, method_lower) in proj.unresolved {
             if let (Some(scope), Some(file)) = (scope_of(target), file_of(caller)) {
                 unresolved_calls.push((scope, method_lower, file));
@@ -1531,6 +1556,7 @@ pub fn reproject_changed_modules(
     let mut state = GraphBuildState::new();
     let call_proj = project_batch_call_edges(&pool, &db, changed, &index, &mut state);
     let mut projected = call_proj.edges;
+    projected.extend(project_batch_intercept_edges(&db, changed, &index));
     projected.extend(project_batch_query_edges(&pool, &db, changed, &mut state));
 
     let mut seen_aux: FxHashSet<String> = FxHashSet::default();
@@ -2702,6 +2728,7 @@ impl<'a> GraphCtx<'a> {
             call_sites_truncated: false,
             call_sites_unavailable,
             crosses_client_to_server: edge.crosses_client_to_server,
+            interception: edge.kind.interception().map(hir::AnnotationKind::as_str),
         }
     }
 }
@@ -3301,6 +3328,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::RoleReference => "role_reference",
         EdgeKind::RegisterRecords => "register_records",
         EdgeKind::RegisterRecordSet => "register_record_set",
+        EdgeKind::Intercepts(_) => "intercepts",
     }
 }
 

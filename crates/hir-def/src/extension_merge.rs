@@ -41,6 +41,30 @@ pub fn pair_base_module_path(
     Some(base_root.join(rel))
 }
 
+/// The candidate extension module paths that mirror `base_path`, one per extension root:
+/// the inverse of [`pair_base_module_path`]. Whether each file exists is the caller's
+/// concern, as it is there.
+///
+/// Empty when `base_path` is not under the base root, or when it lies under an extension
+/// root: an extension may be declared inside the base's own directory, and its files are
+/// then under both.
+pub fn pair_extension_module_paths(
+    roots: &[(Option<String>, PathBuf)],
+    base_path: &Path,
+) -> Vec<PathBuf> {
+    let Some(base_root) = roots.iter().find_map(|(label, p)| label.is_none().then_some(p)) else {
+        return Vec::new();
+    };
+    let ext_roots = || roots.iter().filter_map(|(label, p)| label.as_ref().map(|_| p));
+    if ext_roots().any(|ext_root| base_path.starts_with(ext_root)) {
+        return Vec::new();
+    }
+    let Ok(rel) = base_path.strip_prefix(base_root) else {
+        return Vec::new();
+    };
+    ext_roots().map(|ext_root| ext_root.join(rel)).collect()
+}
+
 /// The result of recognizing an `&ИзменениеИКонтроль("M")` method: the base
 /// method name it modifies, plus a verification that its insert/delete markers
 /// are well-formed. Returned only for the supported v1 shape — malformed or
@@ -100,7 +124,12 @@ pub(crate) fn annotation_first_string_arg(method: &SyntaxNode, kind: SyntaxKind)
         .children()
         .filter_map(ast::Annotation::cast)
         .find(|ann| ann.kind_token().map(|t| t.kind()) == Some(kind))?;
+    annotation_string_param(&annotation)
+}
 
+/// The unquoted string literal of `annotation`'s first parameter, under the rules of
+/// [`annotation_first_string_arg`].
+pub(crate) fn annotation_string_param(annotation: &ast::Annotation) -> Option<String> {
     let first_param = annotation
         .syntax()
         .children()
@@ -292,6 +321,30 @@ mod tests {
         let only_ext = vec![(Some("MyExt".into()), PathBuf::from("/proj/src/cfe/MyExt"))];
         let ext = Path::new("/proj/src/cfe/MyExt/Catalogs/Товары/Ext/ObjectModule.bsl");
         assert_eq!(pair_base_module_path(&only_ext, ext), None);
+    }
+
+    #[test]
+    fn a_base_module_pairs_with_one_candidate_per_extension() {
+        let rel = "Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
+        let base = Path::new("/proj/src").join(rel);
+        let candidates = pair_extension_module_paths(&roots(), &base);
+        let my_ext = Path::new("/proj/src/cfe/MyExt").join(rel);
+        let other = Path::new("/proj/src/cfe/Other").join(rel);
+        assert_eq!(candidates, [my_ext, other]);
+        for candidate in &candidates {
+            assert_eq!(pair_base_module_path(&roots(), candidate), Some(base.clone()));
+        }
+    }
+
+    #[test]
+    fn an_extension_file_under_the_base_root_has_no_extension_counterpart() {
+        let ext = Path::new("/proj/src/cfe/MyExt/Catalogs/Товары/Ext/ObjectModule.bsl");
+        assert!(pair_extension_module_paths(&roots(), ext).is_empty());
+        let outside = Path::new("/elsewhere/Catalogs/Товары/Ext/ObjectModule.bsl");
+        assert!(pair_extension_module_paths(&roots(), outside).is_empty());
+        let only_ext = vec![(Some("MyExt".into()), PathBuf::from("/proj/src/cfe/MyExt"))];
+        let base = Path::new("/proj/src/Catalogs/Товары/Ext/ObjectModule.bsl");
+        assert!(pair_extension_module_paths(&only_ext, base).is_empty());
     }
 
     // §30.4.2.2.5 dev-guide example (8.3.27): delete the buggy `+` line, insert the
