@@ -509,3 +509,56 @@ async fn status_answers_even_when_a_connection_is_passed() {
 
     assert!(body["state"].is_string(), "status still reports the resident lifecycle: {body}");
 }
+
+/// `tree` with `filter` searches object names, as the parameter's schema says, and the category
+/// is `meta_type`. A name fragment used to come back as an unknown category, with an error that
+/// pointed at a tool this server does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tree_filter_searches_object_names_and_meta_type_lists_a_category() {
+    let ws = stage_workspace_with_metadata_union();
+    let client = workspace_client(ws.path()).await;
+    let mut deadline =
+        common::Patience::new(common::STATE_CEILING, std::time::Duration::from_millis(100));
+
+    let found = loop {
+        let result = call(
+            &client,
+            &[("action", json!("tree")), ("mode", json!("source")), ("filter", json!("тОв"))],
+        )
+        .await;
+        if result.structured_content.as_ref().is_some_and(|body| body["status"] == "loading") {
+            assert!(deadline.allows(), "the workspace resident never became ready");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        break text_of(&result).to_owned();
+    };
+    assert!(found.contains("- Справочник.Товары\n"), "{found}");
+    assert!(!found.contains("- Справочник.А\n"), "{found}");
+
+    let listed = call(
+        &client,
+        &[
+            ("action", json!("tree")),
+            ("mode", json!("source")),
+            ("meta_type", json!("Справочники")),
+        ],
+    )
+    .await;
+    let listed = text_of(&listed);
+    assert!(listed.contains("- Товары") && listed.contains("- А"), "{listed}");
+
+    // The name search prints `ОбщийМодуль.Сервер` for this workspace; `object` opens the pair.
+    let module = call(
+        &client,
+        &[
+            ("action", json!("object")),
+            ("mode", json!("source")),
+            ("object_type", json!("ОбщийМодуль")),
+            ("object_name", json!("Сервер")),
+        ],
+    )
+    .await;
+    let module = text_of(&module);
+    assert!(module.starts_with("# ОбщийМодуль.Сервер\n"), "{module}");
+}
