@@ -833,6 +833,7 @@ jobs:
             broker::daemon::shared_tests::
             broker::daemon::idle_boundary_tests::
             graph::build::tests::callers_in_forms_outside_the_project_are_distinct_and_addressable
+            graph::build::tests::outside_ids_agree_
           )
           run_tests -p mcp-server --lib -- "${mcp_server_filters[@]}"
       - name: MCP transports, broker and baselines

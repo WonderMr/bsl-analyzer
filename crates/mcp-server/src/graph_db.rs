@@ -89,10 +89,11 @@ use crate::graph::input::{build_source_root, db_for_files};
 // there mints `method/file/<rel>::<name>` where version 24 minted `method/file/<basename>::<name>`
 // and an incremental patch minted the former: one database could hold both for one method.
 // 26: a file outside the workspace root (a `[source] root` or an extension declared by an
-// absolute path elsewhere) is keyed by its whole path, `method/file/<absolute path>::<name>`,
-// where version 25 minted `method/file/<basename>::<name>` and merged namesakes of every such
-// form module into one row. Nothing about the workspace changed, so no fingerprint moves: a
-// reused artefact would answer `not_found` for the ids this binary hands out.
+// absolute path elsewhere) is keyed by its canonical path, `method/file/<absolute path>::<name>`,
+// where version 25 minted `method/file/<basename>::<name>` in a full build and merged namesakes
+// of every such form module into one row. Nothing about the workspace changed, so no
+// fingerprint moves: a reused artefact would answer `not_found` for the ids this binary hands
+// out.
 pub(crate) const SCHEMA_VERSION: u32 = 26;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
@@ -1162,11 +1163,17 @@ pub(crate) fn build_graph_database_inner(
     }
     let files = &universe.files;
     let modules: Vec<ModuleId> = files.iter().map(|(f, _)| ModuleId::new(*f)).collect();
+    // A file under the workspace root keeps the walk's spelling, as its ids always have; one
+    // outside it takes its canonical spelling, the one the incremental patch and every bridge
+    // into the graph key it by (`StripRoot::id_spelling`).
+    let strip_root = ide::StripRoot::resolve(&project.workspace_root);
     let paths: FxHashMap<FileId, String> = files
         .iter()
         .map(|(f, p)| {
             let walked = universe.walked_path_for(p).unwrap_or(p);
-            (*f, walked.to_string_lossy().replace('\\', "/"))
+            let walked = walked.to_string_lossy().replace('\\', "/");
+            let canonical = p.to_string_lossy().replace('\\', "/");
+            (*f, strip_root.id_spelling(&walked, &canonical).to_owned())
         })
         .collect();
     let file_paths: FxHashMap<FileId, PathBuf> =

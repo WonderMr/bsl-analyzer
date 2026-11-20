@@ -514,7 +514,7 @@ fn schema_json() -> Value {
             "form": "form/<MdoEnglish>/<Object>/<Form> or form/common/<Form>",
             "form_item": "form_item/<MdoEnglish>/<Object>/<Form>/<Item> or form_item/common/<Form>/<Item>",
             "form_attribute": "form_attr/<MdoEnglish>/<Object>/<Form>/<Attr> or form_attr/common/<Form>/<Attr>",
-            "path_fallback": "method/file/<path>::<Method> (module: module/file/<path>) for a module no metadata name keys — a form, command or loose file. <path> is relative to the workspace root; a file outside it (a configuration root or an extension declared elsewhere on disk) is named by its absolute path with `/` separators and no Windows verbatim prefix (`C:/…`, `/srv/…`)"
+            "path_fallback": "method/file/<path>::<Method> (module: module/file/<path>) for a module no metadata name keys — a form, command or loose file. <path> is relative to the workspace root; a file outside it (a configuration root or an extension declared elsewhere on disk) is named by its real (canonical) absolute path — links resolved, real letter case and long names whatever spelling the root was declared with — with `/` separators and no Windows verbatim prefix (`C:/…`, `/srv/…`)"
         }
     })
 }
