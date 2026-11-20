@@ -609,6 +609,12 @@ pub(crate) fn build_scope(root: &Path, base: &str) -> ScopeBuild {
 const SWEEP_CHUNK: stdx::batch::BatchBudget =
     stdx::batch::BatchBudget::files(500).with_bytes(32 << 20);
 
+/// Files and source bytes the background name-index warm-up takes one hold of the resident
+/// lock for. Far below a sweep chunk: every reader queued behind the warm-up waits for the
+/// chunk in hand, and on a loaded machine a sweep chunk takes tens of seconds to parse.
+const BACKGROUND_WARM_CHUNK: stdx::batch::BatchBudget =
+    stdx::batch::BatchBudget::files(64).with_bytes(4 << 20);
+
 impl DiagnosticsResident {
     /// Evict memos beyond their interactive caps and drop the parser's thread-local
     /// green-node caches on the sweep pool. The freed pages are left to the allocator:
@@ -641,7 +647,7 @@ impl DiagnosticsResident {
 
     /// One chunk of [`Self::warm_name_indexes`], for a warm-up that takes the resident
     /// lock once per chunk so the readers queued behind it wait for a chunk, not for the
-    /// whole workspace. The chunks are planned once ([`Self::warm_chunks`]) and the
+    /// whole workspace. The chunks are planned once ([`Self::background_warm_chunks`]) and the
     /// resident may change between two of them: a file the drift has removed since is
     /// skipped, because its id no longer names a source the database can read. Reports
     /// whether the chunk ran to its end: `false` when `cancel` stopped it.
@@ -673,23 +679,29 @@ impl DiagnosticsResident {
         cancel: &RequestCancel,
         job: impl Fn(&Analysis, FileId) + Send + Sync,
     ) {
-        for chunk in self.warm_chunks() {
+        for chunk in self.chunks_within(SWEEP_CHUNK) {
             if !self.warm_chunk(cancel, &chunk, &job) {
                 return;
             }
         }
     }
 
-    /// Every resident file, in the chunks a per-file warm-up takes them in: by file id,
-    /// each chunk within the sweep budget of files and of bytes on disk.
-    pub(crate) fn warm_chunks(&self) -> Vec<Vec<FileId>> {
+    /// Every resident file, in the chunks the background warm-up takes the resident lock
+    /// for, one at a time ([`Self::warm_name_indexes_of`]).
+    pub(crate) fn background_warm_chunks(&self) -> Vec<Vec<FileId>> {
+        self.chunks_within(BACKGROUND_WARM_CHUNK)
+    }
+
+    /// Every resident file, by file id, in chunks within `budget` of files and of bytes on
+    /// disk.
+    fn chunks_within(&self, budget: stdx::batch::BatchBudget) -> Vec<Vec<FileId>> {
         let mut files: Vec<(FileId, &str)> =
             self.by_path.iter().map(|(path, id)| (*id, path.as_str())).collect();
         files.sort_by_key(|(id, _)| id.0);
         stdx::batch::chunks_by_budget(
             &files,
             |(_, path)| std::fs::metadata(path).map_or(0, |meta| meta.len()),
-            SWEEP_CHUNK,
+            budget,
         )
         .into_iter()
         .map(|chunk| chunk.iter().map(|(id, _)| *id).collect())
@@ -3258,6 +3270,24 @@ mod trim_tests {
         assert!(current.is_cancelled(), "the shutdown stops the current one too");
     }
 
+    /// The background warm-up holds the resident for a small chunk at a time, and its
+    /// chunks cover every resident file once.
+    #[test]
+    fn the_background_warm_up_plans_small_chunks_over_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        workspace_with_modules(dir.path());
+        let state = joined_state(dir.path());
+
+        let chunks = ready(state.read(|resident, _| resident.background_warm_chunks()));
+
+        assert!(chunks.len() > 1, "{MODULES} modules fit no single background chunk");
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 64), "a chunk over the budget");
+        let mut files: Vec<FileId> = chunks.into_iter().flatten().collect();
+        files.sort_by_key(|id| id.0);
+        files.dedup();
+        assert_eq!(files.len(), MODULES, "every file once");
+    }
+
     /// A cancelled chunk reports that it did not run to its end, which is what ends the
     /// background warm-up between two chunks.
     #[test]
@@ -3269,7 +3299,7 @@ mod trim_tests {
         cancel.cancel_all();
 
         let ran = ready(state.read_mut(|resident, _| {
-            let chunk = resident.warm_chunks().remove(0);
+            let chunk = resident.background_warm_chunks().remove(0);
             resident.warm_name_indexes_of(&chunk, &cancel)
         }));
 

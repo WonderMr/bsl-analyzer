@@ -1110,7 +1110,7 @@ impl DiagnosticsState {
         let _finish = Finish { state: self, epoch };
 
         let started = Instant::now();
-        let chunks = match self.read_mut(|resident, _| resident.warm_chunks()) {
+        let chunks = match self.read_mut(|resident, _| resident.background_warm_chunks()) {
             ResidentOutcome::Ready(chunks, _) => chunks,
             _ => return,
         };
