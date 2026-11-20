@@ -1523,15 +1523,13 @@ fn build_server(
         enable_tools,
     } = inputs;
     super::logging::activate_vector_journal(source_dir.as_deref());
-    // Every process that serves MCP builds its server here — stdio, daemon, HTTP and
-    // the broker's direct fallback — so the help source is fixed here, before the
-    // server indexes or answers anything.
-    match source_dir.as_deref() {
-        Some(root) => bsl_analyzer::help_bootstrap::bootstrap_for_root(root, None),
-        None => {
-            platform_help::bootstrap(None, &env::current_dir().unwrap_or_default());
-        }
-    }
+    // Every process that serves MCP builds its server here — stdio, HTTP and the broker's
+    // direct fallback — so the help source is chosen here, before the server indexes or
+    // answers anything. It loads in the background: a first extraction of an installed
+    // platform's help takes minutes, and a client that waits that long for `initialize`
+    // gives the server up. The load is announced first, so nothing built below fixes the
+    // build default meanwhile; tools that need the help answer `loading` until it is in.
+    bsl_analyzer::help_bootstrap::spawn_bootstrap(source_dir.clone());
     let state = match profile {
         mcp_server::McpProfile::Workspace => {
             let source_dir = source_dir.ok_or_else(|| {

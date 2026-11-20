@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod name_answer;
 pub mod outline;
 pub mod platform;
+pub(crate) mod platform_help;
 pub mod query;
 pub mod redact;
 pub mod references;

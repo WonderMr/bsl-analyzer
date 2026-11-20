@@ -936,7 +936,10 @@ impl DiagnosticsState {
             }
             inner.build_attempt = inner.build_attempt.wrapping_add(1);
             inner.status = DiagnosticsStatus::Loading;
-            inner.loading_since = Some(Instant::now());
+            // While the process is still loading its platform help, the build waits for the
+            // help before it starts (see `run_load`), and its deadline starts with it: a clock
+            // that counted the load would fail a build that has not begun.
+            inner.loading_since = (!bsl_platform::platform_help_pending()).then(Instant::now);
             inner.build_attempt
         };
         // Spawn the single idle sweeper on first use (it outlives evict→rebuild cycles).
@@ -1181,6 +1184,19 @@ impl DiagnosticsState {
         };
         #[cfg(test)]
         self.fire_load_start_probe();
+        // The build reads the platform help throughout. While the process is still loading it
+        // the build would only wait on it, so it waits here, before it starts, and only then
+        // starts its deadline: `ensure_loading` left the clock unset for exactly this wait.
+        bsl_platform::wait_for_platform_help(None);
+        {
+            let mut inner = lock_inner(&self.inner);
+            if inner.build_attempt == attempt
+                && matches!(inner.status, DiagnosticsStatus::Loading)
+                && inner.loading_since.is_none()
+            {
+                inner.loading_since = Some(Instant::now());
+            }
+        }
         // The attempt can be retired before it has done anything at all: the deadline gives up
         // on a build still in its startup, and the retry that replaces it takes a cursor of its
         // own. The cursor slot belongs to the STATE, not to this thread — re-subscribing here

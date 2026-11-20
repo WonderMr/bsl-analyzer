@@ -145,7 +145,7 @@ fn no_body_changes_items(
     let source_root = db.file_source_root_input(module_id.file_id).source_root_id(db);
     let index = db.module_index(source_root);
     // An extension can add controls that the base dialog does not describe, even
-    // while inference uses the base file as its metadata context.
+    // while inference judges its splice against the base form.
     let unchanged = |bodies: &hir_def::ModuleBodies| {
         let mut all = bodies.method_bodies().map(|(_, body, _)| body).chain(bodies.module_code());
         !all.any(|body| body_may_change_items(body, collection))
@@ -308,8 +308,8 @@ pub(crate) fn lookup_form_item_field(
     }
     let form = managed_form_with_items(db, resolver)?;
     let element = form.find_element(field.as_str())?;
-    let module_id = resolver.module_id()?;
-    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, module_id.file_id);
+    let file_id = resolver.visibility_file_id()?;
+    let obj_resolver = crate::object_resolver::DbObjectResolver::new(db, file_id);
     Some(FieldInfo {
         name: Name::new(&element.name),
         name_en: None,

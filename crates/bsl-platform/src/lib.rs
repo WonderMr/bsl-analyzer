@@ -38,8 +38,9 @@ pub use global_catalog::{
     PlatformVersionParseError,
 };
 pub use help::{
-    active_platform_help_request, install_platform_help, is_url_like, redact_url, InstallOutcome,
-    PlatformHelp, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
+    active_platform_help_request, begin_platform_help_load, install_platform_help, is_url_like,
+    platform_help_pending, redact_url, wait_for_platform_help, InstallOutcome, PlatformHelp,
+    PlatformHelpLoad, PlatformHelpOrigin, PlatformHelpRequest, PlatformHelpSourceKind,
     PlatformHelpStatus, RestartRequired, BUNDLED_PLATFORM_VERSION, CORPUS_ENV,
 };
 pub use parameter_series::ParameterSeries;

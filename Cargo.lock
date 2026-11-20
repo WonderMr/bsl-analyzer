@@ -365,6 +365,7 @@ dependencies = [
  "dirs",
  "expect-test",
  "hir",
+ "html-parser",
  "ide",
  "ide-db",
  "ide-host-core",

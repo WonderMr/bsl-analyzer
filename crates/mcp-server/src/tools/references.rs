@@ -173,23 +173,6 @@ fn anchor(
     let max_files = params.max_files.unwrap_or(DEFAULT_MAX_FILES).min(MAX_MAX_FILES);
 
     let anchor = build_anchor(resident, params)?;
-    // A position names its file outright, so there is no declaration to look for
-    // in a root — and a parameter that is validated against the root table and
-    // then dropped is worse than one that was refused: the caller is told its
-    // root is wrong, never that its narrowing did nothing.
-    // Written against the class and not one member of it: every anchor by `path` already
-    // names its file, so there is no declaration left for a root to narrow. Spelling the
-    // condition as `matches!(anchor, Position { .. })` would let the next anchor by file
-    // through, and a root validated against the root table and then dropped is worse than
-    // one refused — the caller is told its narrowing was understood while nothing narrowed.
-    if params.anchor_root_id.is_some() && !matches!(anchor, ReferenceAnchor::Name(_)) {
-        return Err(McpError::invalid_params(
-            "'anchor_root_id' picks which root the DECLARATION is looked for in, so it goes \
-             with 'symbol'; an anchor by 'path' already names one file. Use 'area_root_id' \
-             to narrow which references are shown",
-            None,
-        ));
-    }
     let anchor_selection = match params.anchor_root_id {
         Some(root_id) => Some(select(resident, db, Some(root_id), None)?),
         None => None,
@@ -232,53 +215,94 @@ pub(crate) fn finish(answer: Answer, revision: u64, topology: u64, stale: bool) 
     structured(Value::Object(body))
 }
 
-fn build_anchor(
-    resident: &DiagnosticsResident,
-    params: &Params<'_>,
-) -> Result<ReferenceAnchor, McpError> {
-    if let Some(symbol) = params.symbol.map(str::trim).filter(|s| !s.is_empty()) {
+/// Why an anchor by `path` without `line` is refused.
+const LINE_REQUIRED: &str = "'line' is required with 'path' unless 'line_content' quotes the line";
+
+/// The name a call anchors on, when it anchors on a name.
+fn anchor_symbol<'a>(params: &Params<'a>) -> Option<&'a str> {
+    params.symbol.map(str::trim).filter(|symbol| !symbol.is_empty())
+}
+
+/// The conflicts and omissions in a call's parameters that the parameters alone decide.
+///
+/// Asked before anything waits for the resident or for the platform help, so a malformed call
+/// is refused as such whatever their state; the walk asks again, since it is also reached
+/// without the handler.
+pub(crate) fn check_params(params: &Params<'_>) -> Result<(), McpError> {
+    let refuse = |message: &'static str| Err(McpError::invalid_params(message, None));
+    if anchor_symbol(params).is_some() {
         if params.path.is_some() {
-            return Err(McpError::invalid_params(
+            return refuse(
                 "pass either 'symbol' or an anchor on 'path', not both: they anchor on \
                  different things and the answer would not say which one it followed",
-                None,
-            ));
+            );
         }
         // `root_id` qualifies `path` and nothing else. Accepting it beside a
         // symbol — and validating it against the root table, as `select` would —
         // tells the caller its narrowing was understood while the walk spans
         // every root. `anchor_root_id` is the parameter that narrows a name.
         if params.line.is_some() || params.column.is_some() {
-            return Err(McpError::invalid_params(
+            return refuse(
                 "'line'/'column' belong to a 'path' anchor; a 'symbol' is resolved by name \
                  and has no position to start from",
-                None,
-            ));
+            );
         }
         if params.line_content.is_some() {
-            return Err(McpError::invalid_params(
+            return refuse(
                 "'line_content' certifies a line of the file named by 'path'; a 'symbol' is \
                  resolved by name and quotes nothing",
-                None,
-            ));
+            );
         }
         if params.root_id.is_some() {
-            return Err(McpError::invalid_params(
+            return refuse(
                 "'root_id' spells out which root 'path' is relative to, so it needs a \
                  'path'; to look for a DECLARATION of 'symbol' in one root pass \
                  'anchor_root_id'",
-                None,
-            ));
+            );
         }
+    } else {
+        if params.path.is_none() {
+            let what = if params.line_content.is_some() { CONTENT_NEEDS_PATH } else { NO_ANCHOR };
+            return refuse(what);
+        }
+        // A quoted line makes `line` a narrowing rather than an address, so the requirement
+        // is lifted exactly there. This is the main input of the promise: a caller that read
+        // the file and does not trust its own line numbers has the text and nothing else.
+        match params.line_content {
+            None if params.line.is_none() => return refuse(LINE_REQUIRED),
+            Some(content) if content.trim().is_empty() => {
+                return refuse(
+                    "'line_content' is empty once its surrounding whitespace is dropped, so it \
+                     certifies nothing; quote the text of the line you read",
+                );
+            }
+            _ => {}
+        }
+        // A position names its file outright, so there is no declaration to look for in a
+        // root — and a parameter that is validated against the root table and then dropped
+        // is worse than one that was refused: the caller is told its root is wrong, never
+        // that its narrowing did nothing. Written against the class and not one member of
+        // it: every anchor by `path` names its file.
+        if params.anchor_root_id.is_some() {
+            return refuse(
+                "'anchor_root_id' picks which root the DECLARATION is looked for in, so it goes \
+                 with 'symbol'; an anchor by 'path' already names one file. Use 'area_root_id' \
+                 to narrow which references are shown",
+            );
+        }
+    }
+    parse_kinds(params.kinds).map(|_| ())
+}
+
+fn build_anchor(
+    resident: &DiagnosticsResident,
+    params: &Params<'_>,
+) -> Result<ReferenceAnchor, McpError> {
+    check_params(params)?;
+    if let Some(symbol) = anchor_symbol(params) {
         return Ok(ReferenceAnchor::Name(symbol.to_string()));
     }
-
-    let path = params.path.ok_or_else(|| {
-        McpError::invalid_params(
-            if params.line_content.is_some() { CONTENT_NEEDS_PATH } else { NO_ANCHOR },
-            None,
-        )
-    })?;
+    let path = params.path.ok_or_else(|| McpError::invalid_params(NO_ANCHOR, None))?;
     let resolved = resident
         .resolve_rooted_path(params.root_id, Path::new(path))
         .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
@@ -299,31 +323,15 @@ fn build_anchor(
             )
         }
     })?;
-    // A quoted line makes `line` a narrowing rather than an address, so the requirement is
-    // lifted exactly there. This is the main input of the promise: a caller that read the
-    // file and does not trust its own line numbers has the text and nothing else.
     let Some(content) = params.line_content else {
-        let line = params.line.ok_or_else(|| {
-            McpError::invalid_params(
-                "'line' is required with 'path' unless 'line_content' quotes the line",
-                None,
-            )
-        })?;
+        let line = params.line.ok_or_else(|| McpError::invalid_params(LINE_REQUIRED, None))?;
         return Ok(ReferenceAnchor::Position { file_id, line, column: params.column.unwrap_or(0) });
     };
-    let content = content.trim();
-    if content.is_empty() {
-        return Err(McpError::invalid_params(
-            "'line_content' is empty once its surrounding whitespace is dropped, so it \
-             certifies nothing; quote the text of the line you read",
-            None,
-        ));
-    }
     Ok(ReferenceAnchor::Text {
         file_id,
         line: params.line,
         column: params.column,
-        content: content.to_owned(),
+        content: content.trim().to_owned(),
     })
 }
 
@@ -1290,6 +1298,9 @@ pub(crate) struct ReferencesLoading {
     attempts: Option<u64>,
     /// How long ago that failure was published.
     failed_age_ms: Option<u64>,
+    /// `platform_help` while the server is still loading the platform help, which every
+    /// walk reads; `status` is then `loading` whatever the resident's own state.
+    phase: Option<String>,
 }
 
 crate::wire_enum!(LoadingSchemaVersion { V1 => "1" });
