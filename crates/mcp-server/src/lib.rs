@@ -545,9 +545,11 @@ struct SyntaxHelpByNameParams {
     /// Owning platform type when `name` is a member of a specific type (optional).
     type_name: Option<String>,
     /// Output budget in tokens (~4 chars each) covering the compatibility Markdown and the
-    /// structured card together: the Markdown is truncated at a line boundary with a note
-    /// pointing at the single-member lookup, and the card's listings take what is left
-    /// (`budget_exhausted` says when they were cut). Default 6000.
+    /// structured card together: the Markdown is truncated, at a line boundary unless one line
+    /// is longer than half of it, and ends with a note; the card's listings take what is left.
+    /// The card drops its documentation when that leaves more Markdown (`budget_exhausted`
+    /// says the card was cut). Below the card's own size the answer is the minimal
+    /// `budget_exhausted` envelope with the start of the Markdown. Default 6000.
     max_output_tokens: Option<usize>,
 }
 
@@ -2563,15 +2565,21 @@ impl McpServer {
                                     tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
                                 );
                                 let found = ide::lookup_names(db, &query, &[&source]);
-                                tools::name_answer::NameAnswer::render(
+                                let answer = tools::name_answer::NameAnswer::render(
                                     db,
                                     Some(resident.workspace_roots()),
                                     &found,
-                                )
+                                );
+                                (answer, ide::owner_outside_loaded_configurations(db, symbol))
                             });
                             match answer {
-                                ResidentOutcome::Ready(answer, _) => {
-                                    Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                                ResidentOutcome::Ready((answer, unloaded_owner), _) => {
+                                    Ok(tools::symbol_info::render_not_found(
+                                        symbol,
+                                        answer,
+                                        unloaded_owner.as_deref(),
+                                        &stamp,
+                                    ))
                                 }
                                 // The resident was evicted between the card read and this
                                 // one; a retry envelope is the honest answer, not a miss
