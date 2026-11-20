@@ -416,13 +416,12 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
     let source = inputs.source_dir.clone().context("workspace daemon requires source")?;
     let cache = inputs.workspace_cache.clone().context("workspace daemon requires cache")?;
     prepare_platform_identity(&source)?;
-    // The launching client waits for its `initialize` answer through the whole daemon
-    // start, and loading the help is the longest part of it: it runs while the daemon
-    // derives its identity, binds the endpoint and takes the first session.
-    let help_preload = Arc::new(std::sync::Mutex::new(Some(std::thread::spawn({
-        let source = source.clone();
-        move || bsl_analyzer::help_bootstrap::bootstrap_for_root(&source, None)
-    }))));
+    // The launching client waits for its `initialize` answer through the daemon start, and
+    // a first extraction of an installed platform's help takes minutes — longer than a
+    // client waits. The help therefore loads in the background for as long as it takes:
+    // MCP sessions are served without it, their tools that need it answer `loading`, and
+    // an editor session gets its workspace once the help is in, as it always did.
+    bsl_analyzer::help_bootstrap::spawn_bootstrap(Some(source.clone()));
     let expected = identity(&source, &cache)?;
     let key = SharedBackendKey::new(expected.clone());
     let preset = if std::env::var_os(AUTO_DAEMON_ENV).is_none() {
@@ -451,7 +450,6 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         let preset = preset.clone();
         let executor_slots = executor_slots.clone();
         let retiring = retiring.clone();
-        let help_preload = help_preload.clone();
         let epoch = epoch;
         if markers_enabled {
             tracing::info!(
@@ -483,16 +481,6 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                             anyhow::ensure!(
                                 identity(&source, &cache)? == expected,
                                 "workspace settings changed before daemon attach"
-                            );
-                            let preload =
-                                help_preload.lock().unwrap_or_else(|p| p.into_inner()).take();
-                            if let Some(preload) = preload {
-                                let _ = preload.join();
-                            }
-                            bsl_analyzer::help_bootstrap::bootstrap_for_root(&source, None);
-                            anyhow::ensure!(
-                                identity(&source, &cache)? == expected,
-                                "platform or workspace identity changed during daemon bootstrap"
                             );
                             let prefixes = resolve_embedding_prefixes(Some(&source))
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -570,10 +558,13 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                     // The editor's `initialize` is answered from the project settings alone,
                     // so the session takes it before the owner exists: loading the platform
                     // help and the owner state is the longest part of a daemon start, and
-                    // every later request waits for the owner anyway.
+                    // every later request waits for the owner anyway. The editor's requests
+                    // wait for the help too, as they do in a standalone language server.
                     let runtime = tokio::runtime::Handle::current();
                     let workspace = move || -> anyhow::Result<mcp_server::WorkspaceHandle> {
-                        Ok(runtime.block_on(initialized)?.shared_state().workspace_handle())
+                        let owner = runtime.block_on(initialized)?;
+                        bsl_platform::wait_for_platform_help(None);
+                        Ok(owner.shared_state().workspace_handle())
                     };
                     serve_lsp(channel, workspace, context, stop, _retired, epoch).await
                 }

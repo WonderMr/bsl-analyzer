@@ -98,6 +98,14 @@ enum SearchOutput<C, H = Value> {
         budget_exhausted: bool,
         budget_hint: Option<String>,
     },
+    ListPlatformNotReady {
+        action: ListPlatformAction,
+        schema_version: ListPlatformSchemaVersion,
+        status: NotReadyStatus,
+        retry_after_ms: u64,
+        detail: String,
+        phase: crate::tools::platform_help::LoadingPhase,
+    },
     Status {
         action: StatusAction,
         schema_version: StatusSchemaVersion,
@@ -167,6 +175,10 @@ struct SearchNotReady<A, V> {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(default, with = "SemanticFailureSchema")]
     semantic_failure: Option<bsl_search::EmbeddingFailure>,
+    /// `platform_help` while the server is still loading the platform help the docs index is
+    /// built from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<crate::tools::platform_help::LoadingPhase>,
 }
 
 macro_rules! const_enum {

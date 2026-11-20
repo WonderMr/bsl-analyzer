@@ -223,6 +223,41 @@ fn indexed_search_budget(command: &SearchCommand) -> Option<usize> {
     }
 }
 
+/// The action of `command` when it depends on the platform help: the docs index is built from
+/// it and the listing is its catalog. `search_code` reads no help itself, yet once the code
+/// index exists a call waits on the workspace's own help-dependent state until the load ends,
+/// which on a first extraction is minutes, so it is answered the same way.
+fn platform_search_action(command: &SearchCommand) -> Option<&'static str> {
+    match command {
+        SearchCommand::ListPlatform(_) => Some("list_platform"),
+        SearchCommand::FindDocs { .. } => Some("find_docs"),
+        SearchCommand::SearchDocs { .. } => Some("search_docs"),
+        SearchCommand::SearchCode(_) => Some("search_code"),
+        SearchCommand::Status => None,
+    }
+}
+
+/// The `not_ready` answer of a search action that reads the platform help, while the server
+/// is still loading it; `None` when the action can be served.
+async fn platform_search_loading(
+    server: &McpServer,
+    command: &SearchCommand,
+    budget: Option<usize>,
+    ct: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CallToolResult>, McpError> {
+    let Some(action) = platform_search_action(command) else { return Ok(None) };
+    let not_ready = || tools::search::platform_help_not_ready(action);
+    let Some(loading) = tools::platform_help::loading_answer(ct, not_ready).await? else {
+        return Ok(None);
+    };
+    let indexing = match command {
+        SearchCommand::SearchCode(_) => server.state.workspace_indexing(),
+        _ => server.state.reference_indexing(),
+    };
+    let stale = server.state.graph().is_reloading();
+    finish_indexed_search(loading, indexing, budget, stale).map(Some)
+}
+
 fn finish_indexed_search(
     mut response: CallToolResult,
     indexing: indexing::Indexing,
@@ -929,6 +964,28 @@ struct ReferencesParams {
     max_output_tokens: Option<usize>,
 }
 
+impl ReferencesParams {
+    /// The parameters as the walk reads them.
+    fn walk(&self) -> tools::references::Params<'_> {
+        tools::references::Params {
+            symbol: self.symbol.as_deref(),
+            anchor_root_id: self.anchor_root_id.as_deref(),
+            root_id: self.root_id.as_deref(),
+            path: self.path.as_deref(),
+            line: self.line,
+            column: self.column,
+            line_content: self.line_content.as_deref(),
+            area_root_id: self.area_root_id.as_deref(),
+            area_path_prefix: self.area_path_prefix.as_deref(),
+            kinds: &self.kinds,
+            include_declaration: self.include_declaration,
+            limit: self.limit,
+            max_files: self.max_files,
+            include_preview: self.include_preview,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiagnosticsParams {
@@ -1603,6 +1660,9 @@ impl McpServer {
         let budget = indexed_search_budget(&command);
         if budget.is_some() && ct.is_cancelled() {
             return Err(McpError::internal_error("request cancelled", None));
+        }
+        if let Some(loading) = platform_search_loading(self, &command, budget, &ct).await? {
+            return Ok(loading);
         }
         let reference =
             matches!(&command, SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. });
@@ -2439,6 +2499,13 @@ impl McpServer {
 
         let sections = tools::symbol_info::sections_from(&p.include);
         let locale = tools::symbol_info::locale_from(p.locale.as_deref())?;
+        // Types and platform members are read off the platform help, which may still be
+        // loading; a read now would hold the call, and the resident with it, until it is in.
+        // Asked after the parameters, so a malformed call is refused as such meanwhile.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, Some("1")).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
         let max_output_tokens =
             p.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
         let member_kind = p.member_kind.map(SymbolMemberKindFilter::as_str);
@@ -2661,6 +2728,16 @@ impl McpServer {
         // handed a `loading` body — the one shape the contract says a cancelled call
         // never produces. Every outcome, `loading` included, is rendered from the read.
         diag.ensure_loading();
+        // Parameters that contradict each other are refused as such, whatever the state of
+        // the resident or of the platform help.
+        tools::references::check_params(&p.walk())?;
+        // Receivers are typed off the platform help, which may still be loading; a walk now
+        // would hold the call, and the resident with it, until it is in. A cancelled call
+        // still gets no body here.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, Some("1")).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         let max_output_tokens = p.max_output_tokens.unwrap_or(tools::references::DEFAULT_BUDGET);
 
@@ -2687,22 +2764,7 @@ impl McpServer {
                     // its chunks, and takes a request handle of its own for each phase.
                     let read = || {
                         session.read_fanout(|resident, _generation| {
-                            let params = tools::references::Params {
-                                symbol: p.symbol.as_deref(),
-                                anchor_root_id: p.anchor_root_id.as_deref(),
-                                root_id: p.root_id.as_deref(),
-                                path: p.path.as_deref(),
-                                line: p.line,
-                                column: p.column,
-                                line_content: p.line_content.as_deref(),
-                                area_root_id: p.area_root_id.as_deref(),
-                                area_path_prefix: p.area_path_prefix.as_deref(),
-                                kinds: &p.kinds,
-                                include_declaration: p.include_declaration,
-                                limit: p.limit,
-                                max_files: p.max_files,
-                                include_preview: p.include_preview,
-                            };
+                            let params = p.walk();
                             tools::references::answer(
                                 resident,
                                 &cancel,
@@ -2859,6 +2921,13 @@ impl McpServer {
             max_output_tokens: p.max_output_tokens,
             detailed,
         };
+        // Findings are computed off the platform help, which may still be loading: an analysis
+        // now would hold the call, and the resident with it, until the help is in. Asked after
+        // the parameters, so a malformed call is refused as such whatever the help's state.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         let retry_diag = diag.clone();
         let response_graph = graph.clone();
@@ -2947,6 +3016,12 @@ impl McpServer {
         let diag = self.state.diagnostics().clone();
         let graph = self.state.graph().clone();
         diag.ensure_loading();
+        // The snippet is typed off the platform help, which may still be loading; asked after
+        // the parameters, so a malformed call is refused as such meanwhile.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
         let retry_diag = diag.clone();
         tasks::resident_response(
             self,
@@ -3041,6 +3116,12 @@ impl McpServer {
             // config surfaces as `truncated` with the true `files_total`.
             max_files: p.max_files.unwrap_or(DEFAULT_MAX_SWEEP_FILES).min(MAX_SWEEP_FILES_CEILING),
         };
+        // Findings are computed off the platform help, which may still be loading; asked after
+        // the parameters, so a malformed call is refused as such meanwhile.
+        let help = tools::platform_help::resident_loading_answer(&ct, &diag, None).await?;
+        if let Some(loading) = help {
+            return Ok(loading.into());
+        }
 
         // The sweep fans out to rayon, and each worker queries its OWN db clone with its
         // own salsa token. Those tokens register in the request's registry — the same one
@@ -3207,6 +3288,9 @@ impl McpServer {
         if budget.is_some() && ct.is_cancelled() {
             return Err(McpError::internal_error("request cancelled", None));
         }
+        if let Some(loading) = platform_search_loading(self, &command, budget, &ct).await? {
+            return Ok(loading);
+        }
         let response = match command {
             SearchCommand::Status => {
                 let engine = self.state.search_engine().clone();
@@ -3352,7 +3436,14 @@ impl McpServer {
     async fn syntax_help(
         &self,
         params: Parameters<SyntaxHelpParams>,
+        ct: tokio_util::sync::CancellationToken,
     ) -> Result<CallToolResult, McpError> {
+        // Every card is read off the platform help, which may still be loading.
+        if let Some(loading) =
+            tools::platform_help::loading_answer(&ct, tools::platform::syntax_help_loading).await?
+        {
+            return Ok(loading);
+        }
         match params.0 {
             SyntaxHelpParams::ByName(p) => tools::platform::bsl_syntax_help(
                 &p.name,
@@ -7161,7 +7252,7 @@ mod platform_catalog_calls {
             }
             for (profile, server) in [("workspace", &workspace), ("reference", &reference)] {
                 let through = server
-                    .syntax_help(Parameters(syntax_help_params(&reference_id, sent)))
+                    .syntax_help(Parameters(syntax_help_params(&reference_id, sent)), token())
                     .await
                     .unwrap();
                 assert_eq!(wire(&through), wire(&direct), "{profile}, budget {sent:?}");
@@ -7210,7 +7301,7 @@ mod platform_catalog_calls {
         assert_eq!(started, 1, "reference_search list_platform");
         let started = blocking_threads_started_by(|| async {
             workspace
-                .syntax_help(Parameters(syntax_help_params(&reference_id, None)))
+                .syntax_help(Parameters(syntax_help_params(&reference_id, None)), token())
                 .await
                 .unwrap()
         });

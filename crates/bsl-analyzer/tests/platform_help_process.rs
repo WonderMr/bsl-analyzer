@@ -354,6 +354,235 @@ fn mcp_profiles_serve_the_configured_corpus_from_the_first_tool_call() {
     }
 }
 
+/// An MCP stdio server child, spoken to one JSON-RPC message at a time.
+struct McpSession {
+    child: McpChild,
+    stdin: std::process::ChildStdin,
+    answers: mpsc::Receiver<Value>,
+    next_id: u64,
+}
+
+impl McpSession {
+    fn start(mut command: Command) -> Self {
+        let mut child = McpChild(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stdin = child.0.stdin.take().unwrap();
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, answers) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(serde_json::from_str::<Value>(&line).unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { child, stdin, answers, next_id: 1 }
+    }
+
+    fn send(&mut self, message: &Value) {
+        writeln!(self.stdin, "{message}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// Sends `method` and returns its answer; one that takes longer than `guard` fails the test.
+    fn request(&mut self, method: &str, params: Value, guard: Duration) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let deadline = Instant::now() + guard;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = self.answers.recv_timeout(remaining).unwrap_or_else(|error| {
+                let status = self.child.0.try_wait().ok().flatten();
+                panic!("{method}: no answer within {guard:?} ({error}); child: {status:?}")
+            });
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    /// The result of calling the tool `name`.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        let params = json!({"name": name, "arguments": arguments});
+        let answer = self.request("tools/call", params, MCP_RESPONSE_GUARD);
+        assert!(answer.get("error").is_none(), "{name}: {answer}");
+        answer["result"].clone()
+    }
+}
+
+/// A project whose `auto` platform help the server extracts from a self-written installed
+/// platform, with the lock of the `auto` snapshot slot held: the server extracts the archives,
+/// then waits for the lock to publish the corpus, so the load stays in flight until
+/// [`HeldHelpLoad::release`].
+struct HeldHelpLoad {
+    project: tempfile::TempDir,
+    platform: PathBuf,
+    cache: tempfile::TempDir,
+    lock: Option<std::fs::File>,
+}
+
+impl HeldHelpLoad {
+    fn new() -> Self {
+        let project = project("[platform_help]\nsource = \"auto\"\n");
+        let platform = project.path().join("platform").join("8.3.27.9");
+        let mut pages = html_parser::fixture_hbk::shcntx_pages();
+        pages[1].1 = pages[1].1.replace("appends one element", "Extracted corpus text.");
+        html_parser::fixture_hbk::write_pair(&platform, &pages, 101);
+        let cache = tempfile::tempdir().unwrap();
+        let slot = cache.path().join("help-cache").join("auto");
+        std::fs::create_dir_all(&slot).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(slot.join("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        Self { project, platform, cache, lock: Some(lock) }
+    }
+
+    /// The workspace MCP stdio server of the project.
+    fn server(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        command
+            .args(["mcp", "serve", "--mode", "stdio", "--profile", "workspace", "--source-dir"])
+            .arg(self.project.path())
+            .current_dir(self.project.path())
+            .env("BSL_MCP_BROKER", "0")
+            .env("XDG_CACHE_HOME", self.cache.path().join("cache"))
+            .env("XDG_STATE_HOME", self.cache.path().join("state"))
+            .env("BSL_PLATFORM_HELP_CACHE_DIR", self.cache.path().join("help-cache"))
+            .env("BSL_PLATFORM_PATH", &self.platform)
+            .env_remove("BSL_PLATFORM_HELP_CORPUS")
+            .env_remove("BSL_ONEC_CONNECTIONS_FILE");
+        command
+    }
+
+    fn release(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            lock.unlock().unwrap();
+        }
+    }
+}
+
+/// `initialize` and `tools/list` of a started server.
+fn handshake(mcp: &mut McpSession) {
+    let hello = json!({
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "help-fixture", "version": "1"}
+    });
+    let initialized = mcp.request("initialize", hello, MCP_RESPONSE_GUARD);
+    assert!(initialized.get("result").is_some(), "{initialized}");
+    mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let listed = mcp.request("tools/list", json!({}), MCP_RESPONSE_GUARD);
+    let tools = listed["result"]["tools"].as_array().cloned().unwrap_or_default();
+    assert!(tools.iter().any(|tool| tool["name"] == "syntax_help"), "{listed}");
+}
+
+/// Calls `name` until its structured answer satisfies `done`, for at most `guard`.
+fn call_until(
+    mcp: &mut McpSession,
+    name: &str,
+    arguments: &Value,
+    guard: Duration,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + guard;
+    loop {
+        let answer = mcp.call(name, arguments.clone());
+        if done(&answer["structuredContent"]) {
+            return answer;
+        }
+        assert!(Instant::now() < deadline, "{name} did not get there within {guard:?}: {answer}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A first extraction of an installed platform's help outlasts the time a client waits for
+/// `initialize`. The server answers the handshake and every tool that reads no help while the
+/// load is held; a tool that reads the help answers `loading` meanwhile, and the configured
+/// corpus once the load is in.
+#[test]
+fn mcp_answers_while_the_platform_help_is_still_loading() {
+    let mut held = HeldHelpLoad::new();
+    let mut server = held.server();
+    server.args(["--enable-tool", "references"]);
+    let mut mcp = McpSession::start(server);
+    handshake(&mut mcp);
+
+    let outline = mcp.call("outline", json!({"path": "Module.bsl"}));
+    assert!(outline.to_string().contains("Тест"), "a tool that reads no help answers: {outline}");
+
+    // Parameters are checked before the help is waited for: a malformed call is refused as
+    // such while the help loads, not told to come back later.
+    let both = json!({"symbol": "Тест", "path": "Module.bsl", "line": 0});
+    for (name, call) in [("diagnostics", json!({"action": "snippet"})), ("references", both)] {
+        let malformed = json!({"name": name, "arguments": call});
+        let refused = mcp.request("tools/call", malformed, MCP_RESPONSE_GUARD);
+        assert_eq!(refused["error"]["code"], -32602, "{name}: {refused}");
+    }
+
+    let request = json!({"name": "Добавить", "type_name": "Массив"});
+    let loading = mcp.call("syntax_help", request.clone());
+    assert_eq!(loading["structuredContent"]["status"], "loading", "{loading}");
+    assert_eq!(loading["structuredContent"]["phase"], "platform_help", "{loading}");
+    assert!(!loading.to_string().contains("Extracted corpus text."), "{loading}");
+
+    held.release();
+    let came_in = |body: &Value| body["status"] != "loading";
+    let card = call_until(&mut mcp, "syntax_help", &request, MCP_RESPONSE_GUARD, came_in);
+    assert!(card.to_string().contains("Extracted corpus text."), "{card}");
+    assert_eq!(card["structuredContent"]["kind"], "method", "{card}");
+}
+
+/// How long the help load of `a_held_help_load_neither_fails_the_resident_nor_holds_search`
+/// is held: past the resident build's shortest deadline and the sweep that would expire it.
+const PAST_THE_BUILD_DEADLINE: Duration = Duration::from_secs(75);
+
+/// The resident build waits for the help before it starts, so a load held past the build's
+/// deadline does not fail the build; and `search_code`, whose index comes up without the help,
+/// answers `not_ready` for the help rather than waiting for the load.
+#[test]
+fn a_held_help_load_neither_fails_the_resident_nor_holds_search() {
+    let mut held = HeldHelpLoad::new();
+    let started = Instant::now();
+    let mut server = held.server();
+    // The shortest deadline the server accepts, and a sweep that looks every five seconds.
+    server.env("BSL_MCP_DIAG_BUILD_TIMEOUT_SECS", "60").env("BSL_MCP_RECONCILE_SECS", "5");
+    let mut mcp = McpSession::start(server);
+    handshake(&mut mcp);
+
+    let status = json!({"action": "status"});
+    let indexed = |body: &Value| body["state"] == "ready";
+    call_until(&mut mcp, "search", &status, MCP_RESPONSE_GUARD, indexed);
+    let query = json!({"action": "search_code", "query": "Тест"});
+    let code = mcp.call("search", query.clone());
+    assert_eq!(code["structuredContent"]["status"], "not_ready", "{code}");
+    assert_eq!(code["structuredContent"]["phase"], "platform_help", "{code}");
+
+    std::thread::sleep(PAST_THE_BUILD_DEADLINE.saturating_sub(started.elapsed()));
+    let resident = mcp.call("metadata", status.clone());
+    assert!(resident["structuredContent"].get("error").is_none(), "{resident}");
+    assert_eq!(resident["structuredContent"]["state"], "loading", "{resident}");
+
+    held.release();
+    let built = |body: &Value| body["state"] == "ready";
+    let ready = call_until(&mut mcp, "metadata", &status, MCP_RESPONSE_GUARD, built);
+    let ready = &ready["structuredContent"];
+    assert!(ready.get("error").is_none() && ready.get("attempts").is_none(), "{ready}");
+    let answered = |body: &Value| body["status"] != "not_ready";
+    let code = call_until(&mut mcp, "search", &query, MCP_RESPONSE_GUARD, answered);
+    assert!(code["structuredContent"]["hits"].is_array(), "{code}");
+}
+
 /// The shared backends an auto-mode LSP launches for `root`, kept in a runtime and cache
 /// directory of the test's own and stopped when the test ends.
 struct AutoBackends {
