@@ -549,9 +549,11 @@ struct SyntaxHelpByNameParams {
     /// Owning platform type when `name` is a member of a specific type (optional).
     type_name: Option<String>,
     /// Output budget in tokens (~4 chars each) covering the compatibility Markdown and the
-    /// structured card together: the Markdown is truncated at a line boundary with a note
-    /// pointing at the single-member lookup, and the card's listings take what is left
-    /// (`budget_exhausted` says when they were cut). Default 6000.
+    /// structured card together: the Markdown is truncated, at a line boundary unless one line
+    /// is longer than half of it, and ends with a note; the card's listings take what is left.
+    /// The card drops its documentation when that leaves more Markdown (`budget_exhausted`
+    /// says the card was cut). Below the card's own size the answer is the minimal
+    /// `budget_exhausted` envelope with the start of the Markdown. Default 6000.
     max_output_tokens: Option<usize>,
 }
 
@@ -1383,7 +1385,10 @@ impl McpServer {
     /// with `connection`; the server does not convert between the forms. Reads the
     /// resident analysis host; while it builds it returns a retry envelope, not an error —
     /// `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-    /// shortly instead of reading the answer as "no such object".
+    /// shortly instead of reading the answer as "no such object". The resident is a build of
+    /// its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+    /// After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+    /// minutes on a large configuration.
     #[tool(name = "metadata", annotations(read_only_hint = true))]
     async fn metadata(
         &self,
@@ -2566,15 +2571,21 @@ impl McpServer {
                                     tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
                                 );
                                 let found = ide::lookup_names(db, &query, &[&source]);
-                                tools::name_answer::NameAnswer::render(
+                                let answer = tools::name_answer::NameAnswer::render(
                                     db,
                                     Some(resident.workspace_roots()),
                                     &found,
-                                )
+                                );
+                                (answer, ide::owner_outside_loaded_configurations(db, symbol))
                             });
                             match answer {
-                                ResidentOutcome::Ready(answer, _) => {
-                                    Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                                ResidentOutcome::Ready((answer, unloaded_owner), _) => {
+                                    Ok(tools::symbol_info::render_not_found(
+                                        symbol,
+                                        answer,
+                                        unloaded_owner.as_deref(),
+                                        &stamp,
+                                    ))
                                 }
                                 // The resident was evicted between the card read and this
                                 // one; a retry envelope is the honest answer, not a miss
@@ -5830,7 +5841,10 @@ mod tool_descriptions {
             with `connection`; the server does not convert between the forms. Reads the
             resident analysis host; while it builds it returns a retry envelope, not an error —
             `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-            shortly instead of reading the answer as "no such object".
+            shortly instead of reading the answer as "no such object". The resident is a build of
+            its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+            After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+            minutes on a large configuration.
               - action: info | tree | object | form | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
               - filter: `tree` in source mode: case-insensitive substring of object names (optional). Alone it
@@ -6975,6 +6989,46 @@ mod resident_failed_answers {
         );
         assert_eq!(body["error"], REASON, "and the retry still names the cause it answers: {body}",);
         assert!(body.get("retry_after_ms").is_none(), "a build in flight owes no wait: {body}");
+
+        gate.release();
+        server.shutdown();
+    }
+
+    /// The graph and the resident `metadata` reads are two builds, and a published graph says
+    /// nothing about the other one. With the graph ready and the resident still building,
+    /// `info` answers the structured retry envelope rather than a summary or an error, and the
+    /// envelope points at the readiness probe that does cover the resident.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ready_graph_leaves_metadata_answering_its_own_loading_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
+        // Parked before it publishes, the resident stays in its build however fast it is: the
+        // read below meets it building instead of racing it.
+        let gate = state.diagnostics().arm_build_gate_for_test();
+        let graph = state.graph().clone();
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        let server = McpServer::new(McpProfile::Workspace, state);
+
+        let answer =
+            server.metadata(metadata_params("info"), token(), tasks::TaskCapable(false)).await;
+        let result = match answer {
+            Ok(CallToolResponse::Complete(result)) => result,
+            Ok(_) => panic!("a synchronous call does not create a task"),
+            Err(error) => panic!("a resident in its build was answered with an error: {error:?}"),
+        };
+        let body = result.structured_content.expect("the not-ready envelope is structured");
+        assert_eq!(body["status"], "loading", "{body}");
+        assert_eq!(body["state"], "loading", "{body}");
+        assert!(body["detail"].as_str().is_some_and(|detail| !detail.is_empty()), "{body}");
+        let text = result.content[0].as_text().expect("a text block").text.as_str();
+        assert!(
+            text.starts_with("Метаданные загружаются") && text.contains("metadata action=status"),
+            "the sentence an agent reads names the probe that covers the resident: {text}",
+        );
 
         gate.release();
         server.shutdown();
