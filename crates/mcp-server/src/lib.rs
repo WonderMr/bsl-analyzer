@@ -354,9 +354,13 @@ impl McpProfile {
 struct MetadataParams {
     /// info | tree | object | form | status.
     action: String,
-    /// `tree`: case-insensitive substring to narrow the returned tree (optional).
+    /// `tree` in source mode: case-insensitive substring of object names (optional). Alone it
+    /// lists every matching object of the configuration and its extensions as
+    /// `Категория.Имя`; with `meta_type` it narrows that category's listing.
     filter: Option<String>,
-    /// `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
+    /// `tree`: the metadata category to list. Source mode takes the singular or plural name,
+    /// e.g. `Справочник`/`Справочники`/`Catalogs`; infobase mode takes the live collection,
+    /// e.g. `Справочники`/`Documents`.
     meta_type: Option<String>,
     /// `tree` in infobase mode: case-insensitive object name/synonym substring.
     name_mask: Option<String>,
@@ -545,9 +549,11 @@ struct SyntaxHelpByNameParams {
     /// Owning platform type when `name` is a member of a specific type (optional).
     type_name: Option<String>,
     /// Output budget in tokens (~4 chars each) covering the compatibility Markdown and the
-    /// structured card together: the Markdown is truncated at a line boundary with a note
-    /// pointing at the single-member lookup, and the card's listings take what is left
-    /// (`budget_exhausted` says when they were cut). Default 6000.
+    /// structured card together: the Markdown is truncated, at a line boundary unless one line
+    /// is longer than half of it, and ends with a note; the card's listings take what is left.
+    /// The card drops its documentation when that leaves more Markdown (`budget_exhausted`
+    /// says the card was cut). Below the card's own size the answer is the minimal
+    /// `budget_exhausted` envelope with the start of the Markdown. Default 6000.
     max_output_tokens: Option<usize>,
 }
 
@@ -1379,7 +1385,10 @@ impl McpServer {
     /// with `connection`; the server does not convert between the forms. Reads the
     /// resident analysis host; while it builds it returns a retry envelope, not an error —
     /// `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-    /// shortly instead of reading the answer as "no such object".
+    /// shortly instead of reading the answer as "no such object". The resident is a build of
+    /// its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+    /// After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+    /// minutes on a large configuration.
     #[tool(name = "metadata", annotations(read_only_hint = true))]
     async fn metadata(
         &self,
@@ -1476,6 +1485,7 @@ impl McpServer {
         diag.ensure_loading();
 
         let action = p.action.clone();
+        let meta_type = p.meta_type.clone();
         let filter = p.filter.clone();
         let object_type = p.object_type.clone();
         let object_name = p.object_name.clone();
@@ -1504,6 +1514,7 @@ impl McpServer {
                                     db,
                                     &config,
                                     &extensions,
+                                    meta_type.clone(),
                                     filter.clone(),
                                     max_output_tokens,
                                 )
@@ -2560,15 +2571,21 @@ impl McpServer {
                                     tools::symbol_info::DEFAULT_CANDIDATE_LIMIT,
                                 );
                                 let found = ide::lookup_names(db, &query, &[&source]);
-                                tools::name_answer::NameAnswer::render(
+                                let answer = tools::name_answer::NameAnswer::render(
                                     db,
                                     Some(resident.workspace_roots()),
                                     &found,
-                                )
+                                );
+                                (answer, ide::owner_outside_loaded_configurations(db, symbol))
                             });
                             match answer {
-                                ResidentOutcome::Ready(answer, _) => {
-                                    Ok(tools::symbol_info::render_not_found(symbol, answer, &stamp))
+                                ResidentOutcome::Ready((answer, unloaded_owner), _) => {
+                                    Ok(tools::symbol_info::render_not_found(
+                                        symbol,
+                                        answer,
+                                        unloaded_owner.as_deref(),
+                                        &stamp,
+                                    ))
                                 }
                                 // The resident was evicted between the card read and this
                                 // one; a retry envelope is the honest answer, not a miss
@@ -5797,7 +5814,7 @@ mod tool_descriptions {
               - depth: Traversal depth for neighbors (default: 1).
               - detail: names | signatures | bodies (default: signatures).
               - dir: in | out | both — only for `neighbors` (default: in).
-              - edge_kinds: Keep only edges of these kinds (call|manager_creates|manager_access|query_ref|contains|data_binding|notify_ref|idle_handler|event_subscription|register_movement|subsystem_membership|role_reference|register_records|register_record_set); empty keeps all. Lets metadata-impact queries isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a register manager is `register_record_set`, not `manager_creates`; the `schema` action explains each kind.
+              - edge_kinds: Keep only edges of these kinds (call|manager_creates|manager_access|query_ref|contains|data_binding|notify_ref|idle_handler|event_subscription|register_movement|subsystem_membership|role_reference|register_records|register_record_set|intercepts); empty keeps all. Lets metadata-impact queries isolate e.g. only `query_ref`. `СоздатьНаборЗаписей()`/`СоздатьМенеджерЗаписи()` on a register manager is `register_record_set`, not `manager_creates`; the `schema` action explains each kind.
               - id: Durable node id (required for node/neighbors/callers/callees).
               - ids: Durable node ids (required for `source`).
               - max_call_sites: Cap on places per edge when `call_sites` is on (default: 20, max: 200). What the cap
@@ -5824,15 +5841,22 @@ mod tool_descriptions {
             with `connection`; the server does not convert between the forms. Reads the
             resident analysis host; while it builds it returns a retry envelope, not an error —
             `structuredContent.status == "loading"`, same field `diagnostics`/`graph` set, so retry
-            shortly instead of reading the answer as "no such object".
+            shortly instead of reading the answer as "no such object". The resident is a build of
+            its own, not the graph: a ready `graph` status says nothing about it, so poll `status`.
+            After about 10 idle minutes it is unloaded and the next call rebuilds it, which takes
+            minutes on a large configuration.
               - action: info | tree | object | form | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
-              - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
+              - filter: `tree` in source mode: case-insensitive substring of object names (optional). Alone it
+            lists every matching object of the configuration and its extensions as
+            `Категория.Имя`; with `meta_type` it narrows that category's listing.
               - form_name: `form`: managed-form name (optional; omit for the object's default form).
               - max_items: `tree` in infobase mode: maximum returned objects (default 100, max 1000).
               - max_output_tokens: `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
             for `content` and `structuredContent` together (default 6000).
-              - meta_type: `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
+              - meta_type: `tree`: the metadata category to list. Source mode takes the singular or plural name,
+            e.g. `Справочник`/`Справочники`/`Catalogs`; infobase mode takes the live collection,
+            e.g. `Справочники`/`Documents`.
               - mode: auto | source | infobase (default auto).
               - name_mask: `tree` in infobase mode: case-insensitive object name/synonym substring.
               - object_name: Metadata object name, e.g. `ЗаказКлиента`. Required for `object`; for `form` it
@@ -6965,6 +6989,46 @@ mod resident_failed_answers {
         );
         assert_eq!(body["error"], REASON, "and the retry still names the cause it answers: {body}",);
         assert!(body.get("retry_after_ms").is_none(), "a build in flight owes no wait: {body}");
+
+        gate.release();
+        server.shutdown();
+    }
+
+    /// The graph and the resident `metadata` reads are two builds, and a published graph says
+    /// nothing about the other one. With the graph ready and the resident still building,
+    /// `info` answers the structured retry envelope rather than a summary or an error, and the
+    /// envelope points at the readiness probe that does cover the resident.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ready_graph_leaves_metadata_answering_its_own_loading_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
+        // Parked before it publishes, the resident stays in its build however fast it is: the
+        // read below meets it building instead of racing it.
+        let gate = state.diagnostics().arm_build_gate_for_test();
+        let graph = state.graph().clone();
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        let server = McpServer::new(McpProfile::Workspace, state);
+
+        let answer =
+            server.metadata(metadata_params("info"), token(), tasks::TaskCapable(false)).await;
+        let result = match answer {
+            Ok(CallToolResponse::Complete(result)) => result,
+            Ok(_) => panic!("a synchronous call does not create a task"),
+            Err(error) => panic!("a resident in its build was answered with an error: {error:?}"),
+        };
+        let body = result.structured_content.expect("the not-ready envelope is structured");
+        assert_eq!(body["status"], "loading", "{body}");
+        assert_eq!(body["state"], "loading", "{body}");
+        assert!(body["detail"].as_str().is_some_and(|detail| !detail.is_empty()), "{body}");
+        let text = result.content[0].as_text().expect("a text block").text.as_str();
+        assert!(
+            text.starts_with("Метаданные загружаются") && text.contains("metadata action=status"),
+            "the sentence an agent reads names the probe that covers the resident: {text}",
+        );
 
         gate.release();
         server.shutdown();

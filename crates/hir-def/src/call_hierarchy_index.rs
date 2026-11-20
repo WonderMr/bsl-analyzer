@@ -52,7 +52,8 @@ impl MethodCallPair {
             | EdgeKind::SubsystemMembership
             | EdgeKind::RoleReference
             | EdgeKind::RegisterRecords
-            | EdgeKind::RegisterRecordSet => None,
+            | EdgeKind::RegisterRecordSet
+            | EdgeKind::Intercepts(_) => None,
         }
     }
 

@@ -193,7 +193,8 @@ pub use hir_def::effective_module::{
     EffectiveModuleId,
 };
 pub use hir_def::extension_merge::{
-    extract_change_and_validate, pair_base_module_path, unquote_bsl_string, Origin, Segment,
+    extract_change_and_validate, pair_base_module_path, pair_extension_module_paths,
+    unquote_bsl_string, Origin, Segment,
 };
 pub use hir_def::weaving::{
     interception_applicable, interception_effective, interceptor_target, signature_mismatch,

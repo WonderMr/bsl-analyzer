@@ -1942,6 +1942,167 @@ fn the_object_of_a_module_is_found_in_both_path_layouts() {
     );
 }
 
+// --- a configuration the project does not load -------------------------------------------
+
+const CALLS_THE_BASE: &str = "\
+Процедура Свой() Экспорт
+    БазовыйМодуль.Экспортируемая();
+КонецПроцедуры
+";
+
+/// An extension-only project calls into the configuration it extends without loading it, so
+/// a name of that configuration finds nothing. The answer carries the owner no loaded root
+/// declares — without it `not_found` reads as "nobody declares it, so nobody calls it" —
+/// while a name of the extension's own module, which IS loaded, keeps its conclusive answer.
+/// Loading the main configuration takes the mark away.
+#[test]
+fn a_name_of_a_configuration_the_project_does_not_load_says_so() {
+    let module = FileId(0);
+    let path = cfe_root("independent").join("CommonModules/МодульНезависимый/Ext/Module.bsl");
+    let mut file_set = FileSet::default();
+    file_set.insert(module, VfsPath::new(path.to_string_lossy().to_string()));
+    let mut db = RootDatabaseImpl::new();
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(module, SourceRootId(0));
+    db.set_file_text(module, CALLS_THE_BASE);
+    let scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+    let extension = (Some("independent".to_string()), cfe_root("independent"));
+    db.set_all_config_paths(vec![extension.clone()], scope);
+
+    let vendor = by_name(&db, "БазовыйМодуль.Экспортируемая");
+    assert_eq!(vendor.outcome, ReferencesOutcome::NotFound);
+    assert_eq!(vendor.unloaded_owner.as_deref(), Some("БазовыйМодуль"));
+
+    let own_missing = by_name(&db, "МодульНезависимый.НетТакого");
+    assert_eq!(own_missing.outcome, ReferencesOutcome::NotFound);
+    assert_eq!(own_missing.unloaded_owner, None, "the extension's own module is loaded");
+
+    let own = by_name(&db, "МодульНезависимый.Свой");
+    assert_eq!(own.outcome, ReferencesOutcome::Resolved);
+    assert_eq!(own.unloaded_owner, None);
+
+    db.set_all_config_paths(vec![(None, cfe_root("base")), extension], scope);
+    let with_base = by_name(&db, "БазовыйМодуль.Экспортируемая");
+    assert_eq!(with_base.unloaded_owner, None, "{:?}", with_base.outcome);
+}
+
+const INTERCEPTOR: &str = "\
+Функция Расш_ВыполнитьВФоне() Экспорт
+    Возврат 1;
+КонецФункции
+";
+
+const CALLS_THE_ADOPTED: &str = "\
+Процедура Свой() Экспорт
+    Длительные.ВыполнитьВФоне();
+КонецПроцедуры
+";
+
+/// The metadata of one extension root with an adopted module, an own module, a role and an
+/// event subscription — the families an extension declares outside the object entries.
+fn adopting_extension() -> RootDatabaseImpl {
+    use ide_db::metadata::{CommonModuleEntry, EventSubscriptionEntry, RoleEntry};
+
+    let module_xml = |name: &str, adopted: bool| {
+        let belonging = if adopted {
+            "<ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>\
+             22222222-2222-2222-2222-222222222222</ExtendedConfigurationObject>"
+        } else {
+            ""
+        };
+        format!(
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><CommonModule uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>{name}</Name>{belonging}<Server>true</Server></Properties></CommonModule></MetaDataObject>"#
+        )
+    };
+    let files: [(&str, String); 6] = [
+        ("/ws/ext/CommonModules/Длительные/Ext/Module.bsl", INTERCEPTOR.to_owned()),
+        ("/ws/ext/CommonModules/Длительные.xml", module_xml("Длительные", true)),
+        ("/ws/ext/CommonModules/Свой/Ext/Module.bsl", CALLS_THE_ADOPTED.to_owned()),
+        ("/ws/ext/CommonModules/Свой.xml", module_xml("Свой", false)),
+        ("/ws/ext/Roles/ЧтениеДанных.xml", "<MetaDataObject/>".to_owned()),
+        ("/ws/ext/EventSubscriptions/ПриЗаписи.xml", "<MetaDataObject/>".to_owned()),
+    ];
+    let pairs: Vec<(&str, &str)> =
+        files.iter().map(|(path, text)| (*path, text.as_str())).collect();
+    let (mut db, ids) = db_with(&pairs);
+    let root = PathBuf::from("/ws/ext");
+    let scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+    db.set_all_config_paths(vec![(Some("Расширение".to_string()), root.clone())], scope);
+    db.set_metadata_listing(
+        &root.to_string_lossy(),
+        MetadataListingData {
+            common_modules: vec![
+                CommonModuleEntry {
+                    name: "Длительные".to_string(),
+                    main: ids[1],
+                    module_file: Some(ids[0]),
+                    unread_module_file: None,
+                },
+                CommonModuleEntry {
+                    name: "Свой".to_string(),
+                    main: ids[3],
+                    module_file: Some(ids[2]),
+                    unread_module_file: None,
+                },
+            ],
+            roles: vec![RoleEntry {
+                name: "ЧтениеДанных".to_string(), main: ids[4], rights: None
+            }],
+            event_subscriptions: vec![EventSubscriptionEntry {
+                name: "ПриЗаписи".to_string(),
+                main: ids[5],
+            }],
+            ..MetadataListingData::default()
+        },
+    );
+    db
+}
+
+/// A module the extension only adopts belongs to the configuration it extends: a member the
+/// adopted copy does not repeat is declared there, so its miss names the module. The
+/// extension's own module, and a role or a subscription the extension declares — kept in
+/// listing families of their own — are held, and their misses stay conclusive.
+#[test]
+fn an_adopted_owner_is_unloaded_and_a_declared_family_is_held() {
+    let db = adopting_extension();
+    let owner = |name: &str| ide::owner_outside_loaded_configurations(&db, name);
+
+    let vendor = by_name(&db, "Длительные.ВыполнитьВФоне");
+    assert_eq!(vendor.outcome, ReferencesOutcome::NotFound);
+    assert_eq!(vendor.unloaded_owner.as_deref(), Some("Длительные"));
+
+    assert_eq!(owner("Свой.НетТакого"), None, "the extension's own module is held");
+    assert_eq!(owner("Роль.ЧтениеДанных"), None, "a role the extension declares is held");
+    assert_eq!(owner("ПодпискаНаСобытие.ПриЗаписи"), None, "so is a subscription");
+    assert_eq!(owner("Роль.НетТакой").as_deref(), Some("Роль.НетТакой"));
+    assert_eq!(
+        owner("РегламентноеЗадание.НетТакого").as_deref(),
+        Some("РегламентноеЗадание.НетТакого"),
+        "a scheduled job is looked for in its own family, not as a module",
+    );
+}
+
+/// A two-segment name whose first segment is both a type word and a module the extension
+/// declares is read both ways: the module reading holds, so a missing member of it is a
+/// conclusive miss.
+#[test]
+fn a_two_segment_name_held_under_either_reading_is_not_unloaded() {
+    let (mut db, _) = db_with(&[(
+        "/ws/ext/CommonModules/Отчеты/Ext/Module.bsl",
+        "Процедура Сформировать() Экспорт\nКонецПроцедуры\n",
+    )]);
+    let scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+    let root = PathBuf::from("/ws/ext");
+    db.set_all_config_paths(vec![(Some("Расширение".to_string()), root)], scope);
+
+    assert_eq!(ide::owner_outside_loaded_configurations(&db, "Отчеты.НетТакого"), None);
+    assert_eq!(
+        ide::owner_outside_loaded_configurations(&db, "Отчеты2.НетТакого").as_deref(),
+        Some("Отчеты2"),
+        "control: a module no root declares",
+    );
+}
+
 // --- the self-certifying anchor -----------------------------------------------------------
 
 fn by_text(

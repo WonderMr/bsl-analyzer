@@ -36,8 +36,8 @@ pub use call_hierarchy_index::{
 };
 pub use completion::{CompletionItem, CompletionItemKind};
 pub use declarations::{
-    classify_unreferenceable, graph_id_of_declaration, resolve_declarations, Declaration,
-    DeclarationKind, UnsupportedCategory,
+    classify_unreferenceable, graph_id_of_declaration, owner_outside_loaded_configurations,
+    resolve_declarations, Declaration, DeclarationKind, UnsupportedCategory,
 };
 pub use diagnostics_catalog::{catalog_entry, diagnostic_catalog, CatalogEntry, SeverityBucket};
 pub use document_highlight::{DocumentHighlight, DocumentHighlightKind};
@@ -56,6 +56,7 @@ pub use graph::{
     ROOTS_UNAVAILABLE, SOURCE_DRIFTED,
 };
 pub use hir::graph_index;
+pub use hir::pair_extension_module_paths;
 pub use hir::AnnotationKind;
 pub use hir::ModuleId;
 pub use hir::{call_hierarchy_method_digest, MethodCallDigest};
