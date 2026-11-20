@@ -2100,6 +2100,50 @@ fn a_member_an_adopted_copy_declares_is_held() {
     assert_eq!(owner("Длительные.ВыполнитьВФоне").as_deref(), Some("Длительные"));
 }
 
+const ADOPTED_DOCUMENT_MODULE: &str = "\
+Процедура Расш_Проверить()
+КонецПроцедуры
+";
+
+/// The same for an object the extension adopts: a procedure its adopted object module
+/// declares, kept private, is the extension's; a member no copy declares, such as the posting
+/// handler of the configuration the copy extends, still names the object.
+#[test]
+fn a_member_an_adopted_object_module_declares_is_held() {
+    let (mut db, ids) = db_with(&[
+        ("/ws/ext/Documents/Заказ/Ext/ObjectModule.bsl", ADOPTED_DOCUMENT_MODULE),
+        (
+            "/ws/ext/Documents/Заказ.xml",
+            r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20"><Document uuid="d11b89e1-90a2-47e7-b43f-7f231ec64b2f"><Properties><Name>Заказ</Name><ObjectBelonging>Adopted</ObjectBelonging><ExtendedConfigurationObject>9de71b46-e9bf-4b0b-8f3c-4abcd6a385de</ExtendedConfigurationObject></Properties></Document></MetaDataObject>"#,
+        ),
+    ]);
+    let root = PathBuf::from("/ws/ext");
+    let scope = Some(bsl_metadata::ExtensionScope::InfoBase);
+    db.set_all_config_paths(vec![(Some("Расширение".to_string()), root.clone())], scope);
+    db.set_metadata_listing(
+        &root.to_string_lossy(),
+        MetadataListingData {
+            entries: vec![MdoEntry {
+                kind: bsl_metadata::MdoType::Document,
+                name: "Заказ".to_string(),
+                main: ids[1],
+                predefined: None,
+            }],
+            ..MetadataListingData::default()
+        },
+    );
+    let owner = |name: &str| ide::owner_outside_loaded_configurations(&db, name);
+
+    let private = by_name(&db, "Документ.Заказ.Расш_Проверить");
+    assert_eq!(private.outcome, ReferencesOutcome::NotFound, "a private member is not addressed");
+    assert_eq!(private.unloaded_owner, None, "and it is declared by the loaded copy");
+    assert_eq!(
+        owner("Документ.Заказ.ОбработкаПроведения").as_deref(),
+        Some("Документ.Заказ"),
+        "a member no copy declares belongs to the configuration the copy extends",
+    );
+}
+
 /// A two-segment name whose first segment is both a type word and a module the extension
 /// declares is read both ways: the module reading holds, so a missing member of it is a
 /// conclusive miss.
