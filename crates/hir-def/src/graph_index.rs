@@ -1076,6 +1076,11 @@ pub fn project_batch_call_edges<DB: ConfigsDatabase + Clone + Send>(
 /// A name `base` does not declare gives no edge: the platform refuses such an extension,
 /// and an edge to a node that does not exist would dangle. The target is looked up in the
 /// resident `index`, so `base` may belong to another batch.
+///
+/// An interceptor named exactly like its target, in a module whose method ids are keyed by
+/// name, encodes to the target's own durable id, and its edge is stored as a self-loop. It is
+/// kept: the two methods already share one node, and the loop is the only sign left that the
+/// method is taken over.
 pub fn project_module_intercept_edges(
     db: &dyn ConfigsDatabase,
     module: ModuleId,
