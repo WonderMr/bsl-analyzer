@@ -865,18 +865,6 @@ pub fn get_object_structure(
         };
     }
 
-    if mdo_type == MdoType::ScheduledJob {
-        return match config.find_scheduled_job(object_name) {
-            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                format_scheduled_job_structure(job),
-            )])),
-            None => Err(McpError::invalid_params(
-                format!("РегламентноеЗадание.{object_name} не найдено в конфигурации"),
-                None,
-            )),
-        };
-    }
-
     if let Some(obj) = config.find_metadata_object(mdo_type, object_name) {
         return Ok(CallToolResult::success(vec![ContentBlock::text(
             format_metadata_object_structure(obj, mdo_type),
@@ -941,19 +929,6 @@ fn format_event_subscription_structure(sub: &bsl_metadata::EventSubscription) ->
         writeln!(out, "  - Модуль: {}", handler.module_name).ok();
         writeln!(out, "  - Метод: {}", handler.method_name).ok();
     }
-    out
-}
-
-fn format_scheduled_job_structure(job: &bsl_metadata::ScheduledJob) -> String {
-    let yes_no = |flag: bool| if flag { "да" } else { "нет" };
-    let mut out = format!("# РегламентноеЗадание.{}\n\n", job.name());
-    writeln!(out, "- Имя метода: {}", dash(job.method_name())).ok();
-    if let Some(handler) = job.parse_handler() {
-        writeln!(out, "  - Модуль: {}", handler.module_name).ok();
-        writeln!(out, "  - Метод: {}", handler.method_name).ok();
-    }
-    writeln!(out, "- Использование: {}", yes_no(job.is_enabled())).ok();
-    writeln!(out, "- Предопределенное: {}", yes_no(job.is_predefined())).ok();
     out
 }
 
@@ -1576,20 +1551,6 @@ pub fn object_from_db(
             )])),
             None => Err(McpError::invalid_params(
                 format!("ПодпискаНаСобытие.{object_name} не найдена в конфигурации"),
-                None,
-            )),
-        };
-    }
-
-    // Like a subscription, a scheduled job lives in its own catalog, not among the objects
-    // and registers the lookups below read.
-    if mdo_type == MdoType::ScheduledJob {
-        return match db.resolve_scheduled_job_across_roots(object_name) {
-            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                format_scheduled_job_structure(&job),
-            )])),
-            None => Err(McpError::invalid_params(
-                format!("РегламентноеЗадание.{object_name} не найдено в конфигурации"),
                 None,
             )),
         };
@@ -2684,16 +2645,20 @@ mod tests {
     }
 
     /// A scheduled job parses as a metadata type, so the action must find it where it
-    /// lives instead of calling an existing job absent.
+    /// lives instead of calling an existing job absent, under either spelling of the type.
     #[test]
     fn test_object_structure_scheduled_job() {
         let config = fixture_config();
-        let result =
-            get_object_structure(&config, "РегламентноеЗадание", "РегламентноеЗадание1").unwrap();
-        let text = extract_text(&result);
-        assert!(text.contains("# РегламентноеЗадание.РегламентноеЗадание1"), "{text}");
-        assert!(text.contains("Модуль: ПервыйОбщийМодуль"), "{text}");
-        assert!(text.contains("Метод: НеУстаревшаяПроцедура"), "{text}");
+        for object_type in ["РегламентноеЗадание", "ScheduledJob"] {
+            let result =
+                get_object_structure(&config, object_type, "РегламентноеЗадание1").unwrap();
+            let text = extract_text(&result);
+            assert!(text.contains("# РегламентноеЗадание.РегламентноеЗадание1"), "{text}");
+            assert!(
+                text.contains("Метод: CommonModule.ПервыйОбщийМодуль.НеУстаревшаяПроцедура"),
+                "{text}"
+            );
+        }
         assert!(get_object_structure(&config, "ScheduledJob", "НетТакого").is_err());
     }
 
@@ -2737,7 +2702,7 @@ mod tests {
         };
         let found = read("ОбменДанными").expect("a declared job is found");
         let text = extract_text(&found);
-        assert!(text.contains("Модуль: Обмен"), "{text}");
+        assert!(text.contains("Метод: CommonModule.Обмен.ВыполнитьОбмен"), "{text}");
         assert!(text.contains("Использование: да"), "{text}");
         assert!(read("НетТакого").is_err(), "a missing job is reported as missing");
     }

@@ -2379,19 +2379,6 @@ impl RootDatabaseImpl {
         })
     }
 
-    /// Resolve a scheduled job by name across base + every extension (first match in
-    /// precedence order; scheduled jobs carry no overlay merge, matching
-    /// [`Self::resolve_scheduled_job_for_file`]).
-    pub fn resolve_scheduled_job_across_roots(
-        &self,
-        name: &str,
-    ) -> Option<Arc<bsl_metadata::ScheduledJob>> {
-        self.ordered_config_roots().iter().find_map(|root| {
-            let listing = self.metadata_listing(root)?;
-            metadata::resolve_scheduled_job(self, listing, name.to_string())
-        })
-    }
-
     /// Resolve an HTTP service by name across base + every extension (first match in
     /// precedence order; services carry no overlay merge, matching
     /// [`Self::resolve_http_service_for_file`]).
