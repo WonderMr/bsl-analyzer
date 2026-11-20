@@ -867,6 +867,7 @@ mod tests {
         <Properties>
             <Name>Курсы</Name>
             <InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity>
+            <WriteMode>RecorderSubordinate</WriteMode>
         </Properties>
     </InformationRegister>
 </MetaDataObject>"#;
@@ -890,6 +891,7 @@ mod tests {
         <Properties>
             <Name>Настройки</Name>
             <InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>
+            <WriteMode>RecorderSubordinate</WriteMode>
         </Properties>
     </InformationRegister>
 </MetaDataObject>"#;
@@ -912,7 +914,7 @@ mod tests {
     fn register_standard_attribute_synthesis_carries_english_names() {
         let xml = r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
 <InformationRegister uuid="12345678-1234-1234-1234-123456789012">
-<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity></Properties>
+<Properties><Name>Курсы</Name><InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity><WriteMode>RecorderSubordinate</WriteMode></Properties>
 </InformationRegister></MetaDataObject>"#;
 
         let register = parse_information_register_xml(xml).unwrap();
@@ -930,6 +932,61 @@ mod tests {
         assert_eq!(name_en("Активность").as_deref(), Some("Active"));
         assert_eq!(name_en("НомерСтроки").as_deref(), Some("LineNumber"));
         assert_eq!(name_en("Период").as_deref(), Some("Period"));
+    }
+
+    /// An independent information register has no recorder, so its record has no
+    /// `Регистратор`, `НомерСтроки` or `Активность`: a query that selects them fails. Only
+    /// `Период` of a periodic register is standard there. A dump without `WriteMode` is read as
+    /// independent, the write mode a new register gets.
+    #[test]
+    fn an_independent_information_register_has_no_recorder_attributes() {
+        let xml = |properties: &str| {
+            format!(
+                r#"<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+<InformationRegister uuid="12345678-1234-1234-1234-123456789012">
+<Properties><Name>ТестовыйРегистр</Name>{properties}</Properties>
+<ChildObjects>
+<Dimension uuid="12345678-1234-1234-1234-123456789013"><Properties><Name>Номер</Name></Properties></Dimension>
+<Resource uuid="12345678-1234-1234-1234-123456789014"><Properties><Name>Ссылка</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Resource>
+<Attribute uuid="12345678-1234-1234-1234-123456789015"><Properties><Name>Комментарий</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+</ChildObjects>
+</InformationRegister></MetaDataObject>"#
+            )
+        };
+        let attribute_names = |properties: &str| {
+            let register = parse_information_register_xml(&xml(properties)).unwrap();
+            register.attributes().iter().map(|a| a.name().to_string()).collect::<Vec<_>>()
+        };
+
+        for properties in [
+            "<InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>\
+             <WriteMode>Independent</WriteMode>",
+            "<InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>",
+            "",
+        ] {
+            assert_eq!(attribute_names(properties), ["Комментарий"], "{properties}");
+        }
+        assert_eq!(
+            attribute_names(
+                "<InformationRegisterPeriodicity>Day</InformationRegisterPeriodicity>\
+                 <WriteMode>Independent</WriteMode>",
+            ),
+            ["Период", "Комментарий"]
+        );
+        assert_eq!(
+            attribute_names(
+                "<InformationRegisterPeriodicity>Nonperiodical</InformationRegisterPeriodicity>\
+                 <WriteMode>RecorderSubordinate</WriteMode>",
+            ),
+            ["Активность", "НомерСтроки", "Регистратор", "Комментарий"]
+        );
+        assert_eq!(
+            attribute_names(
+                "<InformationRegisterPeriodicity>RecorderPosition</InformationRegisterPeriodicity>\
+                 <WriteMode>RecorderSubordinate</WriteMode>",
+            ),
+            ["Активность", "НомерСтроки", "Регистратор", "Период", "Комментарий"]
+        );
     }
 
     #[test]

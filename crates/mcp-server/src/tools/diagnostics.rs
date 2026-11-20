@@ -305,7 +305,8 @@ pub fn schema() -> CallToolResult {
 /// lifecycle snapshot (`state`/`generation`/`elapsed_ms`) so the agent can tell a
 /// progressing build from a stuck or failed one instead of polling a flat `loading`.
 pub fn loading(report: &StatusReport) -> CallToolResult {
-    crate::tools::resident::loading(report, "diagnostics database is building; retry shortly")
+    let detail = crate::tools::resident::not_ready_detail(report, "`diagnostics` status");
+    crate::tools::resident::loading(report, &detail)
 }
 
 /// Who answers a `diagnostics` request — every branch of it, including the in-band errors.

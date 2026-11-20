@@ -12,6 +12,7 @@ pub use diagnostics_baseline_fs::{ManagedBaselineDirectory, ManagedEntryReading}
 
 pub mod extension_topology;
 pub mod file_role;
+mod git_ignore;
 pub mod path_scope;
 pub mod source_set;
 pub mod workspace_walk;
@@ -350,6 +351,7 @@ pub struct Project {
     external_discovery_rejections: Vec<ExternalDiscoveryRejection>,
     topology: ExtensionTopology,
     /// `[source].exclude`, resolved. Wins over every root, declared or discovered.
+    /// Carries what git leaves out below the roots too, which never touches a root.
     exclusions: ExcludedPaths,
     /// Whether the exclusions removed a root the project would otherwise have had.
     /// Such a project must not fall back to the workspace root as an anonymous source
@@ -465,7 +467,7 @@ impl Project {
         };
         let extension_paths = paths_of_kind(false);
         let external_paths = paths_of_kind(true);
-        Ok(Self {
+        let mut project = Self {
             root,
             config,
             source_path,
@@ -476,10 +478,18 @@ impl Project {
             topology,
             exclusions,
             sources_cut: base_excluded || candidates_cut || nodes_cut,
-        })
+        };
+        // Only now, with the roots known: git's rules apply below each root, never to one.
+        if project.config.respects_gitignore() {
+            let ignored = git_ignore::below(&project.source_roots());
+            project.exclusions = std::mem::take(&mut project.exclusions).with_git_ignored(ignored);
+        }
+        Ok(project)
     }
 
-    /// The directories the user took out of the project with `[source].exclude`.
+    /// The directories the user took out of the project with `[source].exclude` and
+    /// `[source].exclude_globs`, and those git leaves out below the source roots
+    /// (`[source].respect_gitignore`).
     pub fn source_exclusions(&self) -> &ExcludedPaths {
         &self.exclusions
     }
@@ -511,7 +521,8 @@ impl Project {
         }
     }
 
-    /// Whether `path` lies in a directory the user took out of the project.
+    /// Whether `path` lies in a directory the user took out of the project, or one git
+    /// leaves out below a source root.
     pub fn is_source_excluded(&self, path: &Path) -> bool {
         self.exclusions.is_excluded_resolved(path)
     }
@@ -2674,6 +2685,13 @@ pub struct ProjectConfig {
     #[serde(skip)]
     pub source_exclude_globs: Vec<String>,
 
+    /// `[source].respect_gitignore`: whether the directories the git work tree of a source
+    /// root leaves out (those its ignore rules name, and the repository's linked
+    /// worktrees) are left out of the project too. Unset means they are. Only the TOML
+    /// config carries it.
+    #[serde(skip)]
+    pub source_respect_gitignore: Option<bool>,
+
     #[serde(default, alias = "target_platform_version")]
     pub target_platform_version: Option<String>,
 
@@ -3217,6 +3235,11 @@ impl ProjectConfig {
         stdx::path_exclusion::ExcludedPaths::default()
             .with_patterns(base, &self.source_exclude_globs)
             .map_err(|error| self.config_error(format!("source.exclude_globs {error}")))
+    }
+
+    /// See [`Self::source_respect_gitignore`].
+    pub fn respects_gitignore(&self) -> bool {
+        self.source_respect_gitignore != Some(false)
     }
 
     /// `[source].exclude` resolved against the directory of the config file — not the
@@ -4004,6 +4027,8 @@ struct TomlSourceConfig {
     exclude: Vec<String>,
     #[serde(default)]
     exclude_globs: Vec<String>,
+    #[serde(default)]
+    respect_gitignore: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4074,6 +4099,7 @@ impl From<TomlConfig> for ProjectConfig {
             configuration_dependency: toml.source.configuration,
             source_exclude: toml.source.exclude,
             source_exclude_globs: toml.source.exclude_globs,
+            source_respect_gitignore: toml.source.respect_gitignore,
             target_platform_version: toml.target_platform_version,
             platform_help: toml.platform_help,
             min_platform_version: toml.min_platform_version,

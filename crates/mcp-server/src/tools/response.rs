@@ -56,8 +56,12 @@ pub fn trim_items_to_budget(items: &mut Vec<Value>, max_output_tokens: usize) ->
 /// Truncate a Markdown/plain-text tool body to fit `max_output_tokens` (~4 chars each) at a
 /// line boundary, appending `note` (a continuation hint) when it had to cut. Text tools carry
 /// no structured envelope, so the trailing note IS the truncation marker. Returns whether it
-/// truncated. A single line longer than the budget is cut at a char boundary rather than
-/// dropped whole.
+/// truncated.
+///
+/// A line longer than half the budget — a long signature, one serialized value — is cut at a
+/// char boundary rather than dropped whole: falling back to the line break before it would keep
+/// next to nothing. A cut inside a fenced code block closes the fence before the note, or the
+/// note would render as code.
 ///
 /// The note is the floor: a budget smaller than `note` yields the note alone rather than a
 /// silently clipped body, because an unmarked truncation reads as a complete answer.
@@ -67,16 +71,42 @@ pub fn truncate_text_to_budget(text: &mut String, max_output_tokens: usize, note
         return false;
     }
     // Reserve room for the note so the final string (body + note) still fits the budget rather
-    // than overshooting it by the note's length.
-    let mut cap = budget.saturating_sub(note.len());
+    // than overshooting it by the note's length, and for the closing fence when the cut falls
+    // inside a code block.
+    let mut cut = cut_point(text, budget.saturating_sub(note.len()));
+    if inside_code_fence(&text[..cut]) {
+        cut = cut_point(text, budget.saturating_sub(note.len() + FENCE_CLOSE.len()));
+    }
+    text.truncate(cut);
+    if inside_code_fence(text) {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("```");
+    }
+    text.push_str(note);
+    true
+}
+
+/// The longest fence close [`truncate_text_to_budget`] appends: a line break and the fence.
+const FENCE_CLOSE: &str = "\n```";
+
+/// Where to cut `text` so that at most `cap` bytes are kept: after the last line break within
+/// them, unless that keeps less than half of `cap`, then at the char boundary nearest `cap`.
+fn cut_point(text: &str, cap: usize) -> usize {
+    let mut cap = cap.min(text.len());
     while cap > 0 && !text.is_char_boundary(cap) {
         cap -= 1;
     }
-    // Prefer a line boundary within budget; fall back to the char boundary for one oversized line.
-    let cut = text[..cap].rfind('\n').map(|i| i + 1).unwrap_or(cap);
-    text.truncate(cut);
-    text.push_str(note);
-    true
+    match text[..cap].rfind('\n') {
+        Some(line_end) if (line_end + 1) * 2 >= cap => line_end + 1,
+        _ => cap,
+    }
+}
+
+/// Whether `text` ends inside a fenced code block: an odd number of its lines open a fence.
+fn inside_code_fence(text: &str) -> bool {
+    !text.lines().filter(|line| line.trim_start().starts_with("```")).count().is_multiple_of(2)
 }
 
 /// Emit a plain-text tool body already fitted to `max_output_tokens`, appending `note` when it
@@ -160,6 +190,27 @@ mod tests {
         assert!(text.ends_with("-- more --\n"));
         // Never leaves a half-written line before the note.
         assert!(!text.contains("line-b\nline-c"));
+    }
+
+    /// One line longer than half the budget is cut inside: the line break before it would keep
+    /// the heading alone.
+    #[test]
+    fn truncate_text_cuts_a_long_line_at_a_char_boundary() {
+        let mut text = format!("# Заголовок\n\n{}\n", "сигнатура ".repeat(40));
+        assert!(truncate_text_to_budget(&mut text, 50, "\n--\n"));
+        assert!(text.len() <= 200, "{} bytes", text.len());
+        assert!(text.starts_with("# Заголовок\n\nсигнатура сигнатура"), "{text}");
+        assert!(text.ends_with("\n--\n"), "{text}");
+    }
+
+    /// A cut inside a fenced block closes the fence, or the note would read as code.
+    #[test]
+    fn truncate_text_closes_a_code_fence_it_cuts_into() {
+        let lines: String = (0..40).map(|n| format!("line-{n:02}\n")).collect();
+        let mut text = format!("intro\n```bsl\n{lines}```\nafter\n");
+        assert!(truncate_text_to_budget(&mut text, 25, "\n--\n"));
+        assert!(text.len() <= 100, "{} bytes", text.len());
+        assert!(text.ends_with("line-08\n```\n--\n"), "{text}");
     }
 
     #[test]

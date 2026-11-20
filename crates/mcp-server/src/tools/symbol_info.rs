@@ -634,9 +634,14 @@ fn module_ref(card: &SymbolInfoCard) -> Option<crate::tools::location::ModuleRef
 /// hold at all, and a workspace with no graph yet, where the answer was an empty
 /// list dressed as an answer. The dictionary asks the platform and the
 /// resident's own tables too, and names whichever source could not be asked.
+///
+/// `unloaded_owner` is the module or object the name addresses when no loaded
+/// configuration declares it (`ide::owner_outside_loaded_configurations`): the miss is
+/// then about the loaded roots only, and the envelope says which configuration is absent.
 pub(crate) fn render_not_found(
     symbol: &str,
     answer: crate::tools::name_answer::NameAnswer,
+    unloaded_owner: Option<&str>,
     stamp: &ResidentStamp<'_>,
 ) -> CallToolResult {
     let status = if answer.total == 0 { "not_found" } else { "ambiguous" };
@@ -648,11 +653,14 @@ pub(crate) fn render_not_found(
     let completeness = answer.insert_into(&mut body);
     // Here the counter matters: the symbol was not found, and an unread module is
     // a place it could have been.
-    let completeness = completeness.when(
-        stamp.unread_files > 0,
-        ReasonCode::UnreadableFiles,
-        "some workspace files could not be read, so the search was not exhaustive",
-    );
+    let completeness = completeness
+        .when(
+            stamp.unread_files > 0,
+            ReasonCode::UnreadableFiles,
+            "some workspace files could not be read, so the search was not exhaustive",
+        )
+        // Only a miss with no candidate is "nothing found here"; an ambiguous one found some.
+        .when_owner_unloaded(unloaded_owner.filter(|_| status == "not_found"));
     body.insert(
         "hint".into(),
         json!(
@@ -1525,8 +1533,8 @@ mod tests {
             &found,
         );
 
-        let body =
-            render_not_found("НетТакого.Метод", answer, &stamp(&roots)).structured_content.unwrap();
+        let result = render_not_found("НетТакого.Метод", answer, None, &stamp(&roots));
+        let body = result.structured_content.unwrap();
 
         serde_json::from_value::<SymbolInfoOutput>(body.clone())
             .expect("not_found output schema shape");
@@ -1539,6 +1547,59 @@ mod tests {
         // silently ship without an envelope.
         assert_eq!(body["freshness"]["source"], "resident");
         assert_eq!(body["freshness"]["completeness"]["reasons"][0]["code"], "index_building");
+    }
+
+    /// A miss about a name whose module no loaded configuration declares is a miss about the
+    /// loaded roots only: the envelope says so, and names the module, instead of reading as
+    /// "this name does not exist".
+    #[test]
+    fn a_miss_about_an_unloaded_module_is_partial() {
+        let roots = stand_roots();
+        let analysis = ide::Analysis::new();
+        let found = ide::NameLookupResult {
+            candidates: Vec::new(),
+            total: 0,
+            total_exact: true,
+            truncated: false,
+            providers: Vec::new(),
+        };
+        let answer = crate::tools::name_answer::NameAnswer::render(
+            analysis.database(),
+            Some(&roots),
+            &found,
+        );
+
+        let owner = Some("ОбщегоНазначения");
+        let result = render_not_found("ОбщегоНазначения.Метод", answer, owner, &stamp(&roots));
+        let body = result.structured_content.unwrap();
+
+        serde_json::from_value::<SymbolInfoOutput>(body.clone())
+            .expect("not_found output schema shape");
+        assert_eq!(body["status"], "not_found");
+        let completeness = &body["freshness"]["completeness"];
+        assert_eq!(completeness["status"], "partial", "{completeness}");
+        let reasons = completeness["reasons"].as_array().unwrap();
+        let reason = reasons
+            .iter()
+            .find(|reason| reason["code"] == "owning_configuration_missing")
+            .expect("the unloaded configuration is a reason");
+        assert!(reason["detail"].as_str().unwrap().contains("`ОбщегоНазначения`"), "{reason}");
+
+        // An ambiguous miss found candidates, so "nothing found here" is not said of it.
+        let found = ide::NameLookupResult { total: 2, ..found };
+        let answer = crate::tools::name_answer::NameAnswer::render(
+            analysis.database(),
+            Some(&roots),
+            &found,
+        );
+        let result = render_not_found("ОбщегоНазначения.Метод", answer, owner, &stamp(&roots));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["status"], "ambiguous");
+        let reasons = body["freshness"]["completeness"]["reasons"].clone();
+        assert!(
+            !reasons.to_string().contains("owning_configuration_missing"),
+            "an ambiguous miss carries no unloaded-owner reason: {reasons}"
+        );
     }
 
     /// И16 where the graph's verdict is an INPUT: a resident miss is answered by the
@@ -1578,7 +1639,8 @@ mod tests {
         let query = ide::NameQuery::new("СтрНайт", DEFAULT_CANDIDATE_LIMIT);
         let found = ide::lookup_names(db, &query, &[&source]);
         let answer = crate::tools::name_answer::NameAnswer::render(db, Some(&roots), &found);
-        let body = render_not_found("СтрНайт", answer, &stamp(&roots)).structured_content.unwrap();
+        let result = render_not_found("СтрНайт", answer, None, &stamp(&roots));
+        let body = result.structured_content.unwrap();
 
         assert_eq!(body["resolved"], false, "{body}");
         let categories: Vec<&str> = body["candidates"]
@@ -1621,7 +1683,8 @@ mod tests {
             truncated: false,
             completeness: Completeness::complete(),
         };
-        let body = render_not_found("Кандидат", answer, &stamp(&roots)).structured_content.unwrap();
+        let result = render_not_found("Кандидат", answer, None, &stamp(&roots));
+        let body = result.structured_content.unwrap();
         serde_json::from_value::<SymbolInfoOutput>(body.clone())
             .expect("ambiguous output schema shape");
         assert_eq!(body["status"], "ambiguous");

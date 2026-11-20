@@ -26,6 +26,7 @@ pub(crate) struct MdoProperties {
     pub check_unique: bool,
     pub code_series: Option<String>,
     pub dependence_on_calculation_types: Option<String>,
+    pub recorder_subordinate: bool,
     pub object_belonging: ObjectBelonging,
     pub extended_configuration_object: Option<Uuid>,
 }
@@ -45,6 +46,8 @@ impl MdoProperties {
         let code_series = child_text(props_node, "CodeSeries").map(|s| s.to_string());
         let dependence_on_calculation_types =
             child_text(props_node, "DependenceOnCalculationTypes").map(|s| s.to_string());
+        let recorder_subordinate =
+            child_text(props_node, "WriteMode") == Some("RecorderSubordinate");
         let (object_belonging, extended_configuration_object) =
             parse_extension_ownership(props_node);
 
@@ -72,6 +75,7 @@ impl MdoProperties {
             check_unique,
             code_series,
             dependence_on_calculation_types,
+            recorder_subordinate,
             object_belonging,
             extended_configuration_object,
         }
@@ -97,6 +101,7 @@ fn condition_satisfied(cond: PresenceCondition, p: &MdoProperties) -> bool {
             p.periodicity.as_deref().unwrap_or("Nonperiodical") != "Nonperiodical"
         }
         PresenceCondition::DependsOnCalculationTypes => p.depends_on_calculation_types(),
+        PresenceCondition::RecorderSubordinate => p.recorder_subordinate,
     }
 }
 
@@ -219,12 +224,18 @@ pub(crate) fn add_register_period_attr(
     }
 }
 
+/// `Активность`, `НомерСтроки` and `Регистратор` belong to the records a recorder writes, so an
+/// information register has them only in the recorder-subordinate write mode; an independent
+/// register's record is its dimensions, resources, attributes and, when periodic, `Период`.
 pub(crate) fn add_information_register_standard_attrs(
     attributes: &mut Vec<RegisterAttribute>,
     object_name: &str,
     periodicity: Option<&str>,
+    recorder_subordinate: bool,
 ) {
-    add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    if recorder_subordinate {
+        add_register_common_attrs(attributes, object_name, MdoType::InformationRegister);
+    }
     add_register_period_attr(attributes, object_name, MdoType::InformationRegister, periodicity);
 }
 
