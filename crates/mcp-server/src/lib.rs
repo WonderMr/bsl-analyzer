@@ -354,9 +354,13 @@ impl McpProfile {
 struct MetadataParams {
     /// info | tree | object | form | status.
     action: String,
-    /// `tree`: case-insensitive substring to narrow the returned tree (optional).
+    /// `tree` in source mode: case-insensitive substring of object names (optional). Alone it
+    /// lists every matching object of the configuration and its extensions as
+    /// `Категория.Имя`; with `meta_type` it narrows that category's listing.
     filter: Option<String>,
-    /// `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
+    /// `tree`: the metadata category to list. Source mode takes the singular or plural name,
+    /// e.g. `Справочник`/`Справочники`/`Catalogs`; infobase mode takes the live collection,
+    /// e.g. `Справочники`/`Documents`.
     meta_type: Option<String>,
     /// `tree` in infobase mode: case-insensitive object name/synonym substring.
     name_mask: Option<String>,
@@ -1481,6 +1485,7 @@ impl McpServer {
         diag.ensure_loading();
 
         let action = p.action.clone();
+        let meta_type = p.meta_type.clone();
         let filter = p.filter.clone();
         let object_type = p.object_type.clone();
         let object_name = p.object_name.clone();
@@ -1509,6 +1514,7 @@ impl McpServer {
                                     db,
                                     &config,
                                     &extensions,
+                                    meta_type.clone(),
                                     filter.clone(),
                                     max_output_tokens,
                                 )
@@ -5841,12 +5847,16 @@ mod tool_descriptions {
             minutes on a large configuration.
               - action: info | tree | object | form | status.
               - connection: Named live 1C connection for `mode=infobase` (optional).
-              - filter: `tree`: case-insensitive substring to narrow the returned tree (optional).
+              - filter: `tree` in source mode: case-insensitive substring of object names (optional). Alone it
+            lists every matching object of the configuration and its extensions as
+            `Категория.Имя`; with `meta_type` it narrows that category's listing.
               - form_name: `form`: managed-form name (optional; omit for the object's default form).
               - max_items: `tree` in infobase mode: maximum returned objects (default 100, max 1000).
               - max_output_tokens: `tree`/`object` in infobase mode: output budget in tokens (~4 UTF-8 bytes each)
             for `content` and `structuredContent` together (default 6000).
-              - meta_type: `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
+              - meta_type: `tree`: the metadata category to list. Source mode takes the singular or plural name,
+            e.g. `Справочник`/`Справочники`/`Catalogs`; infobase mode takes the live collection,
+            e.g. `Справочники`/`Documents`.
               - mode: auto | source | infobase (default auto).
               - name_mask: `tree` in infobase mode: case-insensitive object name/synonym substring.
               - object_name: Metadata object name, e.g. `ЗаказКлиента`. Required for `object`; for `form` it
