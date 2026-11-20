@@ -71,7 +71,7 @@ pub fn parallel_count_cancellable(
 
         builder.build_parallel().run(|| {
             let count = &count;
-            let mut resolved = ResolvedDirs::default();
+            let mut resolved = ResolvedDirs::for_one_worker();
             Box::new(move |entry| {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return ignore::WalkState::Quit;
@@ -120,7 +120,7 @@ pub fn parallel_walk_paths(
 
         builder.build_parallel().run(|| {
             let items = &items;
-            let mut resolved = ResolvedDirs::default();
+            let mut resolved = ResolvedDirs::for_one_worker();
             Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
@@ -165,7 +165,7 @@ pub fn parallel_read_files(
 
         builder.build_parallel().run(|| {
             let items = &items;
-            let mut resolved = ResolvedDirs::default();
+            let mut resolved = ResolvedDirs::for_one_worker();
             Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
@@ -218,7 +218,7 @@ where
         builder.build_parallel().run(|| {
             let items = &items;
             let transform = &transform;
-            let mut resolved = ResolvedDirs::default();
+            let mut resolved = ResolvedDirs::for_one_worker();
             Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
@@ -276,7 +276,7 @@ where
             let items = &items;
             let transform = &transform;
             let on_progress = &on_progress;
-            let mut resolved = ResolvedDirs::default();
+            let mut resolved = ResolvedDirs::for_one_worker();
             Box::new(move |entry| {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;

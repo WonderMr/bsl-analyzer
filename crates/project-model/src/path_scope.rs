@@ -173,9 +173,11 @@ impl PathScope {
     /// scope and did not then declare a root inside — or in a directory the user
     /// excluded, whatever is declared inside it.
     pub fn is_hole(&self, path: &Path) -> bool {
-        if self.excluded.is_excluded(path) {
-            return true;
-        }
+        self.excluded.is_excluded(path) || self.lies_in_a_hole(path)
+    }
+
+    /// [`Self::is_hole`] by the declared holes alone.
+    fn lies_in_a_hole(&self, path: &Path) -> bool {
         self.holes.iter().any(|hole| hole.spellings.iter().any(|hole| path.starts_with(hole)))
             && !self.carve_outs.iter().any(|root| root.covers(path))
     }
@@ -190,7 +192,9 @@ impl PathScope {
     /// an exclusion reached under another spelling — see
     /// [`ExcludedPaths::prunes_walked_dir`].
     pub fn prunes_dir(&self, path: &Path, is_symlink: bool, resolved: &mut ResolvedDirs) -> bool {
-        self.is_hole(path) || self.excluded.prunes_walked_dir(path, is_symlink, resolved)
+        // The walk's own question covers everything the exclusions say about `path` and
+        // what lies above it, so they are not asked about the same path twice.
+        self.lies_in_a_hole(path) || self.excluded.prunes_walked_dir(path, is_symlink, resolved)
     }
 
     /// The user's hard exclusions, as this scope matches them.
